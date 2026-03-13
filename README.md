@@ -1,4 +1,4 @@
-# 🧠 br.ai.n: Agentic Local AI Orchestrator (Meet Bob)
+# 🧠 br.ai.n: Agentic Local AI Orchestrator
 
 [![CI](https://github.com/mitro54/br.ai.n/actions/workflows/ci.yml/badge.svg)](https://github.com/mitro54/br.ai.n/actions/workflows/ci.yml)
 
