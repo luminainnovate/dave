@@ -141,12 +141,17 @@ async def list_models(request: Request):
 async def proxy_ollama(request: Request):
     body = await request.json()
     is_streaming = body.get("stream", True)
+    messages = body.get("messages", [])
+    messages_str = str(messages).lower()
     
+    # 1. SMART BACKGROUND TASK INTERCEPT
     if not is_streaming:
-        return JSONResponse(content={
-            "id": "chatcmpl-Bob-Background", "object": "chat.completion", "created": int(time.time()),
-            "model": "Bob", "choices": [{"index": 0, "message": {"role": "assistant", "content": "AI Orchestrator Session"}, "finish_reason": "stop"}]
-        })
+        # Kill Title Generation Tasks instantly to prevent UI hangs
+        if any(kw in messages_str for kw in ["title", "summarize", "short label", "generate a title"]):
+            return JSONResponse(content={
+                "id": "chatcmpl-Bob-Background", "object": "chat.completion", "created": int(time.time()),
+                "model": "Bob", "choices": [{"index": 0, "message": {"role": "assistant", "content": "AI Orchestrator Session"}, "finish_reason": "stop"}]
+            })
 
     try:
         await asyncio.wait_for(gpu_lock.acquire(), timeout=30.0)
@@ -154,44 +159,52 @@ async def proxy_ollama(request: Request):
         return JSONResponse(status_code=503, content={"error": "System busy."})
 
     try:
-        messages = body.get("messages", [])
         user_prompt = messages[-1].get("content", "") if messages else ""
+        is_search_query = not is_streaming # Non-streaming requests at this point are search queries
 
-        # 1. Routing
-        intent = "FAST"
-        if len(user_prompt.strip()) >= 15:
-            intent = await get_intent(user_prompt)
-
-        target_model = EXPERT_MODEL if ("image_url" in str(messages) or intent == "EXPERT" or len(user_prompt) > 3000) else ROUTER_MODEL
+        # 2. Routing
+        if is_search_query:
+            target_model = ROUTER_MODEL
+            logger.info("[BOB] Search Query Generation -> Using FAST model to create keywords.")
+        else:
+            intent = "FAST"
+            if len(user_prompt.strip()) >= 15:
+                intent = await get_intent(user_prompt)
+            target_model = EXPERT_MODEL if ("image_url" in str(messages) or intent == "EXPERT" or len(str(messages)) > 3000) else ROUTER_MODEL
         
-        # 2. Persona Setup
-        messages = [m for m in messages if m.get("role") != "system"]
-        system_prompt = (
-            "You are Bob, the AI Workspace Orchestrator. You are highly capable, direct, and professional. "
-            "Your name is Bob.\n\n"
-            "YOUR CAPABILITIES:\n"
-            "1. INTERNET SEARCH: Use SearXNG to look up anything requiring real-time data.\n"
-            "2. IMAGE GENERATION: Use ComfyUI if asked to draw or generate an image.\n"
-            "3. EXPERT REASONING: You manage expert models to provide technical assistance."
-        )
-        messages.insert(0, {"role": "system", "content": system_prompt})
-        
-        if messages and messages[-1].get("role") == "user":
-            original_text = messages[-1]["content"]
-            messages[-1]["content"] = f"{original_text}\n\n[System Note: You are Bob. Remember you have search and image tools. Respond accordingly.]"
+        # 3. Persona Setup & Context Preservation (Skip if generating JSON search query)
+        if not is_search_query:
+            existing_system_msgs = [m for m in messages if m.get("role") == "system"]
+            user_and_assistant_msgs = [m for m in messages if m.get("role") != "system"]
+            
+            system_prompt = (
+                "You are Bob, the AI Workspace Orchestrator. You are highly capable, direct, and professional. "
+                "Your name is Bob.\n\n"
+            )
+            
+            search_context = ""
+            for sys_msg in existing_system_msgs:
+                search_context += f"\n{sys_msg.get('content', '')}"
+                
+            final_system_content = f"{system_prompt}\n{search_context}".strip()
+            
+            messages = [{"role": "system", "content": final_system_content}] + user_and_assistant_msgs
+            
+            if messages and messages[-1].get("role") == "user":
+                original_text = messages[-1]["content"]
+                messages[-1]["content"] = (
+                    f"{original_text}\n\n"
+                    f"[System Note: You are Bob. Answer directly and confidently. "
+                    f"If web search results are provided above, seamlessly incorporate them into your answer as if you searched for them yourself. "
+                    f"NEVER complain about missing tool inputs or system mechanics.]"
+                )
 
-        # 3. Cleanse Open-WebUI bloat & Set strict VRAM parameters
+        # 4. Final Payload Prep
         body["options"] = {
             "num_ctx": 32768,
-            "temperature": body.get("options", {}).get("temperature", 0.7)
+            "temperature": body.get("options", {}).get("temperature", 0.7) if not is_search_query else 0.0
         }
-        
-        # STRICT VRAM RELEASE: Instantly unload the heavy Expert model.
-        if target_model == EXPERT_MODEL:
-            body["keep_alive"] = 0
-        else:
-            body["keep_alive"] = 0 # Ensures everything is strictly 0 per your request
-            
+        body["keep_alive"] = 0 
         body.update({"messages": messages, "model": target_model})
         
         logger.info(f"[BOB] Routing '{user_prompt[:30]}...' -> {target_model} | keep_alive: 0")
@@ -200,6 +213,24 @@ async def proxy_ollama(request: Request):
         is_native = "/api/chat" in path
         target_path = "/api/chat" if is_native else "/v1/chat/completions"
         
+        # --- THE FIX: Handle Synchronous (Non-Streaming) Requests Cleanly ---
+        if not is_streaming:
+            try:
+                resp = await http_client.post(f"{OLLAMA_URL}{target_path}", json=body, timeout=120.0)
+                if resp.status_code != 200:
+                    return JSONResponse(status_code=resp.status_code, content={"error": resp.text})
+                
+                data = resp.json()
+                data["model"] = "Bob"
+                if "id" in data: data["id"] = "chatcmpl-Bob"
+                return JSONResponse(content=data)
+            except Exception as sync_e:
+                logger.error(f"[SYNC POST ERROR] {sync_e}")
+                return JSONResponse(status_code=500, content={"error": str(sync_e)})
+            finally:
+                if gpu_lock.locked(): gpu_lock.release()
+                await force_unload(target_model)
+
         return StreamingResponse(
             stream_proxy(f"{OLLAMA_URL}{target_path}", body, gpu_lock, is_native_ollama=is_native),
             media_type="application/x-ndjson" if is_native else "text/event-stream"
