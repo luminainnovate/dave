@@ -1,7 +1,8 @@
-# 🧠 Project Architecture: Unified Local AI Agentic Workspace
+# 🧠 Project Architecture: Agentic Local AI Orchestrator (Bob)
 
 ## 1. System Context & Goals
-**Goal:** Build a fully localized, unified, and agent-driven AI workspace running on a single NVIDIA RTX 4090 via Windows Subsystem for Linux (WSL2).
+**Goal:** Build a fully localized, unified, and agent-driven AI workspace ("Bob") running on a single NVIDIA GPU (24GB+ VRAM recommended) via Windows Subsystem for Linux (WSL2).
+**Scalability:** While optimized for 24GB VRAM (allowing for large expert models like Qwen 27B), the system can be scaled down to 8GB-12GB VRAM by selecting smaller expert models (e.g., Llama-3-8B).
 **Capabilities:** Text generation, complex coding, vision (image analysis), voice transcription, document RAG, live web search, and image generation.
 **Accessibility:** The workspace must be accessible from the local area network (LAN), allowing phones, tablets, and other laptops to utilize the host's GPU resources via a unified web interface.
 **Key Constraint:** The system must use a **Tiered Orchestration** approach to provide instant responses for simple tasks while dynamically routing heavy tasks to expert models, managing VRAM aggressively to prevent OOM on a 24GB budget.
@@ -35,21 +36,23 @@ The system operates on a strict hardware limit. All agentic routing and tool exe
 ### ADR 002: GPU Mutex via Intelligent Proxy (The "Gatekeeper")
 * **Context:** Independent services (Ollama, ComfyUI) cannot coordinate VRAM usage natively, and reloading large models causes lag.
 * **Decision:** We will implement a **Python FastAPI Proxy** (The Gatekeeper) using a tiny resident LLM as a router.
-  * All API calls pass through this proxy.
-  * The proxy uses the **Resident Orchestrator** to categorize requests (Fast Path vs. Expert Path).
-  * The proxy maintains a `threading.Lock` for the 4090's "Expert Zone" (the remaining ~20GB of VRAM).
-  * Fast Path requests (greetings, simple knowledge) are answered by the Orchestrator immediately.
-  * Expert Path requests (Coding, Vision, RAG) or Image Generations trigger the Mutex lock and model swap.
+*   **Context:** Independent services (Ollama, ComfyUI) cannot coordinate VRAM usage natively, and reloading large models causes lag.
+*   **Decision:** We will implement a **Python FastAPI Proxy** (The Gatekeeper) using a tiny resident LLM as a router.
+    *   All API calls pass through this proxy.
+    *   The proxy uses the **Resident Orchestrator** to categorize requests (Fast Path vs. Expert Path).
+    *   The proxy maintains a `threading.Lock` for the 4090's "Expert Zone" (the remaining ~20GB of VRAM).
+    *   Fast Path requests (greetings, simple knowledge) are answered by the Orchestrator immediately.
+    *   Expert Path requests (Coding, Vision, RAG) or Image Generations trigger the Mutex lock and model swap.
 
-### ADR 003: Isolated Docker Bridge Networking
-* **Context:** Relying on `host.docker.internal` across WSL2 is prone to routing issues and exposes internal ports unnecessarily.
-* **Decision:** Deploy Open WebUI, SearXNG, and Ollama on a custom Docker bridge network (`ai-workspace-net`). Services will communicate via internal DNS (e.g., `http://ollama:11434`), exposing only the WebUI port (e.g., `3000`) to the Windows host.
+### ADR 003: Hybrid Native/Docker Orchestration
+*   **Context:** Running Ollama in Docker within WSL2 adds overhead and complications for GPU passthrough.
+*   **Decision:** Ollama will run natively in WSL2 for maximum performance. Open WebUI and SearXNG will run on a custom Docker bridge network (`ai-workspace-net`). Open WebUI will communicate with the host-bound Gatekeeper and native Ollama via `host.docker.internal`.
 
 ### ADR 004: ComfyUI-to-OpenAI Bridge (Prompt-to-Graph)
-* **Context:** Open WebUI expects DALL-E (OpenAI) schema, while ComfyUI requires a workflow graph JSON.
-* **Decision:** The Gatekeeper Proxy will perform **Prompt-to-Graph injection**. 
-  * A template `workflow_api.json` (exported from ComfyUI in API mode) will be stored on disk.
-  * The proxy will read this JSON, inject the user's prompt into the correct node (usually `CLIPTextEncode`), post it to ComfyUI's `/prompt` endpoint, and poll the `/history` endpoint for the resulting image URL.
+*   **Context:** Open WebUI expects DALL-E (OpenAI) schema, while ComfyUI requires a workflow graph JSON.
+*   **Decision:** The Gatekeeper Proxy will perform **Prompt-to-Graph injection**. 
+    *   A template `workflow_api.json` (exported from ComfyUI in API mode) will be stored on disk.
+    *   The proxy will read this JSON, inject the user's prompt into the correct node (usually `CLIPTextEncode`), post it to ComfyUI's `/prompt` endpoint, and poll the `/history` endpoint for the resulting image URL.
 
 ---
 
@@ -58,12 +61,10 @@ The system operates on a strict hardware limit. All agentic routing and tool exe
 ### A. The LLM Engine: Ollama
 * **Role:** Hosts text, vision, and audio models.
 * **Resident Orchestrator:** `qwen2.5:1.5b` (Always-on for intent detection).
-* **Expert Model:** `qwen3.5:27b` or `qwen2.5-vl` (Dense logic, coding, and **high-res vision analysis**).
-* **Audio (Whisper):** Open WebUI utilizes a Whisper model (local or via Ollama) for transcription.
-* **Deployment:** Docker container with NVIDIA GPU passthrough.
+* **Expert Model:** `qwen3.5:27b` (Dense logic, coding).
+* **Deployment:** Native WSL2 binary (for optimal GPU/VRAM performance).
 * **Configuration:** 
-  * **Resident Orchestrator:** Uses `keep_alive: -1` (pinned) for instant responses.
-  * **Expert Models:** Use `OLLAMA_KEEP_ALIVE=0` (global default) to ensure immediate VRAM clearing for ComfyUI.
+    *   VRAM managed dynamically by the Gatekeeper proxy.
 
 ### B. The Orchestrator & Frontend: Open WebUI
 * **Role:** Unified UI, RAG document processing, voice transcription (Whisper), embedding generation, and agentic tool routing.

@@ -1,24 +1,4 @@
 services:
-  ollama:
-    image: ollama/ollama:latest
-    container_name: ollama
-    networks:
-      - ai-workspace-net
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    volumes:
-      - ollama_data:/root/.ollama
-    environment:
-      # Removed KEEP_ALIVE=0 so the Orchestrator can manage it dynamically.
-      - OLLAMA_FLASH_ATTENTION=1
-      - OLLAMA_KV_CACHE_TYPE=q8_0
-      - OLLAMA_NUM_PARALLEL=1
-
   searxng:
     image: searxng/searxng:latest
     container_name: searxng
@@ -54,7 +34,6 @@ services:
       - RAG_WEB_SEARCH_CONCURRENT_REQUESTS=10
       - SEARXNG_QUERY_URL=http://searxng:8080/search?q=<query>
     depends_on:
-      - ollama
       - searxng
 
 networks:
@@ -62,5 +41,4 @@ networks:
     driver: bridge
 
 volumes:
-  ollama_data:
   open-webui_data:

@@ -31,7 +31,7 @@ nvidia-smi
 ```
 
 
-*You should see your RTX 4090 listed with 24GB of VRAM.*
+*You should see your NVIDIA GPU (e.g., RTX 3090, 4090) listed with its VRAM.*
 3. **Docker Installation:** Install Docker Engine and the NVIDIA Container Toolkit inside WSL2 to allow containers to access the GPU.
 *Note: Using Docker Desktop for Windows is acceptable, but native Docker inside WSL2 often yields better performance and resource control.*
 
@@ -43,7 +43,7 @@ nvidia-smi
 2. **Pull models:** Ensure the resident router and expert models are present.
    ```bash
    ollama pull qwen2.5:1.5b
-   ollama pull qwen3.5:27b
+   ollama pull qwen3.5:27b  # Or qwen2.5:7b for smaller GPUs
    ```
 
 3. **Apply VRAM Guardrail:** You must set the environment variable globally in the Ollama systemd service to ensure models drop from memory.
@@ -87,23 +87,6 @@ search:
 
 ```yaml
 services:
-  ollama:
-    image: ollama/ollama:latest
-    container_name: ollama
-    networks:
-      - ai-workspace-net
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    volumes:
-      - ollama_data:/root/.ollama
-    environment:
-      - OLLAMA_KEEP_ALIVE=0
-
   searxng:
     image: searxng/searxng:latest
     container_name: searxng
@@ -126,19 +109,18 @@ services:
     volumes:
       - open-webui_data:/app/backend/data
     environment:
-      - OLLAMA_BASE_URL=http://host.docker.internal:8000/v1
+      - OLLAMA_BASE_URL=http://host.docker.internal:8000
       - IMAGE_GENERATION_ENGINE=openai
       - OPENAI_API_BASE_URL=http://host.docker.internal:8000/v1
       - OPENAI_API_KEY=not-needed
     depends_on:
-      - ollama
+      - searxng
 
 networks:
   ai-workspace-net:
     driver: bridge
 
 volumes:
-  ollama_data:
   open-webui_data:
 ```
 

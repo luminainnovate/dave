@@ -73,7 +73,8 @@ async def stream_proxy(url: str, body: dict, lock_to_release: asyncio.Lock, is_n
     async def _stream_with_rewriting(resp):
         try:
             async for line in resp.aiter_lines():
-                if not line: continue
+                if not line:
+                    continue
                 
                 if is_native_ollama:
                     try:
@@ -90,7 +91,8 @@ async def stream_proxy(url: str, body: dict, lock_to_release: asyncio.Lock, is_n
                         try:
                             data = json.loads(line[6:])
                             data["model"] = "Bob"
-                            if "id" in data: data["id"] = "chatcmpl-Bob"
+                            if "id" in data:
+                                data["id"] = "chatcmpl-Bob"
                             yield f"data: {json.dumps(data)}\n\n".encode('utf-8')
                         except Exception:
                             rewritten = re.sub(r'("model"\s*:\s*")[^"]+(")', r'\1Bob\2', line)
@@ -109,12 +111,14 @@ async def stream_proxy(url: str, body: dict, lock_to_release: asyncio.Lock, is_n
             if resp.status_code != 200:
                 error_body = await resp.aread()
                 yield b"ERROR: " + error_body
-                if lock_to_release.locked(): lock_to_release.release()
+                if lock_to_release.locked():
+                    lock_to_release.release()
                 return
             async for line_bytes in _stream_with_rewriting(resp):
                 yield line_bytes
-    except Exception as e:
-        if lock_to_release.locked(): lock_to_release.release()
+    except Exception:
+        if lock_to_release.locked():
+            lock_to_release.release()
 
 @app.get("/api/tags")
 @app.get("/v1/models")
@@ -222,13 +226,15 @@ async def proxy_ollama(request: Request):
                 
                 data = resp.json()
                 data["model"] = "Bob"
-                if "id" in data: data["id"] = "chatcmpl-Bob"
+                if "id" in data:
+                    data["id"] = "chatcmpl-Bob"
                 return JSONResponse(content=data)
             except Exception as sync_e:
                 logger.error(f"[SYNC POST ERROR] {sync_e}")
                 return JSONResponse(status_code=500, content={"error": str(sync_e)})
             finally:
-                if gpu_lock.locked(): gpu_lock.release()
+                if gpu_lock.locked():
+                    gpu_lock.release()
                 await force_unload(target_model)
 
         return StreamingResponse(
@@ -238,7 +244,8 @@ async def proxy_ollama(request: Request):
 
     except Exception as e:
         logger.error(f"Proxy Error: {e}")
-        if gpu_lock.locked(): gpu_lock.release()
+        if gpu_lock.locked():
+            gpu_lock.release()
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.post("/v1/images/generations")
@@ -251,15 +258,19 @@ async def proxy_comfyui(request: Request):
         
         body = await request.json()
         prompt_text = body.get("prompt", "")
-        with open(WORKFLOW_PATH, 'r') as f: workflow = json.load(f)
+        with open(WORKFLOW_PATH, 'r') as f:
+            workflow = json.load(f)
         for node_id in workflow:
             if workflow[node_id].get("class_type") == "CLIPTextEncode":
                 workflow[node_id]["inputs"]["text"] = prompt_text
         p_resp = await http_client.post(f"{COMFYUI_URL}/prompt", json={"prompt": workflow})
-        if p_resp.status_code != 200: return JSONResponse(status_code=500, content={"error": f"ComfyUI Error: {p_resp.status_code}"})
+        if p_resp.status_code != 200:
+            return JSONResponse(status_code=500, content={"error": f"ComfyUI Error: {p_resp.status_code}"})
         
-        try: p_id = p_resp.json().get("prompt_id")
-        except Exception: return JSONResponse(status_code=500, content={"error": "Invalid JSON"})
+        try:
+            p_id = p_resp.json().get("prompt_id")
+        except Exception:
+            return JSONResponse(status_code=500, content={"error": "Invalid JSON"})
         
         for _ in range(30):
             h_resp = await http_client.get(f"{COMFYUI_URL}/history/{p_id}")
@@ -275,14 +286,16 @@ async def proxy_comfyui(request: Request):
                                 fn = imgs[0].get("filename")
                                 return JSONResponse(content={"created": 1, "data": [{"url": f"{COMFYUI_URL}/view?filename={fn}"}]})
                         break
-                except Exception: pass
+                except Exception:
+                    pass
             await asyncio.sleep(0.5)
             
         return JSONResponse(status_code=500, content={"error": "Generation failed."})
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
     finally:
-        if gpu_lock.locked(): gpu_lock.release()
+        if gpu_lock.locked():
+            gpu_lock.release()
 
 if __name__ == "__main__":
     import uvicorn
