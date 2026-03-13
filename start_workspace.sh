@@ -10,7 +10,8 @@ echo "🐳 Starting Docker (Ollama, SearXNG, Open WebUI)..."
 docker compose up -d
 
 # 2. Start Gatekeeper Proxy
-echo "🛡️ Starting Gatekeeper Proxy..."
+echo "🛡️ Clearing Port 8000 and Starting Gatekeeper Proxy..."
+sudo fuser -k 8000/tcp > /dev/null 2>&1
 # Check if venv exists
 if [ -d "gatekeeper-env" ]; then
     nohup ./gatekeeper-env/bin/python3 gatekeeper.py > gatekeeper.log 2>&1 &

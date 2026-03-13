@@ -1,204 +1,258 @@
 import asyncio
 import httpx
-import os
 import json
 import logging
+import re
+import time
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("Gatekeeper")
+logger = logging.getLogger("Bob-Orchestrator")
 
-app = FastAPI(title="AI Workspace Gatekeeper Proxy")
+app = FastAPI(title="Bob: AI Workspace Orchestrator")
 gpu_lock = asyncio.Lock()
-# Global client for connection pooling
 http_client = httpx.AsyncClient(timeout=None)
 
-# Model Configs
+# --- STRICT MODEL CONFIG ---
 ROUTER_MODEL = "qwen2.5:1.5b"
-GLM_MODEL = "glm-4.7-flash:latest"  # Tier 2: Utility/Reasoning
-EXPERT_MODEL = "qwen3.5:27b"        # Tier 3: Extreme/Coding
+EXPERT_MODEL = "qwen3.5:27b"
 OLLAMA_URL = "http://localhost:11434"
 COMFYUI_URL = "http://localhost:8188"
 WORKFLOW_PATH = "workflow_api.json"
 
-# Common keywords that trigger FAST path instantly without LLM classification
-FAST_KEYWORDS = {"hi", "hello", "who are you", "what model", "what version", "identify yourself", "hey", "test"}
-
 async def force_unload(model_name: str):
-    """Sends an explicit unload command to Ollama for the given model."""
-    logger.info(f"Forcing unload of model: {model_name}")
+    """Frees VRAM manually (Only used when switching to ComfyUI now)"""
     try:
-        # Loading a model with keep_alive=0 tells Ollama to drop it from VRAM
-        await http_client.post(
+        logger.info(f"[VRAM] Sending eviction notice for {model_name}...")
+        asyncio.create_task(http_client.post(
             f"{OLLAMA_URL}/api/generate", 
             json={"model": model_name, "keep_alive": 0},
-            timeout=5.0
-        )
+            timeout=2.0
+        ))
     except Exception as e:
-        logger.warning(f"Failed to force unload {model_name}: {e}")
-
-import re
+        logger.warning(f"[VRAM ERROR] Failed to signal unload for {model_name}: {e}")
 
 async def get_intent(prompt: str) -> str:
-    """Uses the fast router model to categorize the intent into: FAST, GLM, EXPERT, or IMAGE."""
-    clean_p = prompt.lower().strip().strip("?!.")
-    
-    # Instant bypass for common phrases
-    if clean_p in FAST_KEYWORDS or len(clean_p) < 10:
-        logger.info(f"Keyword/Length bypass triggered for: {clean_p}")
-        return "FAST"
-
-    # Classification logic
+    """Fast binary router. Runs 100% on CPU to prevent VRAM fragmentation."""
     system_msg = (
-        "TASK: Classify the user prompt into exactly ONE of these categories: "
-        "FAST, GLM, EXPERT, or IMAGE.\n"
-        "- FAST: Greetings, simple conversation, status checks.\n"
-        "- GLM: Medium reasoning, creative writing, summaries.\n"
-        "- EXPERT: Complex coding, math, logical puzzles, high-precision analysis.\n"
-        "- IMAGE: Requests to generate or create a visual/image.\n"
-        "RULES: Output ONLY the category name. NO EXPLANATION. NO JSON."
+        "Classify the text into EXACTLY one word: FAST or EXPERT.\n"
+        "FAST: Greetings, small talk, identity questions ('who are you').\n"
+        "EXPERT: Code, complex math, deep logic, analysis, technical troubleshooting.\n"
     )
     payload = {
         "model": ROUTER_MODEL,
         "messages": [
             {"role": "system", "content": system_msg}, 
-            {"role": "user", "content": prompt}
+            {"role": "user", "content": f"Text: '{prompt[:500]}' ->"} 
         ],
         "stream": False,
-        "keep_alive": -1 # Keep router pinned
+        "keep_alive": "10m", # Keep warm in System RAM (CPU only)
+        "options": {
+            "temperature": 0.0, 
+            "num_ctx": 2048,
+            "num_gpu": 0 # Forces CPU execution so it never touches VRAM
+        } 
     }
     try:
-        resp = await http_client.post(f"{OLLAMA_URL}/v1/chat/completions", json=payload, timeout=10.0)
-        resp.raise_for_status()
-        raw_content = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "").upper()
-        
-        # Use regex to find the first valid category in the response
-        match = re.search(r"(FAST|GLM|EXPERT|IMAGE)", raw_content)
-        if match:
-            intent = match.group(1)
-            logger.info(f"Intent classified as: {intent} (Extracted from: {raw_content.replace('\n', ' ')})")
-            return intent
-        
-        logger.warning(f"No valid intent found in response: {raw_content}. Defaulting to FAST.")
+        resp = await http_client.post(f"{OLLAMA_URL}/v1/chat/completions", json=payload, timeout=5.0)
+        if resp.status_code == 200:
+            data = resp.json()
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "").upper()
+            return "EXPERT" if "EXPERT" in content else "FAST"
         return "FAST"
     except Exception as e:
-        logger.warning(f"Routing failed: {e}. Defaulting to FAST.")
+        logger.warning(f"Router network/timeout error: {e}")
         return "FAST"
 
-async def stream_proxy(url: str, body: dict, req_lock: asyncio.Lock = None):
-    """Proxies the request, conditionally locking the GPU and enforcing VRAM cleanup."""
+async def stream_proxy(url: str, body: dict, lock_to_release: asyncio.Lock, is_native_ollama: bool = False):
+    """Streams data and cleanly releases the lock."""
     target_model = body.get("model")
-    if req_lock:
+    
+    async def _stream_with_rewriting(resp):
         try:
-            # Acquisition timeout to prevent deadlock
-            await asyncio.wait_for(req_lock.acquire(), timeout=30.0)
-            logger.info(f"GPU Lock Acquired for {target_model}.")
-            
-            # Heavy models MUST have keep_alive: 0
-            body["keep_alive"] = 0
-            
-            async with http_client.stream("POST", url, json=body) as resp:
-                async for chunk in resp.aiter_bytes():
-                    yield chunk
-        except asyncio.TimeoutError:
-            logger.error("GPU Lock Acquisition Timed Out.")
-            yield b"data: " + json.dumps({"error": "Heavy resource busy. Please retry."}).encode() + b"\n\n"
+            async for line in resp.aiter_lines():
+                if not line: continue
+                
+                if is_native_ollama:
+                    try:
+                        data = json.loads(line)
+                        data["model"] = "Bob"
+                        yield f"{json.dumps(data)}\n".encode('utf-8')
+                    except Exception:
+                        yield f"{line}\n".encode('utf-8')
+                else:
+                    if line.startswith("data: "):
+                        if line == "data: [DONE]":
+                            yield b"data: [DONE]\n\n"
+                            continue
+                        try:
+                            data = json.loads(line[6:])
+                            data["model"] = "Bob"
+                            if "id" in data: data["id"] = "chatcmpl-Bob"
+                            yield f"data: {json.dumps(data)}\n\n".encode('utf-8')
+                        except Exception:
+                            rewritten = re.sub(r'("model"\s*:\s*")[^"]+(")', r'\1Bob\2', line)
+                            yield f"{rewritten}\n\n".encode('utf-8')
+        except Exception as e:
+            logger.error(f"[STREAM CONTENT ERROR] {e}")
+            msg = {"error": str(e)}
+            yield (json.dumps(msg) + "\n").encode() if is_native_ollama else f"data: {json.dumps(msg)}\n\n".encode()
         finally:
-            if req_lock.locked():
-                # Release lock BEFORE calling unload to allow next request to start loading if ready
-                req_lock.release()
-                logger.info("GPU Lock Released.")
-            # Explicit cleanup call
-            await force_unload(target_model)
-    else:
-        logger.info(f"Fast Path execution ({target_model}).")
-        async with http_client.stream("POST", url, json=body) as resp:
-            async for chunk in resp.aiter_bytes():
-                yield chunk
+            logger.info(f"[STREAM] Finished stream for {target_model}")
+            if lock_to_release.locked(): 
+                lock_to_release.release()
 
-@app.get("/v1/models")
-async def list_models():
-    """Proxies model list, filtering for valid tiers."""
     try:
-        resp = await http_client.get(f"{OLLAMA_URL}/v1/models")
-        return JSONResponse(content=resp.json())
+        async with http_client.stream("POST", url, json=body, timeout=120.0) as resp:
+            if resp.status_code != 200:
+                error_body = await resp.aread()
+                yield b"ERROR: " + error_body
+                if lock_to_release.locked(): lock_to_release.release()
+                return
+            async for line_bytes in _stream_with_rewriting(resp):
+                yield line_bytes
+    except Exception as e:
+        if lock_to_release.locked(): lock_to_release.release()
+
+@app.get("/api/tags")
+@app.get("/v1/models")
+async def list_models(request: Request):
+    """Forces Open-WebUI to only see Bob."""
+    try:
+        is_ollama = "tags" in str(request.url)
+        bob_model = {
+            "name": "Bob",
+            "model": "Bob",
+            "modified_at": "2024-01-01T00:00:00.000000Z",
+            "size": 0,
+            "digest": "bob-identity",
+            "details": {"family": "llama", "parameter_size": "Expert", "quantization_level": "Q8_0"}
+        } if is_ollama else {
+            "id": "Bob", "object": "model", "created": int(time.time()), "owned_by": "System"
+        }
+        return JSONResponse(content={"models": [bob_model]} if is_ollama else {"object": "list", "data": [bob_model]})
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
+@app.post("/api/chat")
 @app.post("/v1/chat/completions")
 async def proxy_ollama(request: Request):
+    body = await request.json()
+    is_streaming = body.get("stream", True)
+    
+    if not is_streaming:
+        return JSONResponse(content={
+            "id": "chatcmpl-Bob-Background", "object": "chat.completion", "created": int(time.time()),
+            "model": "Bob", "choices": [{"index": 0, "message": {"role": "assistant", "content": "AI Orchestrator Session"}, "finish_reason": "stop"}]
+        })
+
     try:
-        body = await request.json()
+        await asyncio.wait_for(gpu_lock.acquire(), timeout=30.0)
+    except asyncio.TimeoutError:
+        return JSONResponse(status_code=503, content={"error": "System busy."})
+
+    try:
         messages = body.get("messages", [])
         user_prompt = messages[-1].get("content", "") if messages else ""
+
+        # 1. Routing
+        intent = "FAST"
+        if len(user_prompt.strip()) >= 15:
+            intent = await get_intent(user_prompt)
+
+        target_model = EXPERT_MODEL if ("image_url" in str(messages) or intent == "EXPERT" or len(user_prompt) > 3000) else ROUTER_MODEL
         
-        has_images = any("image_url" in str(msg) for msg in messages)
-        intent = await get_intent(user_prompt)
+        # 2. Persona Setup
+        messages = [m for m in messages if m.get("role") != "system"]
+        system_prompt = (
+            "You are Bob, the AI Workspace Orchestrator. You are highly capable, direct, and professional. "
+            "Your name is Bob.\n\n"
+            "YOUR CAPABILITIES:\n"
+            "1. INTERNET SEARCH: Use SearXNG to look up anything requiring real-time data.\n"
+            "2. IMAGE GENERATION: Use ComfyUI if asked to draw or generate an image.\n"
+            "3. EXPERT REASONING: You manage expert models to provide technical assistance."
+        )
+        messages.insert(0, {"role": "system", "content": system_prompt})
         
-        # Tiered Decision
-        is_expert = has_images or "EXPERT" in intent or len(user_prompt) > 4000
-        is_glm = "GLM" in intent and not is_expert
+        if messages and messages[-1].get("role") == "user":
+            original_text = messages[-1]["content"]
+            messages[-1]["content"] = f"{original_text}\n\n[System Note: You are Bob. Remember you have search and image tools. Respond accordingly.]"
+
+        # 3. Cleanse Open-WebUI bloat & Set strict VRAM parameters
+        body["options"] = {
+            "num_ctx": 32768,
+            "temperature": body.get("options", {}).get("temperature", 0.7)
+        }
         
-        if is_expert:
-            target_model = EXPERT_MODEL
-            use_lock = True
-        elif is_glm:
-            target_model = GLM_MODEL
-            use_lock = True
+        # STRICT VRAM RELEASE: Instantly unload the heavy Expert model.
+        if target_model == EXPERT_MODEL:
+            body["keep_alive"] = 0
         else:
-            target_model = ROUTER_MODEL
-            use_lock = False
+            body["keep_alive"] = 0 # Ensures everything is strictly 0 per your request
             
-        # If we are in FAST path, we don't need a lock and can stream immediately
-        # This reduces overhead for Tier 1.
-            
-        body["model"] = target_model
-        logger.info(f"Routing to: {target_model}")
+        body.update({"messages": messages, "model": target_model})
+        
+        logger.info(f"[BOB] Routing '{user_prompt[:30]}...' -> {target_model} | keep_alive: 0")
+
+        path = str(request.url.path)
+        is_native = "/api/chat" in path
+        target_path = "/api/chat" if is_native else "/v1/chat/completions"
         
         return StreamingResponse(
-            stream_proxy(f"{OLLAMA_URL}/v1/chat/completions", body, req_lock=gpu_lock if use_lock else None),
-            media_type="text/event-stream"
+            stream_proxy(f"{OLLAMA_URL}{target_path}", body, gpu_lock, is_native_ollama=is_native),
+            media_type="application/x-ndjson" if is_native else "text/event-stream"
         )
+
     except Exception as e:
-        logger.error(f"Chat Proxy Error: {e}")
+        logger.error(f"Proxy Error: {e}")
+        if gpu_lock.locked(): gpu_lock.release()
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.post("/v1/images/generations")
 async def proxy_comfyui(request: Request):
+    await gpu_lock.acquire()
     try:
-        await asyncio.wait_for(gpu_lock.acquire(), timeout=30.0)
-        logger.info("ComfyUI Lock Acquired.")
-        try:
-            body = await request.json()
-            prompt_text = body.get("prompt", "")
-            with open(WORKFLOW_PATH, 'r') as f: workflow = json.load(f)
-            # Find and update text prompt
-            for node_id in workflow:
-                if workflow[node_id].get("class_type") == "CLIPTextEncode":
-                    workflow[node_id]["inputs"]["text"] = prompt_text
-            p_resp = await http_client.post(f"{COMFYUI_URL}/prompt", json={"prompt": workflow})
-            p_id = p_resp.json().get("prompt_id")
-            for _ in range(60):
-                h_resp = await http_client.get(f"{COMFYUI_URL}/history/{p_id}")
-                hist = h_resp.json()
-                if p_id in hist:
-                    out = hist[p_id].get("outputs", {})
-                    if out:
-                        nid = list(out.keys())[0]
-                        imgs = out[nid].get("images", [])
-                        if imgs:
-                            fn = imgs[0].get("filename")
-                            return JSONResponse(content={"created": 1, "data": [{"url": f"{COMFYUI_URL}/view?filename={fn}"}]})
-                    break
-                await asyncio.sleep(1)
-            return JSONResponse(status_code=500, content={"error": "Generation failed."})
-        finally:
-            if gpu_lock.locked(): gpu_lock.release()
-    except asyncio.TimeoutError:
-        return JSONResponse(status_code=503, content={"error": "Resources busy."})
+        # Extra safety check to clear VRAM for ComfyUI
+        await force_unload(EXPERT_MODEL)
+        await asyncio.sleep(1.0) 
+        
+        body = await request.json()
+        prompt_text = body.get("prompt", "")
+        with open(WORKFLOW_PATH, 'r') as f: workflow = json.load(f)
+        for node_id in workflow:
+            if workflow[node_id].get("class_type") == "CLIPTextEncode":
+                workflow[node_id]["inputs"]["text"] = prompt_text
+        p_resp = await http_client.post(f"{COMFYUI_URL}/prompt", json={"prompt": workflow})
+        if p_resp.status_code != 200: return JSONResponse(status_code=500, content={"error": f"ComfyUI Error: {p_resp.status_code}"})
+        
+        try: p_id = p_resp.json().get("prompt_id")
+        except Exception: return JSONResponse(status_code=500, content={"error": "Invalid JSON"})
+        
+        for _ in range(30):
+            h_resp = await http_client.get(f"{COMFYUI_URL}/history/{p_id}")
+            if h_resp.status_code == 200:
+                try:
+                    hist = h_resp.json()
+                    if p_id in hist:
+                        out = hist[p_id].get("outputs", {})
+                        if out:
+                            nid = list(out.keys())[0]
+                            imgs = out[nid].get("images", [])
+                            if imgs:
+                                fn = imgs[0].get("filename")
+                                return JSONResponse(content={"created": 1, "data": [{"url": f"{COMFYUI_URL}/view?filename={fn}"}]})
+                        break
+                except Exception: pass
+            await asyncio.sleep(0.5)
+            
+        return JSONResponse(status_code=500, content={"error": "Generation failed."})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    finally:
+        if gpu_lock.locked(): gpu_lock.release()
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("gatekeeper.proxy:app" if __name__ != "__main__" else app, host="0.0.0.0", port=8000, reload=False, log_level="info", access_log=False)
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=False, log_level="info")

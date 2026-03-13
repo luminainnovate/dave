@@ -16,7 +16,8 @@ echo "🐳 Deploying Docker Stack (SearXNG & Open WebUI)..."
 docker compose up -d
 
 # 3. Gatekeeper Proxy Setup
-echo "🛡️ Setting up Gatekeeper Proxy..."
+echo "🛡️ Clearing Port 8000 and Setting up Gatekeeper Proxy..."
+sudo fuser -k 8000/tcp > /dev/null 2>&1
 if [ ! -d "gatekeeper-env" ]; then
     python3 -m venv gatekeeper-env
 fi
