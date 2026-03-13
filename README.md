@@ -29,7 +29,7 @@ The setup is automated. Ensure your NVIDIA drivers are up to date on Windows, th
 
 1.  **Clone the repository:**
     ```bash
-    git clone https://github.com/mitro/br.ai.n.git
+    git clone https://github.com/mitro54/br.ai.n.git
     cd br.ai.n
     ```
 
