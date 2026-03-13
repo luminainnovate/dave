@@ -1,6 +1,6 @@
 # 🧠 br.ai.n: Agentic Local AI Orchestrator (Meet Bob)
 
-[![CI](https://github.com/mitro/br.ai.n/actions/workflows/ci.yml/badge.svg)](https://github.com/mitro/br.ai.n/actions/workflows/ci.yml)
+[![CI](https://github.com/mitro54/br.ai.n/actions/workflows/ci.yml/badge.svg)](https://github.com/mitro54/br.ai.n/actions/workflows/ci.yml)
 
 **br.ai.n** is an **Agentic Local AI Orchestrator** powered by **Bob**, a unified AI persona running on your local hardware. Bob manages a tiered orchestration system on a single NVIDIA GPU (24GB+ VRAM), providing instant responses for simple tasks while dynamically routing complex requests (Coding, Vision, Image Generation) to expert models.
 
