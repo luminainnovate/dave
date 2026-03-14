@@ -22,6 +22,9 @@ OLLAMA_URL = "http://localhost:11434"
 COMFYUI_URL = "http://localhost:8188"
 WORKFLOW_PATH = "workflow_api.json"
 
+# --- STATE MANAGEMENT ---
+vram_locked = False
+
 async def force_unload(model_name: str):
     """Frees VRAM manually (Only used when switching to ComfyUI now)"""
     try:
@@ -34,37 +37,47 @@ async def force_unload(model_name: str):
     except Exception as e:
         logger.warning(f"[VRAM ERROR] Failed to signal unload for {model_name}: {e}")
 
-async def get_intent(prompt: str) -> str:
-    """Fast binary router. Runs 100% on CPU to prevent VRAM fragmentation."""
+async def analyze_request(prompt: str) -> dict:
+    """Smart Triage. Evaluates complexity, follow-ups, and tool necessity."""
     system_msg = (
-        "Classify the text into EXACTLY one word: FAST or EXPERT.\n"
-        "FAST: Greetings, small talk, identity questions ('who are you').\n"
-        "EXPERT: Code, complex math, deep logic, analysis, technical troubleshooting.\n"
+        "You are the Triage AI for a workspace. Read the user's prompt and evaluate it. "
+        "The 'Expert' AI is incredibly busy and expensive. You must only call the Expert if "
+        "the complexity is above 6 (e.g., coding, deep logic, advanced math). "
+        "Small talk, greetings, or simple facts are complexity 1-4. "
+        "Guess if the user will need follow-up questions to solve this task (true/false). "
+        "CRITICAL: Determine if the request requires using an external tool like Web Search to get real-time info or news (true/false). "
+        "Respond ONLY in pure JSON format: {\"complexity\": <int>, \"expect_followups\": <bool>, \"requires_tool\": <bool>}"
     )
     payload = {
         "model": ROUTER_MODEL,
+        "format": "json", 
         "messages": [
             {"role": "system", "content": system_msg}, 
-            {"role": "user", "content": f"Text: '{prompt[:500]}' ->"} 
+            {"role": "user", "content": prompt[:500]} 
         ],
         "stream": False,
-        "keep_alive": "10m", # Keep warm in System RAM (CPU only)
+        "keep_alive": "10m", 
         "options": {
             "temperature": 0.0, 
             "num_ctx": 2048,
-            "num_gpu": 0 # Forces CPU execution so it never touches VRAM
+            "num_gpu": 0 
         } 
     }
     try:
         resp = await http_client.post(f"{OLLAMA_URL}/v1/chat/completions", json=payload, timeout=5.0)
         if resp.status_code == 200:
-            data = resp.json()
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "").upper()
-            return "EXPERT" if "EXPERT" in content else "FAST"
-        return "FAST"
+            content = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "{}")
+            data = json.loads(content)
+            return {
+                "complexity": int(data.get("complexity", 1)),
+                "followups": bool(data.get("expect_followups", False)),
+                "requires_tool": bool(data.get("requires_tool", False))
+            }
     except Exception as e:
-        logger.warning(f"Router network/timeout error: {e}")
-        return "FAST"
+        logger.warning(f"Router network/parsing error: {e}")
+    
+    # Failsafe default
+    return {"complexity": 1, "followups": False, "requires_tool": False}
 
 async def stream_proxy(url: str, body: dict, lock_to_release: asyncio.Lock, is_native_ollama: bool = False):
     """Streams data and cleanly releases the lock."""
@@ -143,81 +156,93 @@ async def list_models(request: Request):
 @app.post("/api/chat")
 @app.post("/v1/chat/completions")
 async def proxy_ollama(request: Request):
+    global vram_locked
     body = await request.json()
     is_streaming = body.get("stream", True)
     messages = body.get("messages", [])
     messages_str = str(messages).lower()
     
-    # 1. SMART BACKGROUND TASK INTERCEPT
+    # 1. IDENTIFY BACKGROUND TASKS (Titles, Tags, Summaries)
+    is_background_task = False
     if not is_streaming:
-        # Kill Title Generation Tasks instantly to prevent UI hangs
-        if any(kw in messages_str for kw in ["title", "summarize", "short label", "generate a title"]):
-            return JSONResponse(content={
-                "id": "chatcmpl-Bob-Background", "object": "chat.completion", "created": int(time.time()),
-                "model": "Bob", "choices": [{"index": 0, "message": {"role": "assistant", "content": "AI Orchestrator Session"}, "finish_reason": "stop"}]
-            })
+        if any(kw in messages_str for kw in ["title", "summarize", "short label", "generate a title", "tags"]):
+            is_background_task = True
 
     try:
-        await asyncio.wait_for(gpu_lock.acquire(), timeout=30.0)
+        await asyncio.wait_for(gpu_lock.acquire(), timeout=120.0)
     except asyncio.TimeoutError:
         return JSONResponse(status_code=503, content={"error": "System busy."})
 
     try:
         user_prompt = messages[-1].get("content", "") if messages else ""
-        is_search_query = not is_streaming # Non-streaming requests at this point are search queries
+        user_prompt_lower = user_prompt.lower()
 
-        # 2. Routing
-        if is_search_query:
+        # --- MANUAL VRAM OVERRIDES ---
+        if "!lock" in user_prompt_lower:
+            vram_locked = True
+            gpu_lock.release()
+            return JSONResponse(content={"id": "chatcmpl-Bob", "object": "chat.completion", "created": int(time.time()), "model": "Bob", "choices": [{"index": 0, "message": {"role": "assistant", "content": "🔒 **VRAM Locked.** Expert is held in memory."}, "finish_reason": "stop"}]})
+        elif "!unlock" in user_prompt_lower:
+            vram_locked = False
+            await force_unload(EXPERT_MODEL)
+            gpu_lock.release()
+            return JSONResponse(content={"id": "chatcmpl-Bob", "object": "chat.completion", "created": int(time.time()), "model": "Bob", "choices": [{"index": 0, "message": {"role": "assistant", "content": "🔓 **VRAM Unlocked.** Memory cleared."}, "finish_reason": "stop"}]})
+
+        # --- SMART ROUTING & TRIAGE ---
+        target_model = ROUTER_MODEL
+        dynamic_keep_alive = 0 
+        
+        if is_background_task:
             target_model = ROUTER_MODEL
-            logger.info("[BOB] Search Query Generation -> Using FAST model to create keywords.")
+            dynamic_keep_alive = 0
+            logger.info("[ROUTING] Background Task (Title/Tags) -> Forcing FAST model")
+            
+        elif "@expert" in user_prompt_lower or "hey expert" in user_prompt_lower:
+            target_model = EXPERT_MODEL
+            dynamic_keep_alive = "3m"
+            logger.info("[ROUTING] Explicit keyword -> Forcing EXPERT")
+            
+        elif "@bob" in user_prompt_lower or "hey bob" in user_prompt_lower:
+            target_model = ROUTER_MODEL
+            dynamic_keep_alive = 0
+            logger.info("[ROUTING] Explicit keyword -> Forcing FAST")
+            
         else:
-            intent = "FAST"
-            if len(user_prompt.strip()) >= 15:
-                intent = await get_intent(user_prompt)
-            target_model = EXPERT_MODEL if ("image_url" in str(messages) or intent == "EXPERT" or len(str(messages)) > 3000) else ROUTER_MODEL
-        
-        # 3. Persona Setup & Context Preservation (Skip if generating JSON search query)
-        if not is_search_query:
-            existing_system_msgs = [m for m in messages if m.get("role") == "system"]
-            user_and_assistant_msgs = [m for m in messages if m.get("role") != "system"]
+            # Let the Triage AI Decide
+            analysis = await analyze_request(user_prompt)
             
-            system_prompt = (
-                "You are Bob, the AI Workspace Orchestrator. You are highly capable, direct, and professional. "
-                "Your name is Bob.\n\n"
-            )
+            # Using .get() ensures it never crashes, even if the dictionary is malformed
+            complexity = analysis.get("complexity", 1)
+            requires_tool = analysis.get("requires_tool", False)
+            followups = analysis.get("followups", False)
             
-            search_context = ""
-            for sys_msg in existing_system_msgs:
-                search_context += f"\n{sys_msg.get('content', '')}"
-                
-            final_system_content = f"{system_prompt}\n{search_context}".strip()
+            logger.info(f"[TRIAGE] Complexity: {complexity}/10 | Needs Tool: {requires_tool} | Follow-ups: {followups}")
             
-            messages = [{"role": "system", "content": final_system_content}] + user_and_assistant_msgs
-            
-            if messages and messages[-1].get("role") == "user":
-                original_text = messages[-1]["content"]
-                messages[-1]["content"] = (
-                    f"{original_text}\n\n"
-                    f"[System Note: You are Bob. Answer directly and confidently. "
-                    f"If web search results are provided above, seamlessly incorporate them into your answer as if you searched for them yourself. "
-                    f"NEVER complain about missing tool inputs or system mechanics.]"
-                )
+            if complexity > 6 or requires_tool:
+                target_model = EXPERT_MODEL
+                dynamic_keep_alive = "3m" if followups else 0
+            else:
+                target_model = ROUTER_MODEL
 
-        # 4. Final Payload Prep
+        # Apply global lock if active
+        if vram_locked:
+            dynamic_keep_alive = "-1"
+
+        # 3. Final Payload Prep
         body["options"] = {
-            "num_ctx": 32768,
-            "temperature": body.get("options", {}).get("temperature", 0.7) if not is_search_query else 0.0
+            "num_ctx": 24576,
+            "temperature": body.get("options", {}).get("temperature", 0.7) if is_background_task else 0.7
         }
-        body["keep_alive"] = 0 
-        body.update({"messages": messages, "model": target_model})
+        body["keep_alive"] = dynamic_keep_alive
+        body["model"] = target_model
         
-        logger.info(f"[BOB] Routing '{user_prompt[:30]}...' -> {target_model} | keep_alive: 0")
+        logger.info(f"[EXECUTE] Target: {target_model} | Keep-Alive: {dynamic_keep_alive}")
 
         path = str(request.url.path)
         is_native = "/api/chat" in path
         target_path = "/api/chat" if is_native else "/v1/chat/completions"
         
-        # --- THE FIX: Handle Synchronous (Non-Streaming) Requests Cleanly ---
+        # Handle Synchronous Requests
         if not is_streaming:
             try:
                 resp = await http_client.post(f"{OLLAMA_URL}{target_path}", json=body, timeout=120.0)
@@ -235,7 +260,6 @@ async def proxy_ollama(request: Request):
             finally:
                 if gpu_lock.locked():
                     gpu_lock.release()
-                await force_unload(target_model)
 
         return StreamingResponse(
             stream_proxy(f"{OLLAMA_URL}{target_path}", body, gpu_lock, is_native_ollama=is_native),
