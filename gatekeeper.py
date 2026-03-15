@@ -326,13 +326,13 @@ async def proxy_ollama(request: Request):
         elif "@expert" in user_prompt_lower or "hey expert" in user_prompt_lower:
             target_model = EXPERT_MODEL
             dynamic_keep_alive = "3m"
-            expert_warm_until = current_time + 180
+            expert_warm_until = current_time + 300
             if not is_expert_warm: is_cold_expert = True
             logger.info(f"[ROUTING] Force EXPERT ({'cold' if is_cold_expert else 'warm'})")
         elif is_expert_warm or vram_locked:
             target_model = EXPERT_MODEL
             dynamic_keep_alive = "3m" if not vram_locked else "-1"
-            if not vram_locked: expert_warm_until = current_time + 180
+            if not vram_locked: expert_warm_until = current_time + 300
             logger.info("[ROUTING] Expert warm")
         else:
             # Triage Path
@@ -343,7 +343,7 @@ async def proxy_ollama(request: Request):
             if analysis.get("complexity", 1) > 6 or analysis.get("requires_tool", False):
                 target_model = EXPERT_MODEL
                 dynamic_keep_alive = "3m" if analysis.get("followups") else 0
-                expert_warm_until = current_time + 180
+                expert_warm_until = current_time + 300
                 is_cold_expert = True
                 # Auto-set mode based on triage for cold loads
                 expert_mode = "coding" if analysis.get("is_coding") else "general"
