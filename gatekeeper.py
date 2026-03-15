@@ -24,13 +24,33 @@ gpu_lock = asyncio.Lock()
 http_client: httpx.AsyncClient = None
 vram_locked = False
 expert_warm_until = 0
+expert_mode = "general"  # "general" or "coding"
+
+# --- EXPERT PARAMETERS (Thinking Modes) ---
+PARAMS_GENERAL = {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 1.5,
+    "repeat_penalty": 1.0,
+}
+
+PARAMS_CODING = {
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 0.0,
+    "repeat_penalty": 1.0,
+}
 
 # --- LIFESPAN ---
 @asynccontextmanager
 async def lifespan(app):
     global http_client
-    http_client = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0))
-    logger.info("[STARTUP] HTTP client initialized.")
+    http_client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0))
+    logger.info("[STARTUP] HTTP client initialized (600s timeout).")
     yield
     await http_client.aclose()
     logger.info("[SHUTDOWN] HTTP client closed.")
@@ -105,10 +125,11 @@ async def analyze_request(messages: list) -> dict:
         "You are the Triage AI for a workspace. Read the user's prompt and evaluate it. "
         "The 'Expert' AI is incredibly busy and expensive. You must only call the Expert if "
         "the complexity is above 6 (e.g., coding, deep logic, advanced math). "
-        "Small talk, greetings, or simple facts are complexity 1-4. "
+        "Complexity 1-4: Small talk, greetings, simple facts. "
+        "Complexity 5-10: Deep logic, advanced math, structural coding. "
         "Guess if the user will need follow-up questions to solve this task (true/false). "
-        "CRITICAL: Determine if the request requires using an external tool like Web Search to get real-time info or news (true/false). "
-        "Respond ONLY in pure JSON format: {\"complexity\": <int>, \"expect_followups\": <bool>, \"requires_tool\": <bool>}"
+        "Also determine if this is a 'coding' task (True if involves writing code, debugging, or technical WebDev logic). "
+        "Respond ONLY in pure JSON format: {\"complexity\": <int>, \"expect_followups\": <bool>, \"requires_tool\": <bool>, \"is_coding\": <bool>}"
     )
     
     payload = {
@@ -134,12 +155,13 @@ async def analyze_request(messages: list) -> dict:
             return {
                 "complexity": int(data.get("complexity", 1)),
                 "followups": bool(data.get("expect_followups", False)),
-                "requires_tool": bool(data.get("requires_tool", False))
+                "requires_tool": bool(data.get("requires_tool", False)),
+                "is_coding": bool(data.get("is_coding", False))
             }
     except Exception as e:
         logger.warning(f"Router network/parsing error: {e}")
 
-    return {"complexity": 1, "followups": False, "requires_tool": False}
+    return {"complexity": 1, "followups": False, "requires_tool": False, "is_coding": False}
 
 # =============================================================================
 # STREAMING
@@ -160,7 +182,7 @@ async def stream_proxy(url: str, body: dict, lock_to_release: asyncio.Lock, is_n
                 pass
     
     try:
-        async with http_client.stream("POST", url, json=body, timeout=120.0) as resp:
+        async with http_client.stream("POST", url, json=body, timeout=600.0) as resp:
             if resp.status_code != 200:
                 error_body = await resp.aread()
                 yield b"ERROR: " + error_body
@@ -222,6 +244,7 @@ async def health_check():
     return JSONResponse(content={
         "loaded_models": loaded,
         "expert_warm": time.time() < expert_warm_until,
+        "expert_mode": expert_mode,
         "vram_locked": vram_locked,
         "gpu_lock_held": gpu_lock.locked()
     })
@@ -229,7 +252,7 @@ async def health_check():
 @app.post("/api/chat")
 @app.post("/v1/chat/completions")
 async def proxy_ollama(request: Request):
-    global vram_locked, expert_warm_until
+    global vram_locked, expert_warm_until, expert_mode
     body = await request.json()
     is_streaming = body.get("stream", True)
     messages = body.get("messages", [])
@@ -266,14 +289,24 @@ async def proxy_ollama(request: Request):
         # --- Manual Overrides ---
         if "!lock" in user_prompt_lower:
             vram_locked = True
-            _ = JSONResponse(content={"id": "chatcmpl-Bob", "object": "chat.completion", "created": int(time.time()), "model": "Bob", "choices": [{"index": 0, "message": {"role": "assistant", "content": "🔒 VRAM Locked."}, "finish_reason": "stop"}]})
+            _ = JSONResponse(content={"id": "chatcmpl-Bob", "object": "chat.completion", "created": int(time.time()), "model": "Bob", "choices": [{"index": 0, "message": {"role": "assistant", "content": "🔒 **VRAM Locked.** Expert is held in memory."}, "finish_reason": "stop"}]})
             gpu_lock.release()
             return _
         elif "!unlock" in user_prompt_lower:
             vram_locked = False
             expert_warm_until = 0
             await verified_unload(EXPERT_MODEL)
-            _ = JSONResponse(content={"id": "chatcmpl-Bob", "object": "chat.completion", "created": int(time.time()), "model": "Bob", "choices": [{"index": 0, "message": {"role": "assistant", "content": "🔓 VRAM Unlocked."}, "finish_reason": "stop"}]})
+            _ = JSONResponse(content={"id": "chatcmpl-Bob", "object": "chat.completion", "created": int(time.time()), "model": "Bob", "choices": [{"index": 0, "message": {"role": "assistant", "content": "🔓 **VRAM Unlocked.** Memory cleared."}, "finish_reason": "stop"}]})
+            gpu_lock.release()
+            return _
+        elif "!code" in user_prompt_lower:
+            expert_mode = "coding"
+            _ = JSONResponse(content={"id": "chatcmpl-Bob", "object": "chat.completion", "created": int(time.time()), "model": "Bob", "choices": [{"index": 0, "message": {"role": "assistant", "content": "💻 **Coding Mode Active.** Optimized for precision."}, "finish_reason": "stop"}]})
+            gpu_lock.release()
+            return _
+        elif "!general" in user_prompt_lower:
+            expert_mode = "general"
+            _ = JSONResponse(content={"id": "chatcmpl-Bob", "object": "chat.completion", "created": int(time.time()), "model": "Bob", "choices": [{"index": 0, "message": {"role": "assistant", "content": "🧠 **General Mode Active.** Optimized for creativity."}, "finish_reason": "stop"}]})
             gpu_lock.release()
             return _
 
@@ -312,9 +345,11 @@ async def proxy_ollama(request: Request):
                 dynamic_keep_alive = "3m" if analysis.get("followups") else 0
                 expert_warm_until = current_time + 180
                 is_cold_expert = True
+                # Auto-set mode based on triage for cold loads
+                expert_mode = "coding" if analysis.get("is_coding") else "general"
             else:
                 target_model = ROUTER_MODEL
-            logger.info(f"[ROUTING] Triage -> {target_model}")
+            logger.info(f"[ROUTING] Triage -> {target_model} (Mode: {expert_mode})")
 
         # --- VRAM SAFETY (Cold loads only) ---
         # With the broad fast-exit, no background task can load the Router
@@ -326,9 +361,13 @@ async def proxy_ollama(request: Request):
         options = body.get("options", {})
         if is_background_task:
             options.update({"temperature": 0.0, "num_ctx": 2048})
+        elif target_model == EXPERT_MODEL:
+            # Apply Thinking Mode parameters for Expert
+            params = PARAMS_CODING if expert_mode == "coding" else PARAMS_GENERAL
+            options.update(params)
+            options["num_ctx"] = 8192
         else:
-            # REDUCE default context to 8192 for the 27B model on 24GB GPU.
-            # 16-32K context with a 27B model (15-18GB weights) pushes VRAM over 24GB.
+            # Default context 8192 for the 27B model on 24GB GPU.
             options.update({"temperature": options.get("temperature", 0.7), "num_ctx": 8192})
         
         body.update({"model": target_model, "keep_alive": dynamic_keep_alive, "options": options})
@@ -340,7 +379,7 @@ async def proxy_ollama(request: Request):
 
         if not is_streaming:
             try:
-                resp = await http_client.post(f"{OLLAMA_URL}{target_path}", json=body, timeout=120.0)
+                resp = await http_client.post(f"{OLLAMA_URL}{target_path}", json=body, timeout=600.0)
                 if resp.status_code != 200:
                     return JSONResponse(status_code=resp.status_code, content={"error": resp.text})
                 data = resp.json()
