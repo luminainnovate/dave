@@ -267,7 +267,7 @@ async def proxy_ollama(request: Request):
     # (titles, tags, summaries, follow-up suggestions, search queries, embeddings).
     # These were silently queuing up on the Expert, eating 30-60s before your follow-up.
     if not is_streaming and (time.time() < expert_warm_until or vram_locked):
-        logger.info(f"[FAST-EXIT] Non-streaming request skipped (Expert session active)")
+        logger.info("[FAST-EXIT] Non-streaming request skipped (Expert session active)")
         if "/api/chat" in str(request.url.path):
             return JSONResponse(content={"model": "Bob", "message": {"role": "assistant", "content": "Analyzing..."}, "done": True})
         return JSONResponse(content={"id": "chatcmpl-Bob", "object": "chat.completion", "created": int(time.time()), "model": "Bob", "choices": [{"index": 0, "message": {"role": "assistant", "content": "Analyzing..."}, "finish_reason": "stop"}]})
@@ -326,12 +326,14 @@ async def proxy_ollama(request: Request):
             target_model = EXPERT_MODEL
             dynamic_keep_alive = "3m"
             expert_warm_until = current_time + 300
-            if not is_expert_warm: is_cold_expert = True
+            if not is_expert_warm:
+                is_cold_expert = True
             logger.info(f"[ROUTING] Force EXPERT ({'cold' if is_cold_expert else 'warm'})")
         elif is_expert_warm or vram_locked:
             target_model = EXPERT_MODEL
             dynamic_keep_alive = "3m" if not vram_locked else "-1"
-            if not vram_locked: expert_warm_until = current_time + 300
+            if not vram_locked:
+                expert_warm_until = current_time + 300
             logger.info("[ROUTING] Expert warm")
         else:
             # Triage Path
@@ -383,10 +385,13 @@ async def proxy_ollama(request: Request):
                     return JSONResponse(status_code=resp.status_code, content={"error": resp.text})
                 data = resp.json()
                 data["model"] = "Bob"
-                if "id" in data: data["id"] = "chatcmpl-Bob"
+                if "id" in data:
+                    data["id"] = "chatcmpl-Bob"
                 return JSONResponse(content=data)
             finally:
-                if lock_held: gpu_lock.release(); lock_held = False
+                if lock_held:
+                    gpu_lock.release()
+                    lock_held = False
         
         lock_held = False
         return StreamingResponse(
@@ -397,7 +402,8 @@ async def proxy_ollama(request: Request):
         logger.error(f"Global Proxy Error: {e}")
         return JSONResponse(status_code=500, content={"error": str(e)})
     finally:
-        if lock_held: gpu_lock.release()
+        if lock_held:
+            gpu_lock.release()
 
 if __name__ == "__main__":
     import uvicorn
