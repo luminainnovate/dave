@@ -21,7 +21,8 @@ else
 fi
 
 # 3. Start ComfyUI
-echo "🎨 Starting ComfyUI..."
+echo "🎨 Clearing Port 8188 and Starting ComfyUI..."
+sudo fuser -k 8188/tcp > /dev/null 2>&1
 if [ -d "comfy-env" ] && [ -d "ComfyUI" ]; then
     cd ComfyUI
     nohup ../comfy-env/bin/python3 main.py --lowvram --listen 0.0.0.0 > ../comfyui.log 2>&1 &
