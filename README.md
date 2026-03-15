@@ -8,7 +8,7 @@
 
 -   **Tiered Orchestration:** Uses a resident "Fast Orchestrator" (`qwen2.5:1.5b`) for instant intent detection and simple queries.
 -   **Expert Reasoning:** Dynamically loads expert models (`qwen3.5:27b`) for complex coding and logic tasks.
--   **Local Image Generation:** Integrated ComfyUI (Flux.1 Schnell / SDXL) via a VRAM-safe proxy.
+-   **Local Image Generation:** Integrated ComfyUI (Flux 2) via a VRAM-safe proxy.
 -   **Live Web Search:** Grounded responses using SearXNG.
 -   **Unified UI:** Powered by Open WebUI for text, vision, audio (Whisper), and RAG.
 -   **VRAM Guardrails:** Intelligent "Gatekeeper" proxy with GPU Mutex locking to prevent simultaneous heavy model loading.

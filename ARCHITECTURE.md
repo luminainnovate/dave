@@ -22,7 +22,7 @@ The system operates on a strict hardware limit. All agentic routing and tool exe
 * **Dynamic VRAM Allocations:**
   * **Resident Orchestrator (`qwen2.5:1.5b`):** ~1.2GB (Pinned to VRAM for instant routing/chat).
   * **Expert LLM (`qwen3.5:27b` quant):** ~15GB (Loaded on-demand).
-  * **Image Model (Flux.1 Schnell / SDXL):** ~12GB (Loaded on-demand).
+  * **Image Model (Flux 2):** ~12GB (Loaded on-demand).
 * **Rule:** The Resident Orchestrator stays in memory. The Expert LLM and Visual/Image models **cannot** exist in VRAM simultaneously. 
 
 ---

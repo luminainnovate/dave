@@ -6,7 +6,7 @@
 echo "🚀 Launching Unified Local AI Workspace..."
 
 # 1. Start Docker Stack
-echo "🐳 Starting Docker (Ollama, SearXNG, Open WebUI)..."
+echo "🐳 Starting Docker (Open WebUI, SearXNG)..."
 docker compose up -d
 
 # 2. Start Gatekeeper Proxy

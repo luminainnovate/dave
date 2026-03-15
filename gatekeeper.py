@@ -293,6 +293,7 @@ async def proxy_ollama(request: Request):
         elif "!unlock" in user_prompt_lower:
             vram_locked = False
             expert_warm_until = 0
+            expert_mode = "general"
             await verified_unload(EXPERT_MODEL)
             _ = JSONResponse(content={"id": "chatcmpl-Bob", "object": "chat.completion", "created": int(time.time()), "model": "Bob", "choices": [{"index": 0, "message": {"role": "assistant", "content": "🔓 **VRAM Unlocked.** Memory cleared."}, "finish_reason": "stop"}]})
             gpu_lock.release()
@@ -317,11 +318,11 @@ async def proxy_ollama(request: Request):
             target_model = ROUTER_MODEL
             dynamic_keep_alive = 0
             logger.info("[ROUTING] Background Task -> FAST")
-        elif "@bob" in user_prompt_lower or "hey bob" in user_prompt_lower:
+        elif "!bob" in user_prompt_lower or "hey bob" in user_prompt_lower:
             target_model = ROUTER_MODEL
             expert_warm_until = 0
             logger.info("[ROUTING] Force FAST")
-        elif "@expert" in user_prompt_lower or "hey expert" in user_prompt_lower:
+        elif "!expert" in user_prompt_lower or "hey expert" in user_prompt_lower:
             target_model = EXPERT_MODEL
             dynamic_keep_alive = "3m"
             expert_warm_until = current_time + 300
