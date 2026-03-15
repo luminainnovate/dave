@@ -28,17 +28,17 @@
 The setup is automated. Ensure your NVIDIA drivers are up to date on Windows, then run in WSL2:
 
 1.  **Clone the repository:**
-    ```bash
-    git clone https://github.com/mitro54/br.ai.n.git
-    cd br.ai.n
+```bash
+git clone https://github.com/mitro54/br.ai.n.git
+cd br.ai.n
     ```
 
 2.  **Run the Installer:**
     The `setup_workspace.sh` script installs dependencies, pulls models, and configures the environment.
     ```bash
-    chmod +x setup_workspace.sh
-    ./setup_workspace.sh
-    ```
+chmod +x setup_workspace.sh
+./setup_workspace.sh
+```
 
 *Note: VRAM management is handled automatically by the Orchestrator proxy. No manual service configuration is required.*
 
@@ -53,17 +53,16 @@ chmod +x start_workspace.sh
 
 -   **Web UI:** [http://localhost:3000](http://localhost:3000)
 -   **Logs:** `tail -f gatekeeper.log` or `tail -f comfyui.log`
+-   **Health Debugger:** [http://localhost:8000/health](http://localhost:8000/health)
 
 ## 🏗️ Architecture
 
 The system operates on an intelligent **GPU Mutex** principle managed by the **Gatekeeper Proxy**:
 
-1.  **Intent Detection:** Every request is analyzed by the Resident Orchestrator (CPU-bound or tiny VRAM footprint).
-2.  **VRAM Locking:** If "Expert" or "Image" intent is detected, the Gatekeeper acquires a global lock.
-3.  **Model Swapping:** The Expert LLM or ComfyUI is loaded into the primary VRAM slice.
-4.  **Auto-Eviction:** Models are unloaded immediately after inference (`OLLAMA_KEEP_ALIVE=0`) to free space for the next task.
-
-For details, see [ARCHITECTURE.md](ARCHITECTURE.md) and [SETUP.md](SETUP.md).
+1.  **Triage:** Every query is analyzed by the resident 1.5B Router.
+2.  **Verified Lifecycle:** If Expert intent is detected, the Router is force-evicted, VRAM is swept, and the Expert is loaded with a 5-minute "warm session" timer.
+3.  **Bypass Logic:** Background tasks (summaries, titles) skip the lock during warm sessions to prevent blocking user follow-ups.
+4.  **Thinking Modes:** Sampling parameters (temperature, penalties) are dynamically applied based on task type.
 
 ## 🌐 Network Access (Multi-Device)
 
@@ -79,7 +78,21 @@ To access your workspace from other devices on your LAN:
     ```powershell
     New-NetFirewallRule -DisplayName "AI Workspace - Open WebUI" -Direction Inbound -LocalPort 3000 -Protocol TCP -Action Allow
     ```
+## 🔧 Portability & Customization
 
-## ⚖️ License
+Swap models without touching the code using environment variables:
 
-MIT License. See [LICENSE](LICENSE) for details.
+| Variable | Description | Default |
+| :--- | :--- | :--- |
+| `ROUTER_MODEL` | The resident triage model | `qwen2.5:1.5b` |
+| `EXPERT_MODEL` | The heavy-lifting reasoning model | `qwen3.5:27b` |
+| `OLLAMA_URL` | Your Ollama API endpoint | `http://localhost:11434` |
+
+---
+## ⌨️ Manual Control Commands
+
+While in chat, use these commands to override the orchestrator:
+- `!lock`: Holds the Expert in VRAM indefinitely.
+- `!unlock`: Releases the lock and evicts the Expert immediately.
+- `!code`: Manually switches Expert to high-precision "Coding Mode".
+- `!general`: Manually switches Expert to creative "General Mode".

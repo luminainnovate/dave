@@ -16,8 +16,6 @@ logger = logging.getLogger("Bob-Orchestrator")
 ROUTER_MODEL = "qwen2.5:1.5b"
 EXPERT_MODEL = "qwen3.5:27b"
 OLLAMA_URL = "http://localhost:11434"
-COMFYUI_URL = "http://localhost:8188"
-WORKFLOW_PATH = "workflow_api.json"
 
 # --- STATE MANAGEMENT ---
 gpu_lock = asyncio.Lock()
@@ -399,42 +397,6 @@ async def proxy_ollama(request: Request):
         return JSONResponse(status_code=500, content={"error": str(e)})
     finally:
         if lock_held: gpu_lock.release()
-
-@app.post("/v1/images/generations")
-async def proxy_comfyui(request: Request):
-    global expert_warm_until
-    await gpu_lock.acquire()
-    try:
-        expert_warm_until = 0
-        await verified_unload(EXPERT_MODEL)
-        await verified_unload(ROUTER_MODEL)
-        
-        body = await request.json()
-        prompt_text = body.get("prompt", "")
-        with open(WORKFLOW_PATH, 'r') as f:
-            workflow = json.load(f)
-        for node_id in workflow:
-            if workflow[node_id].get("class_type") == "CLIPTextEncode":
-                workflow[node_id]["inputs"]["text"] = prompt_text
-        
-        p_resp = await http_client.post(f"{COMFYUI_URL}/prompt", json={"prompt": workflow})
-        if p_resp.status_code != 200: return JSONResponse(status_code=500, content={"error": "ComfyUI Error"})
-        p_id = p_resp.json().get("prompt_id")
-        
-        for _ in range(30):
-            h_resp = await http_client.get(f"{COMFYUI_URL}/history/{p_id}")
-            if h_resp.status_code == 200:
-                hist = h_resp.json()
-                if p_id in hist:
-                    out = hist[p_id].get("outputs", {})
-                    if out:
-                        nid = list(out.keys())[0]
-                        fn = out[nid].get("images", [{}])[0].get("filename")
-                        return JSONResponse(content={"data": [{"url": f"{COMFYUI_URL}/view?filename={fn}"}]})
-            await asyncio.sleep(1.0)
-        return JSONResponse(status_code=500, content={"error": "Timeout"})
-    finally:
-        gpu_lock.release()
 
 if __name__ == "__main__":
     import uvicorn
