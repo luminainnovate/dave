@@ -173,6 +173,6 @@ To ensure optimal performance and prevent VRAM fragmentation, you must install t
 2. Go to **Admin Panel** -> **Images**.
 3. Set **Image Generation Engine** to `ComfyUI`.
 4. Set **ComfyUI Base URL** to `http://host.docker.internal:8188`.
-5. Under **ComfyUI Workflow Nodes**, ensure the **Text Input** is mapped to **Node ID 4**.
-6. Set the **Model Name** to `flux-2-klein-9b-fp8.safetensors`.
-7. **The most important step:** Upload the provided `flux2api.json` workflow file in the same settings area.
+5. Set the **Model Name** to `flux-2-klein-9b-fp8.safetensors`.
+6. Upload the provided `flux2api.json` workflow file in the same settings area.
+7. Under **ComfyUI Workflow Nodes**, ensure the **Text Input** is mapped to **Node ID 4**.
