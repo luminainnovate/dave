@@ -8,10 +8,10 @@
 
 -   **Tiered Orchestration:** Uses a resident "Fast Orchestrator" (`qwen2.5:1.5b`) for instant intent detection and simple queries.
 -   **Expert Reasoning:** Dynamically loads expert models (`qwen3.5:27b`) for complex coding and logic tasks.
--   **Silent Image Interception**: Automatically silences automated image descriptions and prompt expansions, allowing search and chat to stay fast.
--   **Local Image Generation:** Integrated ComfyUI (Flux 2) via a VRAM-safe proxy.
--   **Live Web Search:** Grounded responses using SearXNG.
--   **Unified UI:** Powered by Open WebUI for text, vision, audio (Whisper), and RAG.
+-   **Project Extraction (`!move`):** Automatically reconstructs entire project structures from chat conversations. It parses folder trees and code snippets, reconstructs them in a dedicated `conversations/` directory, and opens the result in VS Code.
+-   **Smart Conflict Management:** The extraction system only updates files that have actually changed, preserving your local modifications.
+-   **Safe Path Sanitization:** Built-in safeguards prevent directory traversal (clears `..`) and automatically filters out shell/command blocks from project files.
+-   **Flexible Expert Tuning:** High-level models use customized "Thinking Mode" parameters, while alternative expert models automatically fall back to their native default settings for maximum compatibility.
 -   **Periodic RAM Cleanup**: A background task automatically sweeps ComfyUI memory every 5 minutes when the system is idle.
 -   **VRAM Guardrails:** Intelligent "Orchestrator" proxy with GPU Mutex locking to prevent simultaneous heavy model loading.
 -   **LAN Accessible:** Bridged networking for access from phones, tablets, and other laptops.
@@ -97,6 +97,9 @@ Swap models without touching the code using environment variables:
 | `EXPERT_MODEL` | The heavy-lifting reasoning model | `qwen3.5:27b` |
 | `OLLAMA_URL` | Your Ollama API endpoint | `http://localhost:11434` |
 
+> [!NOTE]
+> **Hot-Swapping Experts:** You can change `EXPERT_MODEL` at the top of `orchestrator.py` at any time. If you use a model other than the default (`qwen3.5:27b`), the system will automatically bypass custom sampling parameters (temperature, penalties) and use that model's native default settings.
+
 ---
 ## ⌨️ Manual Control Commands
 
@@ -105,6 +108,7 @@ While in chat, use these commands to override the orchestrator:
 - `!unlock`: Releases the lock and evicts the Expert immediately.
 - `!code`: Manually switches Expert to high-precision "Coding Mode".
 - `!general`: Manually switches Expert to creative "General Mode".
+- `!move`: Scans the conversation, identifies project structure/code, and exports it to `conversations/`.
 - `!bob` / `hey bob`: Force the current turn to use the Fast Orchestrator.
 - `!expert` / `hey expert`: Force the current turn to use the Expert Model.
 
