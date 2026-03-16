@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Unified Workspace Start Script
-# Orchestrates Docker, Gatekeeper Proxy, and ComfyUI
+# Orchestrates Docker, Orchestrator Proxy, and ComfyUI
 
 echo "🚀 Launching Unified Local AI Workspace..."
 
@@ -9,15 +9,15 @@ echo "🚀 Launching Unified Local AI Workspace..."
 echo "🐳 Starting Docker (Open WebUI, SearXNG)..."
 docker compose up -d
 
-# 2. Start Gatekeeper Proxy
-echo "🛡️ Clearing Port 8000 and Starting Gatekeeper Proxy..."
+# 2. Start Orchestrator Proxy
+echo "🛡️ Clearing Port 8000 and Starting Orchestrator Proxy..."
 sudo fuser -k 8000/tcp > /dev/null 2>&1
 # Check if venv exists
-if [ -d "gatekeeper-env" ]; then
-    nohup ./gatekeeper-env/bin/python3 gatekeeper.py > gatekeeper.log 2>&1 &
-    echo "✅ Gatekeeper running (See gatekeeper.log)"
+if [ -d "orchestrator-env" ]; then
+    nohup ./orchestrator-env/bin/python3 orchestrator.py > orchestrator.log 2>&1 &
+    echo "✅ Orchestrator running (See orchestrator.log)"
 else
-    echo "⚠️ Gatekeeper environment not found. Please run setup_workspace.sh first."
+    echo "⚠️ Orchestrator environment not found. Please run setup_workspace.sh first."
 fi
 
 # 3. Start ComfyUI

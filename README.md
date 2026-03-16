@@ -8,10 +8,12 @@
 
 -   **Tiered Orchestration:** Uses a resident "Fast Orchestrator" (`qwen2.5:1.5b`) for instant intent detection and simple queries.
 -   **Expert Reasoning:** Dynamically loads expert models (`qwen3.5:27b`) for complex coding and logic tasks.
+-   **Silent Image Interception**: Automatically silences automated image descriptions and prompt expansions, allowing search and chat to stay fast.
 -   **Local Image Generation:** Integrated ComfyUI (Flux 2) via a VRAM-safe proxy.
 -   **Live Web Search:** Grounded responses using SearXNG.
 -   **Unified UI:** Powered by Open WebUI for text, vision, audio (Whisper), and RAG.
--   **VRAM Guardrails:** Intelligent "Gatekeeper" proxy with GPU Mutex locking to prevent simultaneous heavy model loading.
+-   **Periodic RAM Cleanup**: A background task automatically sweeps ComfyUI memory every 5 minutes when the system is idle.
+-   **VRAM Guardrails:** Intelligent "Orchestrator" proxy with GPU Mutex locking to prevent simultaneous heavy model loading.
 -   **LAN Accessible:** Bridged networking for access from phones, tablets, and other laptops.
 
 ## 🛠️ Requirements
@@ -28,19 +30,24 @@
 The setup is automated. Ensure your NVIDIA drivers are up to date on Windows, then run in WSL2:
 
 1.  **Clone the repository:**
-```bash
-git clone https://github.com/mitro54/br.ai.n.git
-cd br.ai.n
+    ```bash
+    git clone https://github.com/mitro54/br.ai.n.git
+    cd br.ai.n
     ```
 
 2.  **Run the Installer:**
-    The `setup_workspace.sh` script installs dependencies, pulls models, and configures the environment.
-    ```bash
-chmod +x setup_workspace.sh
-./setup_workspace.sh
-```
+    The `setup_workspace.sh` script automatically:
+    -   Installs required Python virtual environments.
+    -   Pulls the correct Ollama models (`qwen2.5:1.5b`, `qwen3.5:27b`).
+    -   Deploys the Docker stack (Open WebUI & SearXNG).
+    -   Sets up and launches ComfyUI and the Orchestrator proxy.
 
-*Note: VRAM management is handled automatically by the Orchestrator proxy. No manual service configuration is required.*
+    ```bash
+    chmod +x setup_workspace.sh
+    ./setup_workspace.sh
+    ```
+
+*Note: The orchestrator proxy handles VRAM management and model swapping automatically.*
 
 ## 🚥 Usage
 
@@ -52,17 +59,19 @@ chmod +x start_workspace.sh
 ```
 
 -   **Web UI:** [http://localhost:3000](http://localhost:3000)
--   **Logs:** `tail -f gatekeeper.log` or `tail -f comfyui.log`
--   **Health Debugger:** [http://localhost:8000/health](http://localhost:8000/health)
+-   **Proxy Health/State:** [http://localhost:8000/health](http://localhost:8000/health)
+-   **Logs (Orchestrator):** `tail -f orchestrator.log`
+-   **Logs (ComfyUI):** `tail -f comfyui.log`
 
 ## 🏗️ Architecture
 
-The system operates on an intelligent **GPU Mutex** principle managed by the **Gatekeeper Proxy**:
+The system operates on an intelligent **GPU Mutex** principle managed by the **Orchestrator Proxy**:
 
 1.  **Triage:** Every query is analyzed by the resident 1.5B Router.
 2.  **Verified Lifecycle:** If Expert intent is detected, the Router is force-evicted, VRAM is swept, and the Expert is loaded with a 5-minute "warm session" timer.
-3.  **Bypass Logic:** Background tasks (summaries, titles) skip the lock during warm sessions to prevent blocking user follow-ups.
-4.  **Thinking Modes:** Sampling parameters (temperature, penalties) are dynamically applied based on task type.
+3.  **Selective Interception:** Automatically identifies and silences background "expansion" and "description" pings while preserving high-priority search results.
+4.  **Idle Sweeping:** A background loop sweeps ComfyUI RAM/VRAM every 5 minutes when no generation or chat is active.
+5.  **Thinking Modes:** Sampling parameters (temperature, penalties) are dynamically applied based on task type.
 
 ## 🌐 Network Access (Multi-Device)
 
@@ -96,6 +105,8 @@ While in chat, use these commands to override the orchestrator:
 - `!unlock`: Releases the lock and evicts the Expert immediately.
 - `!code`: Manually switches Expert to high-precision "Coding Mode".
 - `!general`: Manually switches Expert to creative "General Mode".
+- `!bob` / `hey bob`: Force the current turn to use the Fast Orchestrator.
+- `!expert` / `hey expert`: Force the current turn to use the Expert Model.
 
 
 ## System prompt in Open WebUI for Bob

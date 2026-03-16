@@ -422,10 +422,10 @@ async def proxy_ollama(request: Request):
             return _command_response("🔓 **VRAM Unlocked.** Memory cleared.")
         elif "!code" in prompt_lower:
             expert_mode = "coding"
-            return _command_response("💻 **Coding Mode.** Parameters optimized for precision.")
+            logger.info("Command: Switched to Coding Mode.")
         elif "!general" in prompt_lower:
             expert_mode = "general"
-            return _command_response("🧠 **General Mode.** Parameters optimized for creativity.")
+            logger.info("Command: Switched to General Mode.")
 
         # Determine target model and load strategy
         target_model = ROUTER_MODEL
@@ -439,12 +439,12 @@ async def proxy_ollama(request: Request):
             target_model = ROUTER_MODEL
             expert_warm_until = 0
             logger.info("Direct request for Router model.")
-        elif any(kw in prompt_lower for kw in ["!expert", "hey expert"]):
+        elif any(kw in prompt_lower for kw in ["!expert", "hey expert", "!code", "!general"]):
             target_model = EXPERT_MODEL
             keep_alive = "3m"
             expert_warm_until = current_time + 300
             is_cold_expert = not is_expert_warm
-            logger.info("Direct request for Expert model.")
+            logger.info(f"Direct request for Expert model ({expert_mode}).")
         elif is_expert_warm or vram_locked:
             target_model = EXPERT_MODEL
             keep_alive = "3m" if not vram_locked else "-1"

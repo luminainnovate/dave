@@ -15,17 +15,17 @@ ollama pull qwen3.5:27b
 echo "🐳 Deploying Docker Stack (SearXNG & Open WebUI)..."
 docker compose up -d
 
-# 3. Gatekeeper Proxy Setup
-echo "🛡️ Clearing Port 8000 and Setting up Gatekeeper Proxy..."
+# 3. Orchestrator Proxy Setup
+echo "🛡️ Clearing Port 8000 and Setting up Orchestrator Proxy..."
 sudo fuser -k 8000/tcp > /dev/null 2>&1
-if [ ! -d "gatekeeper-env" ]; then
-    python3 -m venv gatekeeper-env
+if [ ! -d "orchestrator-env" ]; then
+    python3 -m venv orchestrator-env
 fi
-source gatekeeper-env/bin/activate
+source orchestrator-env/bin/activate
 pip install fastapi uvicorn httpx python-multipart
 # Use nohup to keep it running
-nohup python3 gatekeeper.py > gatekeeper.log 2>&1 &
-echo "✅ Gatekeeper is starting in the background (Port 8000)."
+nohup python3 orchestrator.py > orchestrator.log 2>&1 &
+echo "✅ Orchestrator is starting in the background (Port 8000)."
 deactivate
 
 # 4. ComfyUI Setup
@@ -50,7 +50,7 @@ echo "--------------------------------------------------------"
 echo "🎉 Setup Complete!"
 echo "--------------------------------------------------------"
 echo "🌐 Open WebUI: http://localhost:3000"
-echo "🛡️ Gatekeeper Log: tail -f gatekeeper.log"
+echo "🛡️ Orchestrator Log: tail -f orchestrator.log"
 echo "🎨 ComfyUI Log: tail -f comfyui.log"
 echo "--------------------------------------------------------"
 echo "⚠️ REMINDER: Ensure you have opened your Windows Firewall port 3000"

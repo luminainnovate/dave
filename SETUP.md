@@ -151,15 +151,15 @@ pip install -r requirements.txt
 ```
 
 
-3. **Configuration & Launch:** Launch ComfyUI strictly with memory-safe arguments to respect the VRAM time-slicing rules:
+3. **Configuration & Launch:** Launch ComfyUI with appropriate memory settings for your GPU. For a 24GB+ card (RTX 3090/4090/5090), `--normalvram` is recommended:
 ```bash
-python main.py --lowvram --listen 0.0.0.0
+python main.py --normalvram --listen 0.0.0.0
 ```
 
 4. **Export API Workflow:** Open the ComfyUI web interface (`http://localhost:8188`), build your favorite workflow, and click **"Save (API Format)"**. Save this as `workflow_api.json` in your project root.
    * *Note: You must enable "Enable Dev mode" in ComfyUI settings to see the API export button.*
 
-5. **Integration (The Gatekeeper Proxy):** This provides the Mutex lock and the "Fast Orchestrator" tier. Create `gatekeeper.py`:
+5. **Integration (The Orchestrator Proxy):** This provides the Mutex lock and the "Fast Orchestrator" tier. Create `orchestrator.py`:
 
 ```python
 import asyncio
@@ -172,9 +172,9 @@ from fastapi.responses import StreamingResponse, JSONResponse
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("Gatekeeper")
+logger = logging.getLogger("Orchestrator")
 
-app = FastAPI(title="AI Workspace Gatekeeper Proxy")
+app = FastAPI(title="AI Workspace Orchestrator Proxy")
 gpu_lock = asyncio.Lock()
 
 # Model Configs
@@ -245,8 +245,8 @@ async def proxy_ollama(request: Request):
             media_type="text/event-stream"
         )
     except Exception as e:
-        logger.error(f"Gatekeeper Chat Error: {e}", exc_info=True)
-        return JSONResponse(status_code=500, content={"error": f"Gatekeeper Chat Error: {str(e)}"})
+        logger.error(f"Orchestrator Chat Error: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": f"Orchestrator Chat Error: {str(e)}"})
 
 @app.post("/v1/audio/transcriptions")
 async def proxy_transcription(request: Request):
@@ -325,12 +325,12 @@ async def proxy_comfyui(request: Request):
 if __name__ == "__main__":
     import uvicorn
     # Standard parameters for ASGI production stability
-    uvicorn.run("gatekeeper:app", host="0.0.0.0", port=8000, reload=False, log_level="info", access_log=False)
+    uvicorn.run("orchestrator:app", host="0.0.0.0", port=8000, reload=False, log_level="info", access_log=False)
 ```
 
-6. **Run Gatekeeper:**
+6. **Run Orchestrator:**
 ```bash
-python gatekeeper.py
+python orchestrator.py
 ```
 
 ---
@@ -389,11 +389,11 @@ Run these tests sequentially while monitoring `nvtop` or `nvidia-smi` in a separ
 
 ## Phase 7: Automating Development & CI/CD Pipeline
 
-To ensure the `gatekeeper.py` script and Docker deployment remain stable as you build, a CI/CD pipeline should be implemented.
+To ensure the `orchestrator.py` script and Docker deployment remain stable as you build, a CI/CD pipeline should be implemented.
 
 **If using GitHub for version control:**
 1. Create `.github/workflows/ci.yml`.
-2. **Linting:** Use `ruff` or `flake8` to validate `gatekeeper.py` for Python syntax errors.
+2. **Linting:** Use `ruff` or `flake8` to validate `orchestrator.py` for Python syntax errors.
 3. **Type Checking:** Use `mypy` to ensure async logic is properly typed.
 4. **Docker Confidence:** Add a step to run `docker compose build` to verify the syntax and dependencies of the Core Stack.
 
@@ -416,5 +416,5 @@ jobs:
         python -m pip install --upgrade pip
         pip install ruff fastapi uvicorn httpx
     - name: Lint with Ruff
-      run: ruff check gatekeeper.py
+      run: ruff check orchestrator.py
 ```
