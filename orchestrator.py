@@ -8,14 +8,17 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
+import mover
+
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("Bob-Orchestrator")
 
 # --- STRICT MODEL CONFIG ---
+DEFAULT_EXPERT_MODEL = "qwen3.5:27b"
 ROUTER_MODEL = "qwen2.5:1.5b"
-EXPERT_MODEL = "qwen3.5:27b"
+EXPERT_MODEL = "qwen3.5:27b"  # Switch this to any model
 OLLAMA_URL = "http://localhost:11434"
 COMFYUI_URL = "http://localhost:8188"
 
@@ -431,20 +434,26 @@ async def proxy_ollama(request: Request):
         prompt_lower = (messages[-1].get("content", "") if messages else "").lower()
 
         # Handle explicit user commands
-        if "!lock" in prompt_lower:
-            vram_locked = True
-            return _command_response("🔒 **VRAM Locked.** Expert model is persistent.")
-        elif "!unlock" in prompt_lower:
-            vram_locked = False
-            expert_warm_until = 0
-            await verified_unload(EXPERT_MODEL)
-            return _command_response("🔓 **VRAM Unlocked.** Memory cleared.")
-        elif "!code" in prompt_lower:
-            expert_mode = "coding"
-            logger.info("Command: Switched to Coding Mode.")
-        elif "!general" in prompt_lower:
-            expert_mode = "general"
-            logger.info("Command: Switched to General Mode.")
+        if not is_background_task:
+            if "!lock" in prompt_lower:
+                vram_locked = True
+                return _command_response("🔒 **VRAM Locked.** Expert model is persistent.", is_streaming, is_native)
+            elif "!unlock" in prompt_lower:
+                vram_locked = False
+                expert_warm_until = 0
+                await verified_unload(EXPERT_MODEL)
+                return _command_response("🔓 **VRAM Unlocked.** Memory cleared.", is_streaming, is_native)
+            elif "!code" in prompt_lower:
+                expert_mode = "coding"
+                logger.info("Command: Switched to Coding Mode.")
+            elif "!general" in prompt_lower:
+                expert_mode = "general"
+                logger.info("Command: Switched to General Mode.")
+            elif "!move" in prompt_lower:
+                logger.info("Command: Move initiated.")
+                success = mover.handle_move(messages)
+                msg = "Files moved!" if "Moved" in success else "Files failed to move!"
+                return _command_response(msg, is_streaming, is_native)
 
         # Determine target model and load strategy
         target_model = ROUTER_MODEL
@@ -466,15 +475,15 @@ async def proxy_ollama(request: Request):
             logger.info("Direct request for Router model.")
         elif any(kw in prompt_lower for kw in ["!expert", "hey expert", "!code", "!general"]):
             target_model = EXPERT_MODEL
-            keep_alive = "3m"
-            expert_warm_until = current_time + 300
+            keep_alive = "10m"
+            expert_warm_until = current_time + 600
             is_cold_expert = not is_expert_warm
             logger.info(f"Direct request for Expert model ({expert_mode}).")
         elif is_expert_warm or vram_locked:
             target_model = EXPERT_MODEL
-            keep_alive = "3m" if not vram_locked else "-1"
+            keep_alive = "10m" if not vram_locked else "-1"
             if not vram_locked:
-                expert_warm_until = current_time + 300
+                expert_warm_until = current_time + 600
         else:
             # Complexity Triage
             await sweep_vram_for_expert()
@@ -501,9 +510,14 @@ async def proxy_ollama(request: Request):
         if is_background_task:
             options.update({"temperature": 0.0, "num_ctx": 2048})
         elif target_model == EXPERT_MODEL:
-            # Apply Thinking Mode parameters for Expert
-            params = PARAMS_CODING if expert_mode == "coding" else PARAMS_GENERAL
-            options.update(params)
+            # Apply Thinking Mode parameters for Expert only if using the default model
+            if EXPERT_MODEL == DEFAULT_EXPERT_MODEL:
+                params = PARAMS_CODING if expert_mode == "coding" else PARAMS_GENERAL
+                options.update(params)
+                logger.debug(f"Applied expert parameters for {EXPERT_MODEL}")
+            else:
+                logger.info(f"Non-default expert {EXPERT_MODEL} detected; using default model settings.")
+            
             options["num_ctx"] = 8192
         else:
             options.update({"temperature": options.get("temperature", 0.7), "num_ctx": 8192})
@@ -551,16 +565,30 @@ def _silent_response(is_native: bool, text: str = ""):
     })
 
 
-def _command_response(text: str):
-    """Returns a non-streaming JSON response for internal orchestrator commands."""
-    try:
-        gpu_lock.release()
-    except RuntimeError:
-        pass
-    return JSONResponse(content={
-        "id": "chatcmpl-Bob", "object": "chat.completion", "created": int(time.time()), "model": "Bob",
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}]
-    })
+def _command_response(text: str, is_streaming: bool = False, is_native: bool = False):
+    """Returns a JSON response (streaming or one-shot) for internal orchestrator commands."""
+    if not is_streaming:
+        if is_native:
+            return JSONResponse(content={"model": "Bob", "message": {"role": "assistant", "content": text}, "done": True})
+        return JSONResponse(content={
+            "id": "chatcmpl-Bob", "object": "chat.completion", "created": int(time.time()), "model": "Bob",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        })
+
+    async def _generator():
+        if is_native:
+            yield f"{json.dumps({'model': 'Bob', 'message': {'role': 'assistant', 'content': text}, 'done': False})}\n".encode('utf-8')
+            yield f"{json.dumps({'model': 'Bob', 'done': True})}\n".encode('utf-8')
+        else:
+            chunk = {
+                "id": "chatcmpl-Bob", "object": "chat.completion.chunk", "created": int(time.time()), "model": "Bob",
+                "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]
+            }
+            yield f"data: {json.dumps(chunk)}\n\n".encode('utf-8')
+            yield b"data: [DONE]\n\n"
+
+    return StreamingResponse(_generator(), media_type="application/x-ndjson" if is_native else "text/event-stream")
 
 
 if __name__ == "__main__":
