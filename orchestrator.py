@@ -200,6 +200,7 @@ async def analyze_request(messages: list) -> dict:
         "Complexity 5-10: Deep logic, advanced math, structural coding. "
         "Guess if the user will need follow-up questions to solve this task (true/false). "
         "Also determine if this is a 'coding' task (True if involves writing code, debugging, or technical WebDev logic). "
+        "and if it requires a tool (True if it needs web search). "
         "Respond ONLY in pure JSON format: {\"complexity\": <int>, \"expect_followups\": <bool>, \"requires_tool\": <bool>, \"is_coding\": <bool>}"
     )
 
@@ -368,7 +369,26 @@ async def proxy_ollama(request: Request):
         is_tool_result = (role == "tool")
         is_image_tool = is_tool_result and any(kw in last_content for kw in ["![", "comfy", "image_url", "image/"])
         is_search_tool = is_tool_result and not is_image_tool
+        
+        # Search Intent (In user prompt)
+        search_triggers = [
+            "google", "find on the web", "look up", "latest news", "recent news", "current weather", 
+            "what is the price of", "what is the status of", "current events", "today",
+            "recently", "latest version of"
+        ]
+        is_search_query = (role == "user") and any(kw in last_content for kw in search_triggers)
+        
+        # Image Intent (In user prompt)
+        image_triggers = ["generate an image", "create an image", "create a picture", "draw a", "make an image", "flux", "comfyui"]
+        is_image_query = (role == "user") and any(kw in last_content for kw in image_triggers)
 
+        # History-based Search Detection (Check only last 2 messages)
+        has_search_history = any(
+            (m.get("role") == "tool" or "retrieved" in str(m.get("content", "")).lower() or "sources" in str(m.get("content", "")).lower()) 
+            and not any(kw in str(m.get("content", "")).lower() for kw in ["![", "comfy", "image_url", "image/"])
+            for m in messages[-2:]
+        )
+        
         # 3. Interception Rules
         # Rule A: Silence image tool outputs
         if is_image_tool:
@@ -384,7 +404,7 @@ async def proxy_ollama(request: Request):
             return _silent_response(is_native)
 
         # Rule C: Route background pings to small model
-        is_background_task = (is_suggestion_ping or is_description_ping or is_expansion_ping) and not is_search_tool
+        is_background_task = (is_suggestion_ping or is_description_ping or is_expansion_ping) and not (is_search_tool or is_search_query or has_search_history or is_image_query)
 
         # Rule D: Signal Reset (Manual user turns clear the state)
         if role == "user" and not (is_suggestion_ping or is_description_ping or is_expansion_ping or "### task:" in last_content):
@@ -431,9 +451,15 @@ async def proxy_ollama(request: Request):
         keep_alive = 0
         is_cold_expert = False
 
-        if is_background_task:
+        if is_background_task or is_image_query or is_search_query or is_search_tool or has_search_history:
             target_model = ROUTER_MODEL
-            logger.info("Routing background task to Router model.")
+            if is_image_query:
+                logger.info("Image generation intent detected: Routing to Router model.")
+            elif is_search_query or is_search_tool or has_search_history:
+                source = "intent" if is_search_query else "result" if is_search_tool else "history"
+                logger.info(f"Search {source} detected: Routing to Router model.")
+            else:
+                logger.info("Routing background task to Router model.")
         elif any(kw in prompt_lower for kw in ["!bob", "hey bob"]):
             target_model = ROUTER_MODEL
             expert_warm_until = 0
