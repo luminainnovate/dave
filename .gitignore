@@ -46,3 +46,6 @@ Thumbs.db
 
 # Large files / Workflows
 workflow_api.json
+
+# Conversations files
+/conversations/*
