@@ -8,7 +8,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
-# Setup logging
+
+# Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("Bob-Orchestrator")
 
@@ -16,6 +17,8 @@ logger = logging.getLogger("Bob-Orchestrator")
 ROUTER_MODEL = "qwen2.5:1.5b"
 EXPERT_MODEL = "qwen3.5:27b"
 OLLAMA_URL = "http://localhost:11434"
+COMFYUI_URL = "http://localhost:8188"
+WORKFLOW_PATH = "workflow_api.json"
 
 # --- STATE MANAGEMENT ---
 gpu_lock = asyncio.Lock()
@@ -23,6 +26,7 @@ http_client: httpx.AsyncClient = None
 vram_locked = False
 expert_warm_until = 0
 expert_mode = "general"  # "general" or "coding"
+last_comfy_history_count = 0  # Track ComfyUI history count for automated pings
 
 # --- EXPERT PARAMETERS (Thinking Modes) ---
 PARAMS_GENERAL = {
@@ -45,13 +49,23 @@ PARAMS_CODING = {
 
 # --- LIFESPAN ---
 @asynccontextmanager
-async def lifespan(app):
-    global http_client
+async def lifespan(app: FastAPI):
+    """Manages the application lifecycle, initializing and closing the HTTP client."""
+    global http_client, last_comfy_history_count
     http_client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0))
-    logger.info("[STARTUP] HTTP client initialized (600s timeout).")
+    logger.info("HTTP client initialized.")
+
+    # Synchronize initial ComfyUI history state
+    last_comfy_history_count = await get_comfy_history_count()
+
+    # Start periodic background cleanup
+    cleanup_task = asyncio.create_task(periodic_cleanup())
+
     yield
+    cleanup_task.cancel()
     await http_client.aclose()
-    logger.info("[SHUTDOWN] HTTP client closed.")
+    logger.info("HTTP client closed.")
+
 
 app = FastAPI(title="Bob: AI Workspace Orchestrator", lifespan=lifespan)
 
@@ -60,7 +74,7 @@ app = FastAPI(title="Bob: AI Workspace Orchestrator", lifespan=lifespan)
 # =============================================================================
 
 async def get_loaded_models() -> list[str]:
-    """Queries Ollama /api/ps to see what's actually in VRAM."""
+    """Queries the Ollama API to identify models currently residing in VRAM."""
     try:
         resp = await http_client.get(f"{OLLAMA_URL}/api/ps", timeout=2.0)
         if resp.status_code == 200:
@@ -71,54 +85,114 @@ async def get_loaded_models() -> list[str]:
     return []
 
 async def force_unload(model_name: str):
-    """Signals Ollama to unload a model. Minimal payload for reliability."""
+    """
+    Directly requests Ollama to unload the specified model from VRAM.
+    Uses a minimal request payload to ensure high reliability.
+    """
     try:
-        logger.info(f"[VRAM] Evicting {model_name}...")
-        # Strictly correct Ollama unload: model + keep_alive 0
+        logger.info(f"Unloading model: {model_name}")
         await http_client.post(
             f"{OLLAMA_URL}/api/generate",
             json={"model": model_name, "keep_alive": 0},
             timeout=5.0
         )
     except Exception as e:
-        logger.warning(f"[VRAM ERROR] Failed to unload {model_name}: {e}")
+        logger.warning(f"Failed to unload {model_name}: {e}")
 
 async def verified_unload(model_name: str, max_wait: float = 3.0):
-    """Unloads and confirms. Uses short polling to avoid blocking the lock too long."""
+    """
+    Attempts to unload a model and verifies its removal through short polling.
+    """
     loaded = await get_loaded_models()
     if not any(model_name in m for m in loaded):
         return True
-    
+
     await force_unload(model_name)
-    
+
     deadline = time.time() + max_wait
     while time.time() < deadline:
         await asyncio.sleep(0.4)
         loaded = await get_loaded_models()
         if not any(model_name in m for m in loaded):
-            logger.info(f"[VRAM] Confirmed {model_name} is unloaded.")
             return True
-    
-    logger.warning(f"[VRAM] {model_name} still loaded after {max_wait}s — proceeding anyway.")
+
+    logger.warning(f"{model_name} persistent in VRAM after {max_wait}s; continuing.")
     return False
 
+
 async def sweep_vram_for_expert():
-    """CRITICAL: Ensures the tiny Router is GONE before the 27B Expert loads.
-    Even 1GB of Router can push the 27B + KV Cache into slow System RAM (minutes of lag)."""
+    """
+    Ensures the Router model is removed before loading the Expert model.
+    This prevents VRAM fragmentation and avoids offloading to slower system RAM.
+    """
     loaded = await get_loaded_models()
     if any(ROUTER_MODEL in m for m in loaded):
-        logger.info("[VRAM SWEEP] Router found in VRAM — evicting to prevent swapping")
+        logger.info("Sweeping VRAM for Expert model load.")
         await verified_unload(ROUTER_MODEL)
+
+async def free_comfyui():
+    """Immediately signals ComfyUI to clear models and release system/video memory."""
+    try:
+        await http_client.post(
+            f"{COMFYUI_URL}/free",
+            json={"unload_models": True, "free_memory": True},
+            timeout=3.0
+        )
+    except Exception:
+        pass
+
+
+async def periodic_cleanup():
+    """
+    Background loop that periodically sweeps memory if the system is idle.
+    Runs every 5 minutes.
+    """
+    while True:
+        try:
+            await asyncio.sleep(300)  # 5 minute interval
+            if not await is_comfy_active() and not gpu_lock.locked():
+                logger.info("Periodic idle cleanup triggered.")
+                await free_comfyui()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Cleanup Task Error: {e}")
+            await asyncio.sleep(60)  # Wait before retry on error
+
+
+async def is_comfy_active() -> bool:
+    """Checks the ComfyUI queue for active or pending generation jobs."""
+    try:
+        resp = await http_client.get(f"{COMFYUI_URL}/queue", timeout=2.0)
+        if resp.status_code == 200:
+            data = resp.json()
+            return len(data.get("queue_running", [])) > 0 or len(data.get("queue_pending", [])) > 0
+    except Exception:
+        pass
+    return False
+
+async def get_comfy_history_count() -> int:
+    """Retrieves the total number of completed prompts from the ComfyUI history."""
+    try:
+        resp = await http_client.get(f"{COMFYUI_URL}/history", timeout=2.0)
+        if resp.status_code == 200:
+            return len(resp.json())
+    except Exception:
+        pass
+    return 0
 
 # =============================================================================
 # TRIAGE
 # =============================================================================
 
 async def analyze_request(messages: list) -> dict:
-    """Smart Triage. Uses the Router model. Only reads recent context."""
+    """
+    Performs request triage using the Router model to determine task complexity.
+    Routes complex logic or coding tasks to the Expert model.
+    """
     recent_msgs = [m for m in messages if m.get("role") == "user"][-2:]
     context_text = "\n".join([m.get("content", "") for m in recent_msgs])
-    
+
     system_msg = (
         "You are the Triage AI for a workspace. Read the user's prompt and evaluate it. "
         "The 'Expert' AI is incredibly busy and expensive. You must only call the Expert if "
@@ -129,22 +203,19 @@ async def analyze_request(messages: list) -> dict:
         "Also determine if this is a 'coding' task (True if involves writing code, debugging, or technical WebDev logic). "
         "Respond ONLY in pure JSON format: {\"complexity\": <int>, \"expect_followups\": <bool>, \"requires_tool\": <bool>, \"is_coding\": <bool>}"
     )
-    
+
     payload = {
         "model": ROUTER_MODEL,
-        "format": "json", 
+        "format": "json",
         "messages": [
-            {"role": "system", "content": system_msg}, 
+            {"role": "system", "content": system_msg},
             {"role": "user", "content": context_text[:1000]}
         ],
         "stream": False,
         "keep_alive": 0,
-        "options": {
-            "temperature": 0.0,
-            "num_ctx": 2048
-        } 
+        "options": {"temperature": 0.0, "num_ctx": 2048}
     }
-    
+
     try:
         resp = await http_client.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=10.0)
         if resp.status_code == 200:
@@ -165,32 +236,32 @@ async def analyze_request(messages: list) -> dict:
 # STREAMING
 # =============================================================================
 
-async def stream_proxy(url: str, body: dict, lock_to_release: asyncio.Lock, is_native_ollama: bool = False):
-    """Streams data. Guarantees lock release even on client disconnect."""
-    target_model = body.get("model")
+async def stream_proxy(url: str, body: dict, lock: asyncio.Lock, is_native: bool = False):
+    """
+    Proxies a streaming response from the backend AI model while managing VRAM locks.
+    """
     lock_released = False
-    
-    def _release_lock():
+
+    def _release():
         nonlocal lock_released
         if not lock_released:
             lock_released = True
             try:
-                lock_to_release.release()
+                lock.release()
             except RuntimeError:
                 pass
-    
+
     try:
         async with http_client.stream("POST", url, json=body, timeout=600.0) as resp:
             if resp.status_code != 200:
-                error_body = await resp.aread()
-                yield b"ERROR: " + error_body
+                yield b"ERROR: Backend unavailable"
                 return
-            
+
             async for line in resp.aiter_lines():
                 if not line:
                     continue
-                
-                if is_native_ollama:
+
+                if is_native:
                     try:
                         data = json.loads(line)
                         data["model"] = "Bob"
@@ -209,15 +280,14 @@ async def stream_proxy(url: str, body: dict, lock_to_release: asyncio.Lock, is_n
                                 data["id"] = "chatcmpl-Bob"
                             yield f"data: {json.dumps(data)}\n\n".encode('utf-8')
                         except (Exception, json.JSONDecodeError):
-                            rewritten = re.sub(r'("model"\s*:\s*")[^"]+(")' , r'\1Bob\2', line)
+                            rewritten = re.sub(r'("model"\s*:\s*")[^"]+(")', r'\1Bob\2', line)
                             yield f"{rewritten}\n\n".encode('utf-8')
     except (GeneratorExit, asyncio.CancelledError):
-        logger.info(f"[STREAM] Cancelled during {target_model} stream")
+        pass
     except Exception as e:
-        logger.error(f"[STREAM ERROR] {e}")
+        logger.error(f"Stream Error: {e}")
     finally:
-        logger.info(f"[STREAM] Finished {target_model} — releasing lock")
-        _release_lock()
+        _release()
 
 # =============================================================================
 # API ENDPOINTS
@@ -226,14 +296,19 @@ async def stream_proxy(url: str, body: dict, lock_to_release: asyncio.Lock, is_n
 @app.get("/api/tags")
 @app.get("/v1/models")
 async def list_models(request: Request):
-    """Forces Open-WebUI to only see Bob."""
+    """Returns a unified model list to satisfy both Ollama and OpenAI API clients."""
+    is_tags = "tags" in str(request.url)
     bob_model = {
-        "name": "Bob", "model": "Bob", "modified_at": "2024-01-01T00:00:00.000000Z", "size": 0,
-        "digest": "bob-identity", "details": {"family": "llama", "parameter_size": "Expert", "quantization_level": "Q8_0"}
-    } if "tags" in str(request.url) else {
+        "name": "Bob", "model": "Bob", "modified_at": "2026-03-16T00:00:00Z", "size": 0,
+        "digest": "bob-identity",
+        "details": {"family": "llama", "parameter_size": "Expert", "quantization_level": "Q8_0"}
+    } if is_tags else {
         "id": "Bob", "object": "model", "created": int(time.time()), "owned_by": "System"
     }
-    return JSONResponse(content={"models": [bob_model]} if "models" not in str(request.url) else {"object": "list", "data": [bob_model]})
+
+    if is_tags:
+        return JSONResponse(content={"models": [bob_model]})
+    return JSONResponse(content={"object": "list", "data": [bob_model]})
 
 @app.get("/health")
 async def health_check():
@@ -250,111 +325,149 @@ async def health_check():
 @app.post("/api/chat")
 @app.post("/v1/chat/completions")
 async def proxy_ollama(request: Request):
-    global vram_locked, expert_warm_until, expert_mode
+    """
+    Main entry point for AI chat requests.
+    Handles orchestration, triage, interception, and VRAM management.
+    """
+    global vram_locked, expert_warm_until, expert_mode, last_comfy_history_count
+
     body = await request.json()
     is_streaming = body.get("stream", True)
     messages = body.get("messages", [])
-    messages_str = str(messages).lower()
-    
-    # 1. Identify Background Tasks
+    path = str(request.url.path)
+    is_native = "/api/chat" in path
+
     is_background_task = False
-    if not is_streaming:
-        if any(kw in messages_str for kw in ["title", "summarize", "short label", "generate a title", "tags"]):
-            is_background_task = True
+    if messages:
+        last_msg = messages[-1]
+        last_content = str(last_msg.get("content", "")).lower()
+        role = last_msg.get("role", "")
 
-    # 2. BROAD Fast Exit: ALL non-streaming requests during Expert sessions are skipped.
-    # Open WebUI user messages are ALWAYS streaming. Non-streaming = housekeeping
-    # (titles, tags, summaries, follow-up suggestions, search queries, embeddings).
-    # These were silently queuing up on the Expert, eating 30-60s before your follow-up.
+        # 1. Generation State Tracking
+        is_busy = await is_comfy_active()
+        current_history_count = await get_comfy_history_count()
+        has_finished_gen = current_history_count > last_comfy_history_count
+        has_gen_signal = is_busy or has_finished_gen
+
+        # 2. Categorization
+        # Detect UI-injected context tags
+        system_content = "".join([m.get("content", "") for m in messages if m.get("role") == "system"]).lower()
+        has_injected_context = "the requested image has been created" in system_content or "<context>" in system_content
+
+        # Background tasks (Follow-ups, titles, etc.)
+        is_suggestion_ping = any(kw in last_content for kw in ["suggest 3-5", "generate a title", "generate a short title", "summarize", "short label", "tags"])
+        # Prompt Expansion (Inhibited by policy)
+        is_expansion_ping = "generate a detailed prompt" in last_content or "### task:\ngenerate a detailed prompt" in last_content
+
+        # Image Descriptions
+        description_keywords = ["describe", "analyze", "summarize", "tell me about", "what is in this", "what do you see", "explain the image"]
+        is_description_ping = has_injected_context or (
+            any(kw in last_content for kw in description_keywords) and ("### task:" in last_content or len(last_content) < 400)
+        )
+
+        # Tool results
+        is_tool_result = (role == "tool")
+        is_image_tool = is_tool_result and any(kw in last_content for kw in ["![", "comfy", "image_url", "image/"])
+        is_search_tool = is_tool_result and not is_image_tool
+
+        # 3. Interception Rules
+        # Rule A: Silence image tool outputs
+        if is_image_tool:
+            last_comfy_history_count = current_history_count
+            asyncio.create_task(free_comfyui())
+            return _silent_response(is_native)
+
+        # Rule B: Silence expansions and fresh-image descriptions
+        should_kill_comment = (is_description_ping and has_gen_signal)
+        if should_kill_comment or is_expansion_ping:
+            last_comfy_history_count = current_history_count
+            asyncio.create_task(free_comfyui())
+            return _silent_response(is_native)
+
+        # Rule C: Route background pings to small model
+        is_background_task = (is_suggestion_ping or is_description_ping or is_expansion_ping) and not is_search_tool
+
+        # Rule D: Signal Reset (Manual user turns clear the state)
+        if role == "user" and not (is_suggestion_ping or is_description_ping or is_expansion_ping or "### task:" in last_content):
+            if current_history_count != last_comfy_history_count:
+                last_comfy_history_count = current_history_count
+                asyncio.create_task(free_comfyui())
+
+    # =============================================================================
+
+    # 2. Fast Exit for Background Traffic
     if not is_streaming and (time.time() < expert_warm_until or vram_locked):
-        logger.info("[FAST-EXIT] Non-streaming request skipped (Expert session active)")
-        if "/api/chat" in str(request.url.path):
-            return JSONResponse(content={"model": "Bob", "message": {"role": "assistant", "content": "Analyzing..."}, "done": True})
-        return JSONResponse(content={"id": "chatcmpl-Bob", "object": "chat.completion", "created": int(time.time()), "model": "Bob", "choices": [{"index": 0, "message": {"role": "assistant", "content": "Analyzing..."}, "finish_reason": "stop"}]})
+        return _silent_response(is_native, "Analyzing...")
 
-    # 3. Lock Acquisition
+    # 3. Request Orchestration
     try:
         await asyncio.wait_for(gpu_lock.acquire(), timeout=120.0)
     except asyncio.TimeoutError:
-        return JSONResponse(status_code=503, content={"error": "System busy."})
+        return JSONResponse(status_code=503, content={"error": "The orchestrator is busy."})
 
     lock_held = True
     try:
         current_time = time.time()
         is_expert_warm = current_time < expert_warm_until
-        user_prompt_lower = (messages[-1].get("content", "") if messages else "").lower()
+        prompt_lower = (messages[-1].get("content", "") if messages else "").lower()
 
-        # --- Manual Overrides ---
-        if "!lock" in user_prompt_lower:
+        # Handle explicit user commands
+        if "!lock" in prompt_lower:
             vram_locked = True
-            _ = JSONResponse(content={"id": "chatcmpl-Bob", "object": "chat.completion", "created": int(time.time()), "model": "Bob", "choices": [{"index": 0, "message": {"role": "assistant", "content": "🔒 **VRAM Locked.** Expert is held in memory."}, "finish_reason": "stop"}]})
-            gpu_lock.release()
-            return _
-        elif "!unlock" in user_prompt_lower:
+            return _command_response("🔒 **VRAM Locked.** Expert model is persistent.")
+        elif "!unlock" in prompt_lower:
             vram_locked = False
             expert_warm_until = 0
-            expert_mode = "general"
             await verified_unload(EXPERT_MODEL)
-            _ = JSONResponse(content={"id": "chatcmpl-Bob", "object": "chat.completion", "created": int(time.time()), "model": "Bob", "choices": [{"index": 0, "message": {"role": "assistant", "content": "🔓 **VRAM Unlocked.** Memory cleared."}, "finish_reason": "stop"}]})
-            gpu_lock.release()
-            return _
-        elif "!code" in user_prompt_lower:
+            return _command_response("🔓 **VRAM Unlocked.** Memory cleared.")
+        elif "!code" in prompt_lower:
             expert_mode = "coding"
-            _ = JSONResponse(content={"id": "chatcmpl-Bob", "object": "chat.completion", "created": int(time.time()), "model": "Bob", "choices": [{"index": 0, "message": {"role": "assistant", "content": "💻 **Coding Mode Active.** Optimized for precision."}, "finish_reason": "stop"}]})
-            gpu_lock.release()
-            return _
-        elif "!general" in user_prompt_lower:
+            return _command_response("💻 **Coding Mode.** Parameters optimized for precision.")
+        elif "!general" in prompt_lower:
             expert_mode = "general"
-            _ = JSONResponse(content={"id": "chatcmpl-Bob", "object": "chat.completion", "created": int(time.time()), "model": "Bob", "choices": [{"index": 0, "message": {"role": "assistant", "content": "🧠 **General Mode Active.** Optimized for creativity."}, "finish_reason": "stop"}]})
-            gpu_lock.release()
-            return _
+            return _command_response("🧠 **General Mode.** Parameters optimized for creativity.")
 
-        # --- Routing ---
+        # Determine target model and load strategy
         target_model = ROUTER_MODEL
-        dynamic_keep_alive = 0
+        keep_alive = 0
         is_cold_expert = False
 
         if is_background_task:
             target_model = ROUTER_MODEL
-            dynamic_keep_alive = 0
-            logger.info("[ROUTING] Background Task -> FAST")
-        elif "!bob" in user_prompt_lower or "hey bob" in user_prompt_lower:
+            logger.info("Routing background task to Router model.")
+        elif any(kw in prompt_lower for kw in ["!bob", "hey bob"]):
             target_model = ROUTER_MODEL
             expert_warm_until = 0
-            logger.info("[ROUTING] Force FAST")
-        elif "!expert" in user_prompt_lower or "hey expert" in user_prompt_lower:
+            logger.info("Direct request for Router model.")
+        elif any(kw in prompt_lower for kw in ["!expert", "hey expert"]):
             target_model = EXPERT_MODEL
-            dynamic_keep_alive = "3m"
+            keep_alive = "3m"
             expert_warm_until = current_time + 300
-            if not is_expert_warm:
-                is_cold_expert = True
-            logger.info(f"[ROUTING] Force EXPERT ({'cold' if is_cold_expert else 'warm'})")
+            is_cold_expert = not is_expert_warm
+            logger.info("Direct request for Expert model.")
         elif is_expert_warm or vram_locked:
             target_model = EXPERT_MODEL
-            dynamic_keep_alive = "3m" if not vram_locked else "-1"
+            keep_alive = "3m" if not vram_locked else "-1"
             if not vram_locked:
                 expert_warm_until = current_time + 300
-            logger.info("[ROUTING] Expert warm")
         else:
-            # Triage Path
-            await sweep_vram_for_expert() # Clear Expert if it was lingering
+            # Complexity Triage
+            await sweep_vram_for_expert()
             analysis = await analyze_request(messages)
-            await verified_unload(ROUTER_MODEL) # Clear Router after triage
-            
+            await verified_unload(ROUTER_MODEL)
+
             if analysis.get("complexity", 1) > 6 or analysis.get("requires_tool", False):
                 target_model = EXPERT_MODEL
-                dynamic_keep_alive = "3m" if analysis.get("followups") else 0
-                expert_warm_until = current_time + 300
+                keep_alive = "3m" if analysis.get("followups") else 0
+                if analysis.get("followups"):
+                    expert_warm_until = current_time + 300
                 is_cold_expert = True
-                # Auto-set mode based on triage for cold loads
                 expert_mode = "coding" if analysis.get("is_coding") else "general"
+                logger.info(f"Triage: Expert model required ({expert_mode}).")
             else:
                 target_model = ROUTER_MODEL
-            logger.info(f"[ROUTING] Triage -> {target_model} (Mode: {expert_mode})")
+                logger.info("Triage: Router model sufficient.")
 
-        # --- VRAM SAFETY (Cold loads only) ---
-        # With the broad fast-exit, no background task can load the Router
-        # during an Expert session, so warm paths don't need sweeping.
         if target_model == EXPERT_MODEL and is_cold_expert:
             await sweep_vram_for_expert()
 
@@ -368,21 +481,18 @@ async def proxy_ollama(request: Request):
             options.update(params)
             options["num_ctx"] = 8192
         else:
-            # Default context 8192 for the 27B model on 24GB GPU.
             options.update({"temperature": options.get("temperature", 0.7), "num_ctx": 8192})
-        
-        body.update({"model": target_model, "keep_alive": dynamic_keep_alive, "options": options})
-        logger.info(f"[EXECUTE] {target_model} | ctx: {options['num_ctx']} | warm: {not is_cold_expert}")
 
-        path = str(request.url.path)
-        is_native = "/api/chat" in path
+        body.update({"model": target_model, "keep_alive": keep_alive, "options": options})
+        logger.info(f"Executing {target_model} (ctx: {options['num_ctx']}, warm: {not is_cold_expert})")
+
         target_path = "/api/chat" if is_native else "/v1/chat/completions"
 
         if not is_streaming:
             try:
                 resp = await http_client.post(f"{OLLAMA_URL}{target_path}", json=body, timeout=600.0)
                 if resp.status_code != 200:
-                    return JSONResponse(status_code=resp.status_code, content={"error": resp.text})
+                    return JSONResponse(status_code=resp.status_code, content={"error": "Inference failed."})
                 data = resp.json()
                 data["model"] = "Bob"
                 if "id" in data:
@@ -392,19 +502,42 @@ async def proxy_ollama(request: Request):
                 if lock_held:
                     gpu_lock.release()
                     lock_held = False
-        
+
         lock_held = False
         return StreamingResponse(
-            stream_proxy(f"{OLLAMA_URL}{target_path}", body, gpu_lock, is_native_ollama=is_native),
+            stream_proxy(f"{OLLAMA_URL}{target_path}", body, gpu_lock, is_native=is_native),
             media_type="application/x-ndjson" if is_native else "text/event-stream"
         )
     except Exception as e:
-        logger.error(f"Global Proxy Error: {e}")
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        logger.error(f"Orchestration Error: {e}")
+        return JSONResponse(status_code=500, content={"error": "Internal orchestration error."})
     finally:
         if lock_held:
             gpu_lock.release()
 
+
+def _silent_response(is_native: bool, text: str = ""):
+    """Returns an empty assistant response to silently terminate an interaction."""
+    if is_native:
+        return JSONResponse(content={"model": "Bob", "message": {"role": "assistant", "content": text}, "done": True})
+    return JSONResponse(content={
+        "id": "chatcmpl-Bob", "object": "chat.completion", "created": int(time.time()), "model": "Bob",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}]
+    })
+
+
+def _command_response(text: str):
+    """Returns a non-streaming JSON response for internal orchestrator commands."""
+    try:
+        gpu_lock.release()
+    except RuntimeError:
+        pass
+    return JSONResponse(content={
+        "id": "chatcmpl-Bob", "object": "chat.completion", "created": int(time.time()), "model": "Bob",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}]
+    })
+
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=False, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=False, log_level="warning")

@@ -25,7 +25,7 @@ echo "🎨 Clearing Port 8188 and Starting ComfyUI..."
 sudo fuser -k 8188/tcp > /dev/null 2>&1
 if [ -d "comfy-env" ] && [ -d "ComfyUI" ]; then
     cd ComfyUI
-    nohup ../comfy-env/bin/python3 main.py --lowvram --listen 0.0.0.0 > ../comfyui.log 2>&1 &
+    nohup ../comfy-env/bin/python3 main.py --normalvram --listen 0.0.0.0 > ../comfyui.log 2>&1 &
     cd ..
     echo "✅ ComfyUI running (See comfyui.log)"
 else

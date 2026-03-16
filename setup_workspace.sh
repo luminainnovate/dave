@@ -38,10 +38,10 @@ if [ ! -d "ComfyUI" ]; then
     git clone https://github.com/comfyanonymous/ComfyUI.git
 fi
 cd ComfyUI
-pip install torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cu121
+pip install torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cu130
 pip install -r requirements.txt
 # Launch ComfyUI with low VRAM settings
-nohup python3 main.py --lowvram --listen 0.0.0.0 > ../comfyui.log 2>&1 &
+nohup python3 main.py --normalvram --listen 0.0.0.0 > ../comfyui.log 2>&1 &
 echo "✅ ComfyUI is starting in the background (Port 8188)."
 cd ..
 deactivate
