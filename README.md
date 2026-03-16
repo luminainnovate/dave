@@ -138,3 +138,41 @@ Save the file, then reload systemd and restart ollama:
 sudo systemctl daemon-reload
 sudo systemctl restart ollama
 ```
+
+---
+
+## 🎨 Image Generation Setup (Flux.2)
+
+To get image generation working, you need to download the models and configure Open WebUI. This is my personal setup.
+
+### 1. Download Models & Text Encoders
+Download the following files from Hugging Face:
+
+-   **Main Model:** [FLUX.2-klein-9b-fp8](https://huggingface.co/black-forest-labs/FLUX.2-klein-9b-fp8/tree/main)
+-   **Text Encoders & VAE:** [VAE/Text Encoders for Flux](https://huggingface.co/Comfy-Org/vae-text-encorder-for-flux-klein-9b/tree/main/split_files)
+
+### 2. File Placement
+Move the downloaded files to their respective directories within your `ComfyUI/models` folder:
+
+-   **Main Model (`.safetensors`):** `ComfyUI/models/diffusion_models/`
+-   **Text Encoders:** `ComfyUI/models/text_encoders/`
+-   **VAE:** `ComfyUI/models/vae/`
+
+### 3. Installing Memory Management Plugin
+To ensure optimal performance and prevent VRAM fragmentation, you must install the **FreeMemory** plugin before uploading the workflow:
+
+1. Navigate to your `ComfyUI/custom_nodes` directory.
+2. Clone the repository:
+   ```bash
+   git clone https://github.com/ShmuelRonen/ComfyUI-FreeMemory
+   ```
+3. Restart ComfyUI. (Just run the start_workspace.sh script again if you need to refresh something)
+
+### 4. Open WebUI Configuration
+1. Login to **Open WebUI** as an Administrator.
+2. Go to **Admin Panel** -> **Images**.
+3. Set **Image Generation Engine** to `ComfyUI`.
+4. Set **ComfyUI Base URL** to `http://host.docker.internal:8188`.
+5. Under **ComfyUI Workflow Nodes**, ensure the **Text Input** is mapped to **Node ID 4**.
+6. Set the **Model Name** to `flux-2-klein-9b-fp8.safetensors`.
+7. **The most important step:** Upload the provided `flux2api.json` workflow file in the same settings area.
