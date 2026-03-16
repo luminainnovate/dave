@@ -18,7 +18,6 @@ ROUTER_MODEL = "qwen2.5:1.5b"
 EXPERT_MODEL = "qwen3.5:27b"
 OLLAMA_URL = "http://localhost:11434"
 COMFYUI_URL = "http://localhost:8188"
-WORKFLOW_PATH = "workflow_api.json"
 
 # --- STATE MANAGEMENT ---
 gpu_lock = asyncio.Lock()

@@ -120,3 +120,17 @@ CRITICAL DIRECTIVES:
 3. USER COMMANDS: The user might sometimes include commands starting with ! , that could be !lock or !expert for example but not limited only to, meaning they are using their own built in tools, you must ignore these completely in your thoughts, they do not interest you.
 4. OVERTHINKING: Do not overthink it, you must keep your thought process logical and analytical. Once you are approaching a decision, do it! Trust yourself. Do not overthink it!
 ```
+
+# Ollama GPU Overhead
+If ollama hogs all of your resources, causing major delays in responses due to expert model spilling over to RAM, set this to have some overhead for system processes (4gb for example)
+Edit your ollama config file `sudo systemctl edit ollama` and add the following line there:
+```
+[Service]
+Environment="OLLAMA_GPU_OVERHEAD=4294967296"
+```
+
+Save the file, then reload systemd and restart ollama:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart ollama
+```
