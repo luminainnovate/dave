@@ -125,20 +125,6 @@ CRITICAL DIRECTIVES:
 4. OVERTHINKING: Do not overthink it, you must keep your thought process logical and analytical. Once you are approaching a decision, do it! Trust yourself. Do not overthink it!
 ```
 
-## Ollama GPU Overhead
-If Ollama hogs all of your resources, causing major delays in responses due to expert model spilling over to RAM, set this to have some overhead for system processes (4gb for example). Note: This might make the expert model run slower.
-Edit your ollama config file `sudo systemctl edit ollama` and add the following line there:
-```
-[Service]
-Environment="OLLAMA_GPU_OVERHEAD=4294967296"
-```
-
-Save the file, then reload systemd and restart Ollama:
-```bash
-sudo systemctl daemon-reload
-sudo systemctl restart ollama
-```
-
 ---
 
 ## 🎨 Image Generation Setup (Flux.2)
