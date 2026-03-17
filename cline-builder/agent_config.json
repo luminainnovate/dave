@@ -27,7 +27,7 @@
 
     "limits": {
         "max_project_size_mb": 4096,
-        "max_build_iterations": 3,
-        "cline_max_turns": 10
+        "max_build_iterations": 5,
+        "cline_max_turns": 25
     }
 }

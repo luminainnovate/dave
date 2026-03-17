@@ -443,6 +443,11 @@ async def proxy_ollama(request: Request):
             logger.info("Maintenance follow-up detected: Silencing background task.")
             return _silent_response(is_native)
 
+        # Rule F: Suppress background tasks during active build pipelines
+        if is_background_task and await is_pipeline_active():
+            logger.info("Pipeline active: Silencing background task to save VRAM.")
+            return _silent_response(is_native)
+
     # =============================================================================
 
     # 2. Fast Exit for Background Traffic
@@ -473,7 +478,7 @@ async def proxy_ollama(request: Request):
             return _command_response(msg, is_streaming, is_native)
         elif "!build" in prompt_lower:
             logger.info("Command: Build pipeline triggered.")
-            build_msg = _trigger_build_pipeline(messages)
+            build_msg = await _trigger_build_pipeline_safe(messages)
             return _command_response(build_msg, is_streaming, is_native)
         elif "!stop" in prompt_lower:
             logger.info("Command: Stop pipeline triggered.")
@@ -707,6 +712,36 @@ def _check_build_status() -> str:
         return "\n".join(report)
     except Exception as e:
         return f"❌ **Status Check Failed:** {e}"
+
+
+async def is_pipeline_active() -> bool:
+    """Checks if any cline-builder container is currently running."""
+    try:
+        # Run docker ps to see if any containers with the name 'cline-builder' are running
+        cmd = ["docker", "ps", "--filter", "name=cline-builder", "--filter", "status=running", "--format", "{{.ID}}"]
+        # Use asyncio.create_subprocess_exec for non-blocking check
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        stdout, _ = await proc.communicate()
+        return bool(stdout.strip())
+    except Exception as e:
+        logger.warning(f"Failed to check pipeline activity: {e}")
+        return False
+
+
+async def _trigger_build_pipeline_safe(messages: list) -> str:
+    """
+    Triggers the build pipeline while ensuring VRAM is cleared and
+    waiting for any active LLM tasks to finish.
+    """
+    async with gpu_lock:
+        logger.info("Acquired GPU lock for pipeline trigger. Clearing VRAM...")
+        # Ensure the expert model is unloaded to free as much VRAM as possible
+        await verified_unload(EXPERT_MODEL)
+        await verified_unload(ROUTER_MODEL)
+        await free_comfyui()
+        
+        # Now trigger the actual command
+        return _trigger_build_pipeline(messages)
 
 
 def _stop_build_pipeline() -> str:
