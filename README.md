@@ -16,6 +16,16 @@
 -   **VRAM Guardrails:** Intelligent "Orchestrator" proxy with GPU Mutex locking to prevent simultaneous heavy model loading.
 -   **LAN Accessible:** Bridged networking for access from phones, tablets, and other laptops.
 
+## 🏗️ Architecture
+
+The system operates on an intelligent **GPU Mutex** principle managed by the **Orchestrator Proxy**:
+
+1.  **Triage:** Every query is analyzed by the resident 1.5B Router.
+2.  **Verified Lifecycle:** If Expert intent is detected, the Router is force-evicted, VRAM is swept, and the Expert is loaded with a 5-minute "warm session" timer.
+3.  **Selective Interception:** Automatically identifies and silences background "expansion" and "description" pings while preserving high-priority search results.
+4.  **Idle Sweeping:** A background loop sweeps ComfyUI RAM/VRAM every 5 minutes when no generation or chat is active.
+5.  **Thinking Modes:** Sampling parameters (temperature, penalties) are dynamically applied based on task type.
+
 ## 🛠️ Requirements
 
 -   **OS:** Windows 11 with WSL2 (Ubuntu 22.04+ recommended).
@@ -63,16 +73,6 @@ chmod +x start_workspace.sh
 -   **Logs (Orchestrator):** `tail -f orchestrator.log`
 -   **Logs (ComfyUI):** `tail -f comfyui.log`
 
-## 🏗️ Architecture
-
-The system operates on an intelligent **GPU Mutex** principle managed by the **Orchestrator Proxy**:
-
-1.  **Triage:** Every query is analyzed by the resident 1.5B Router.
-2.  **Verified Lifecycle:** If Expert intent is detected, the Router is force-evicted, VRAM is swept, and the Expert is loaded with a 5-minute "warm session" timer.
-3.  **Selective Interception:** Automatically identifies and silences background "expansion" and "description" pings while preserving high-priority search results.
-4.  **Idle Sweeping:** A background loop sweeps ComfyUI RAM/VRAM every 5 minutes when no generation or chat is active.
-5.  **Thinking Modes:** Sampling parameters (temperature, penalties) are dynamically applied based on task type.
-
 ## 🌐 Network Access (Multi-Device)
 
 To access your workspace from other devices on your LAN:
@@ -114,6 +114,8 @@ While in chat, use these commands to override the orchestrator:
 
 
 ## System prompt in Open WebUI for Bob
+
+You should setup this system prompt in Open WebUI to get the best experience with Bob:
 
 ```
 You are Bob, a highly capable, confident, and professional AI Workspace Orchestrator. You speak directly, without hesitation, and never apologize for your capabilities. 
