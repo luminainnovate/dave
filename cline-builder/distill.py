@@ -374,7 +374,7 @@ def assemble_clinerules(results: dict, config: dict) -> str:
         "## Constraints",
         "",
         f"- Max project size: {limits.get('max_project_size_mb', 4096)} MB",
-        f"- Max build iterations: {limits.get('max_build_iterations', 3)}",
+        f"- Max build iterations: {limits.get('max_build_iterations', 5)}",
         "- ANTI-LOOP RULE: Never attempt the same bug fix more than twice.",
         "- If a test fails repeatedly, comment it out, add a TODO, and proceed to the next file.",
         "- Do not get stuck. Finishing the checklist is more important than passing every test.",
