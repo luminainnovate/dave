@@ -49,3 +49,14 @@ workflow_api.json
 
 # Conversations files
 /conversations/*
+
+# Multi-Agent Builder Pipeline
+.clinerules
+.distill_*
+.build_conversation.json
+.build_log_iter_*.txt
+.verify_log_iter_*.txt
+.safety_log_iter_*.txt
+.build_complete
+.build_issues.md
+cline-builder/staging/

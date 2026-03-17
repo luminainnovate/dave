@@ -9,6 +9,9 @@ echo "🚀 Launching Unified Local AI Workspace..."
 echo "🐳 Starting Docker (Open WebUI, SearXNG)..."
 docker compose up -d
 
+echo "🏗️  Ensuring Cline Builder is built..."
+docker compose --profile build build cline-builder
+
 # 2. Start Orchestrator Proxy
 echo "🛡️ Clearing Port 8000 and Starting Orchestrator Proxy..."
 sudo fuser -k 8000/tcp > /dev/null 2>&1

@@ -36,6 +36,26 @@ services:
     depends_on:
       - searxng
 
+  cline-builder:
+    build:
+      context: ./cline-builder
+      dockerfile: Dockerfile
+    container_name: cline-builder
+    profiles:
+      - build
+    networks:
+      - ai-workspace-net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./conversations:/workspace
+      - ./cline-builder/agent_config.json:/app/agent_config.json:ro
+    environment:
+      - OLLAMA_HOST=http://host.docker.internal:11434
+      - AGENT_CONFIG_PATH=/app/agent_config.json
+      - EXPERT_CTX=8192
+    working_dir: /workspace
+
 networks:
   ai-workspace-net:
     driver: bridge

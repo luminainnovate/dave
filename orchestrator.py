@@ -2,7 +2,9 @@ import asyncio
 import httpx
 import json
 import logging
+import os
 import re
+import subprocess
 import time
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
@@ -16,11 +18,25 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(level
 logger = logging.getLogger("Bob-Orchestrator")
 
 # --- STRICT MODEL CONFIG ---
-DEFAULT_EXPERT_MODEL = "qwen3.5:27b"
+EXPERT_MODEL = "qwen3.5:27"  # Switch this to any model
 ROUTER_MODEL = "qwen2.5:1.5b"
-EXPERT_MODEL = "qwen3.5:27b"  # Switch this to any model
+DEFAULT_EXPERT_MODEL = "qwen3.5:27b" # Keep this as default, if you know what youre doing, you can change it with the expert params
 OLLAMA_URL = "http://localhost:11434"
 COMFYUI_URL = "http://localhost:8188"
+EXPERT_CTX = 16384
+DISTILL_CTX = 16384  # Context for the distillation engine (Thinking)
+CLINE_CTX = 32768    # Context for the Cline agent (Building)
+
+# --- BUILDER PIPELINE CONFIG ---
+BUILDER_CONFIG = {
+    "architect_model": EXPERT_MODEL,
+    "engineer_model": EXPERT_MODEL,
+    "safety_model": EXPERT_MODEL,
+    "cline_model": EXPERT_MODEL,
+    "max_project_size_mb": 2048,
+    "max_build_iterations": 5,
+    "cline_max_turns": 50,
+}
 
 # --- STATE MANAGEMENT ---
 gpu_lock = asyncio.Lock()
@@ -454,6 +470,18 @@ async def proxy_ollama(request: Request):
                 success = mover.handle_move(messages)
                 msg = "Files moved!" if "Moved" in success else "Files failed to move!"
                 return _command_response(msg, is_streaming, is_native)
+            elif "!build" in prompt_lower:
+                logger.info("Command: Build pipeline triggered.")
+                build_msg = _trigger_build_pipeline(messages)
+                return _command_response(build_msg, is_streaming, is_native)
+            elif "!stop" in prompt_lower:
+                logger.info("Command: Stop pipeline triggered.")
+                stop_msg = _stop_build_pipeline()
+                return _command_response(stop_msg, is_streaming, is_native)
+            elif "!status" in prompt_lower:
+                logger.info("Command: Status check triggered.")
+                status_msg = _check_build_status()
+                return _command_response(status_msg, is_streaming, is_native)
 
         # Determine target model and load strategy
         target_model = ROUTER_MODEL
@@ -518,9 +546,9 @@ async def proxy_ollama(request: Request):
             else:
                 logger.info(f"Non-default expert {EXPERT_MODEL} detected; using default model settings.")
             
-            options["num_ctx"] = 8192
+            options["num_ctx"] = EXPERT_CTX
         else:
-            options.update({"temperature": options.get("temperature", 0.7), "num_ctx": 8192})
+            options.update({"temperature": options.get("temperature", 0.7), "num_ctx": EXPERT_CTX})
 
         body.update({"model": target_model, "keep_alive": keep_alive, "options": options})
         logger.info(f"Executing {target_model} (ctx: {options['num_ctx']}, warm: {not is_cold_expert})")
@@ -589,6 +617,106 @@ def _command_response(text: str, is_streaming: bool = False, is_native: bool = F
             yield b"data: [DONE]\n\n"
 
     return StreamingResponse(_generator(), media_type="application/x-ndjson" if is_native else "text/event-stream")
+
+
+def _trigger_build_pipeline(messages: list) -> str:
+    """
+    Orchestrates the build pipeline:
+    1. Extracts conversation files to a unique project folder.
+    2. Serializes the conversation for distillation.
+    3. Launches the cline-builder Docker container.
+    """
+    try:
+        # 1. Extract files via mover
+        # This creates the project folder in ./conversations/
+        status_msg = mover.handle_move(messages)
+        if "No code snippets" in status_msg:
+            return f"⚠️ **Build aborted.** {status_msg}"
+
+        # Extract target_dir from the mover's response
+        match = re.search(r"to `([^`]+)`", status_msg)
+        if not match:
+            return "❌ **Critical Error:** Failed to determine workspace path."
+        
+        target_dir = match.group(1)
+        abs_target_dir = os.path.abspath(target_dir)
+        conv_file_path = os.path.join(abs_target_dir, ".build_conversation.json")
+
+        # 2. Save conversation for the container
+        with open(conv_file_path, "w", encoding="utf-8") as f:
+            json.dump(messages, f, indent=2)
+
+        # 3. Launch Docker Container (Non-blocking)
+        # We mount the SPECIFIC conversation folder as /workspace
+        container_name = f"cline-builder-{int(time.time())}"
+        cmd = [
+            "docker", "compose", "--profile", "build", "run", "-d",
+            "--name", container_name,
+            "-v", f"{abs_target_dir}:/workspace",
+            "-e", f"CONVERSATION_FILE=/workspace/.build_conversation.json",
+            "-e", f"EXPERT_CTX={DISTILL_CTX}",
+            "-e", f"CLINE_CTX={CLINE_CTX}",
+            "cline-builder"
+        ]
+        
+        logger.info(f"Launching pipeline command: {' '.join(cmd)}")
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        return (
+            f"🔨 **Build pipeline triggered.**\n\n"
+            f"- **Workspace:** `{target_dir}`\n"
+            f"- **Container:** `{container_name}`\n"
+            f"- **Mode:** Autonomous (YOLO)\n"
+            f"- **Status:** Distillation started... Cline will follow.\n\n"
+            f"Check logs with: `docker logs {container_name}`"
+        )
+
+    except Exception as e:
+        logger.error(f"Failed to trigger build: {e}")
+        return f"❌ **Build Trigger Failed:** {e}"
+
+
+def _check_build_status() -> str:
+    """Checks for active or recently completed cline-builder containers."""
+    try:
+        cmd = ["docker", "ps", "-a", "--filter", "name=cline-builder", "--format", "{{.Names}}\t{{.Status}}\t{{.RunningFor}}"]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if not result.stdout.strip():
+            return "📭 **No active or recent build pipelines found.**"
+        
+        lines = result.stdout.strip().split("\n")
+        report = ["🔍 **Build Pipeline Status:**", ""]
+        for line in lines:
+            name, status, age = line.split("\t")
+            icon = "🟢" if "Up" in status else "⚪"
+            report.append(f"{icon} `{name}`: {status} (Started {age} ago)")
+        
+        return "\n".join(report)
+    except Exception as e:
+        return f"❌ **Status Check Failed:** {e}"
+
+
+def _stop_build_pipeline() -> str:
+    """Stops and removes all cline-builder containers."""
+    try:
+        # Get list of containers
+        list_cmd = ["docker", "ps", "-a", "--filter", "name=cline-builder", "--format", "{{.Names}}"]
+        containers = subprocess.run(list_cmd, capture_output=True, text=True).stdout.strip().split("\n")
+        
+        if not containers or not containers[0]:
+            return "📭 **No active build pipelines to stop.**"
+        
+        # Stop and remove them
+        for name in containers:
+            if name:
+                logger.info(f"Stopping container: {name}")
+                subprocess.run(["docker", "stop", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(["docker", "rm", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
+        return f"🛑 **Stopped and cleared {len(containers)} build pipeline(s).**"
+    except Exception as e:
+        return f"❌ **Stop Command Failed:** {e}"
 
 
 if __name__ == "__main__":
