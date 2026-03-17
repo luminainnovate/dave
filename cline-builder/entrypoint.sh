@@ -157,6 +157,7 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     set +e
     cline task -v -y \
         -m "$CLINE_MODEL" \
+        --timeout 300 \
         "$BUILD_MSG" \
         2>&1 | tee "/workspace/.build_log_iter_${ITERATION}.txt"
     CLINE_EXIT=$?
@@ -178,6 +179,7 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     set +e
     cline task -v -y \
         -m "$CLINE_MODEL" \
+        --timeout 300 \
         "$VERIFY_MSG" \
         2>&1 | tee "/workspace/.verify_log_iter_${ITERATION}.txt"
     set -e
@@ -190,6 +192,7 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     set +e
     cline task -v -y \
         -m "$CLINE_MODEL" \
+        --timeout 300 \
         "$SAFETY_MSG" \
         2>&1 | tee "/workspace/.safety_log_iter_${ITERATION}.txt"
     set -e

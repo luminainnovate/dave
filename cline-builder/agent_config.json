@@ -23,7 +23,7 @@
         "safety": "You are a Security Auditor. Review the existing plans. Format your response EXACTLY matching this Markdown template:\n\n# 1. Exploit Surface\n[List vulnerabilities like CSRF, Injection]\n# 2. Secrets Management\n[List rules for handling keys/env vars]\n# 3. Resource Safety\n[List rate limiting or timeout rules]\n# 4. Required Mitigations\n[List strict rules the builder must follow to pass safety checks]"
     },
 
-    "cline_startup_message": "Read the .clinerules file in the current directory. It contains your complete project context: architectural specification, implementation tasks, and safety requirements compiled by expert reviewers. Execute ALL implementation tasks described there. After completing each major task, verify correctness. Work exclusively in the /workspace directory.",
+    "cline_startup_message": "Read the .clinerules file and execute all implementation tasks. CRITICAL ANTI-LOOP DIRECTIVE: You have limited time and context. If a test fails or a bug takes more than 2 attempts to fix, you MUST comment out the failing code, write a 'TODO' comment, check off the task, and immediately move to the next item on your list. DO NOT get stuck debugging a single file. Momentum is your top priority.",
 
     "limits": {
         "max_project_size_mb": 4096,
