@@ -162,7 +162,7 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     fi
 
     set +e
-    cline task -y \
+    cline task -v -y \
         -m "$CLINE_MODEL" \
         --timeout "$CURRENT_TIMEOUT" \
         "$BUILD_MSG" \
@@ -189,7 +189,7 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     4) If the app is 100% working, safe, and has a README, create a file at '/workspace/.build_complete' containing 'VERIFIED'. If issues remain, ensure they are accurately documented in '.build_issues.md'."
 
     set +e
-    cline task -y \
+    cline task -v -y \
         -m "$CLINE_MODEL" \
         --timeout 400 \
         "$VERIFY_MSG" \
@@ -205,7 +205,7 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     If you cannot fix them, add them to /workspace/.build_issues.md."
 
     set +e
-    cline task -y \
+    cline task -v -y \
         -m "$CLINE_MODEL" \
         --timeout 400 \
         "$SAFETY_MSG" \
