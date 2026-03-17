@@ -9,8 +9,8 @@
 -   **Tiered Orchestration:** Uses a resident "Fast Orchestrator" (`qwen2.5:1.5b`) for instant intent detection and simple queries.
 -   **Expert Reasoning:** Dynamically loads expert models (`qwen3.5:27b`) for complex coding and logic tasks.
 -   **Project Extraction (`!move`):** Automatically reconstructs entire project structures from chat conversations. It parses folder trees and code snippets, reconstructs them in a dedicated `conversations/` directory, and opens the result in VS Code.
--   **Smart Conflict Management:** The extraction system only updates files that have actually changed, preserving your local modifications.
--   **Safe Path Sanitization:** Built-in safeguards prevent directory traversal (clears `..`) and automatically filters out shell/command blocks from project files.
+    -   **Smart Conflict Management:** The extraction system only updates files that have actually changed, preserving your local modifications.
+    -   **Safe Path Sanitization:** Built-in safeguards prevent directory traversal (clears `..`) and automatically filters out shell/command blocks from project files.
 -   **Flexible Expert Tuning:** High-level models use customized "Thinking Mode" parameters, while alternative expert models automatically fall back to their native default settings for maximum compatibility.
 -   **Periodic RAM Cleanup**: A background task automatically sweeps ComfyUI memory every 5 minutes when the system is idle.
 -   **VRAM Guardrails:** Intelligent "Orchestrator" proxy with GPU Mutex locking to prevent simultaneous heavy model loading.
