@@ -12,6 +12,8 @@
     -   **Smart Conflict Management:** The extraction system only updates files that have actually changed, preserving your local modifications.
     -   **Safe Path Sanitization:** Built-in safeguards prevent directory traversal (clears `..`) and automatically filters out shell/command blocks from project files.
 -   **Flexible Expert Tuning:** High-level models use customized "Thinking Mode" parameters, while alternative expert models automatically fall back to their native default settings for maximum compatibility.
+-   **Autonomous Build Pipeline (`!build`):** Trigger a multi-agent distillation and implementation process for any project extracted from the conversation.
+    -   **Context Distillation:** Automatically compresses long conversations into actionable `.clinerules` through a 4-pass expert review (Architect, Engineer, Test, Safety).
 -   **Periodic RAM Cleanup**: A background task automatically sweeps ComfyUI memory every 5 minutes when the system is idle.
 -   **VRAM Guardrails:** Intelligent "Orchestrator" proxy with GPU Mutex locking to prevent simultaneous heavy model loading.
 -   **LAN Accessible:** Bridged networking for access from phones, tablets, and other laptops.
@@ -109,6 +111,9 @@ While in chat, use these commands to override the orchestrator:
 - `!code`: Manually switches Expert to high-precision "Coding Mode".
 - `!general`: Manually switches Expert to creative "General Mode".
 - `!move`: Scans the conversation, identifies project structure/code, and exports it to `conversations/`.
+- `!build`: Triggers the autonomous build pipeline for the currently moved project.
+- `!status`: Checks the status of active or recent build containers.
+- `!stop`: Force-stops all running build pipelines.
 - `!bob` / `hey bob`: Force the current turn to use the Fast Orchestrator.
 - `!expert` / `hey expert`: Force the current turn to use the Expert Model.
 

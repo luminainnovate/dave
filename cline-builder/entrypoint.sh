@@ -146,18 +146,25 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
         exit 1
     fi
 
-    # --- Build Phase ---
+# --- Build Phase ---
     echo "  🔧 Running Cline (Build mode)..."
 
+    # [NEW] Dynamic Timeout and Messaging
+    CURRENT_TIMEOUT=300
     BUILD_MSG="$CLINE_STARTUP"
-    if [ $ITERATION -gt 1 ]; then
-        BUILD_MSG="Continue building the project. Review what was done in the previous iteration, fix any issues, and complete remaining tasks from .clinerules. This is iteration ${ITERATION} of ${MAX_ITERATIONS}."
+
+    if [ $ITERATION -eq $MAX_ITERATIONS ]; then
+        echo "  🚨 FINAL ROUND: Shifting to Stabilization and Debugging..."
+        BUILD_MSG="CRITICAL: This is the FINAL iteration (${ITERATION} of ${MAX_ITERATIONS}). Your directive is now STABILIZATION. You must ignore the previous 'move on' anti-loop rules. Revisit any TODOs, uncommented code, or failing tests. Your sole priority is to ensure the application compiles, runs correctly end-to-end, and is completely usable. Take your time and fix the root causes of any remaining bugs."
+        CURRENT_TIMEOUT=600  # Give it 10 full minutes for deep debugging
+    elif [ $ITERATION -gt 1 ]; then
+        BUILD_MSG="Continue building the project. Review what was done in the previous iteration, fix any issues, and complete remaining tasks from .clinerules. This is iteration ${ITERATION} of ${MAX_ITERATIONS}. Remember: keep momentum and don't get stuck on one bug."
     fi
 
     set +e
-    cline task -v -y \
+    cline task -y \
         -m "$CLINE_MODEL" \
-        --timeout 300 \
+        --timeout "$CURRENT_TIMEOUT" \
         "$BUILD_MSG" \
         2>&1 | tee "/workspace/.build_log_iter_${ITERATION}.txt"
     CLINE_EXIT=$?
@@ -174,12 +181,17 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     # --- Verification Phase ---
     echo "  🔍 Running Cline (Verification mode)..."
 
-    VERIFY_MSG="Review all files in /workspace. Check that: 1) All tasks from .clinerules are implemented, 2) The code compiles/runs without errors, 3) All imports and dependencies are correct, 4) No placeholder code remains. If everything is complete and correct, create a file called /workspace/.build_complete with content 'VERIFIED'. If issues remain, create /workspace/.build_issues.md listing what needs fixing."
+    # [NEW] Instructions to maintain the issue list and write a README
+    VERIFY_MSG="Review the project in /workspace. 
+    1) Verify all tasks from .clinerules are implemented and the code runs without errors. 
+    2) MUST DO: Create a 'README.md' file that clearly explains what the project is and EXACTLY how to run it. 
+    3) Check if '/workspace/.build_issues.md' already exists. If it does, READ it. Cross off or remove the issues that were fixed in this iteration, and keep the ones that still need work. Do not hallucinate uncompleted tasks. 
+    4) If the app is 100% working, safe, and has a README, create a file at '/workspace/.build_complete' containing 'VERIFIED'. If issues remain, ensure they are accurately documented in '.build_issues.md'."
 
     set +e
-    cline task -v -y \
+    cline task -y \
         -m "$CLINE_MODEL" \
-        --timeout 300 \
+        --timeout 400 \
         "$VERIFY_MSG" \
         2>&1 | tee "/workspace/.verify_log_iter_${ITERATION}.txt"
     set -e
@@ -187,12 +199,15 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     # --- Safety Phase ---
     echo "  🛡️ Running Cline (Safety audit)..."
 
-    SAFETY_MSG="Perform a security and safety audit of all code in /workspace. Check for: 1) Input validation issues, 2) Path traversal vulnerabilities, 3) Hardcoded secrets or credentials, 4) SQL injection or command injection risks, 5) Infinite loops or resource leaks, 6) Missing error handling. If the code is safe, append 'SAFE' to /workspace/.build_complete. If critical issues are found, fix them directly."
+    SAFETY_MSG="Perform a security and safety audit of all code in /workspace. Check for: 1) Input validation, 2) Path traversal, 3) Hardcoded secrets, 4) Injection risks, 5) Infinite loops/resource leaks, 6) Missing error handling. 
+    If you find critical issues, attempt to FIX THEM DIRECTLY in the code. 
+    If you fix them or the code is already safe, append 'SAFE' to /workspace/.build_complete. 
+    If you cannot fix them, add them to /workspace/.build_issues.md."
 
     set +e
-    cline task -v -y \
+    cline task -y \
         -m "$CLINE_MODEL" \
-        --timeout 300 \
+        --timeout 400 \
         "$SAFETY_MSG" \
         2>&1 | tee "/workspace/.safety_log_iter_${ITERATION}.txt"
     set -e

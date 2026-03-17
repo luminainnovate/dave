@@ -18,7 +18,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(level
 logger = logging.getLogger("Bob-Orchestrator")
 
 # --- STRICT MODEL CONFIG ---
-EXPERT_MODEL = "glm-fast:latest"  # Switch this to any model
+EXPERT_MODEL = "qwen3.5:27b"  # Switch this to any model
 ROUTER_MODEL = "qwen2.5:1.5b"
 DEFAULT_EXPERT_MODEL = "qwen3.5:27b" # Keep this as default, if you know what youre doing, you can change it with the expert params
 OLLAMA_URL = "http://localhost:11434"
@@ -431,13 +431,60 @@ async def proxy_ollama(request: Request):
                 last_comfy_history_count = current_history_count
                 asyncio.create_task(free_comfyui())
 
+        # Rule E: Suppress background tasks following maintenance commands
+        maintenance_commands = ["!status", "!stop", "!move", "!build", "!lock", "!unlock"]
+        is_maintenance_followup = False
+        if is_background_task and len(messages) >= 3:
+            prev_user_msg = messages[-3].get("content", "").lower() if messages[-3].get("role") == "user" else ""
+            if any(cmd in prev_user_msg for cmd in maintenance_commands):
+                is_maintenance_followup = True
+        
+        if is_maintenance_followup:
+            logger.info("Maintenance follow-up detected: Silencing background task.")
+            return _silent_response(is_native)
+
     # =============================================================================
 
     # 2. Fast Exit for Background Traffic
     if not is_streaming and (time.time() < expert_warm_until or vram_locked):
         return _silent_response(is_native, "Analyzing...")
 
-    # 3. Request Orchestration
+    # 3. Early Command Handling (Before Lock)
+    prompt_lower = (messages[-1].get("content", "") if messages else "").lower()
+    if not is_background_task:
+        if "!lock" in prompt_lower:
+            vram_locked = True
+            return _command_response("🔒 **VRAM Locked.** Expert model is persistent.", is_streaming, is_native)
+        elif "!unlock" in prompt_lower:
+            vram_locked = False
+            expert_warm_until = 0
+            await verified_unload(EXPERT_MODEL)
+            return _command_response("🔓 **VRAM Unlocked.** Memory cleared.", is_streaming, is_native)
+        elif "!code" in prompt_lower:
+            expert_mode = "coding"
+            logger.info("Command: Switched to Coding Mode.")
+        elif "!general" in prompt_lower:
+            expert_mode = "general"
+            logger.info("Command: Switched to General Mode.")
+        elif "!move" in prompt_lower:
+            logger.info("Command: Move initiated.")
+            success = mover.handle_move(messages)
+            msg = "Files moved!" if "Moved" in success else "Files failed to move!"
+            return _command_response(msg, is_streaming, is_native)
+        elif "!build" in prompt_lower:
+            logger.info("Command: Build pipeline triggered.")
+            build_msg = _trigger_build_pipeline(messages)
+            return _command_response(build_msg, is_streaming, is_native)
+        elif "!stop" in prompt_lower:
+            logger.info("Command: Stop pipeline triggered.")
+            stop_msg = _stop_build_pipeline()
+            return _command_response(stop_msg, is_streaming, is_native)
+        elif "!status" in prompt_lower:
+            logger.info("Command: Status check triggered.")
+            status_msg = _check_build_status()
+            return _command_response(status_msg, is_streaming, is_native)
+
+    # 4. Request Orchestration
     try:
         await asyncio.wait_for(gpu_lock.acquire(), timeout=120.0)
     except asyncio.TimeoutError:
@@ -447,41 +494,6 @@ async def proxy_ollama(request: Request):
     try:
         current_time = time.time()
         is_expert_warm = current_time < expert_warm_until
-        prompt_lower = (messages[-1].get("content", "") if messages else "").lower()
-
-        # Handle explicit user commands
-        if not is_background_task:
-            if "!lock" in prompt_lower:
-                vram_locked = True
-                return _command_response("🔒 **VRAM Locked.** Expert model is persistent.", is_streaming, is_native)
-            elif "!unlock" in prompt_lower:
-                vram_locked = False
-                expert_warm_until = 0
-                await verified_unload(EXPERT_MODEL)
-                return _command_response("🔓 **VRAM Unlocked.** Memory cleared.", is_streaming, is_native)
-            elif "!code" in prompt_lower:
-                expert_mode = "coding"
-                logger.info("Command: Switched to Coding Mode.")
-            elif "!general" in prompt_lower:
-                expert_mode = "general"
-                logger.info("Command: Switched to General Mode.")
-            elif "!move" in prompt_lower:
-                logger.info("Command: Move initiated.")
-                success = mover.handle_move(messages)
-                msg = "Files moved!" if "Moved" in success else "Files failed to move!"
-                return _command_response(msg, is_streaming, is_native)
-            elif "!build" in prompt_lower:
-                logger.info("Command: Build pipeline triggered.")
-                build_msg = _trigger_build_pipeline(messages)
-                return _command_response(build_msg, is_streaming, is_native)
-            elif "!stop" in prompt_lower:
-                logger.info("Command: Stop pipeline triggered.")
-                stop_msg = _stop_build_pipeline()
-                return _command_response(stop_msg, is_streaming, is_native)
-            elif "!status" in prompt_lower:
-                logger.info("Command: Status check triggered.")
-                status_msg = _check_build_status()
-                return _command_response(status_msg, is_streaming, is_native)
 
         # Determine target model and load strategy
         target_model = ROUTER_MODEL
@@ -653,7 +665,7 @@ def _trigger_build_pipeline(messages: list) -> str:
             "docker", "compose", "--profile", "build", "run", "-d",
             "--name", container_name,
             "-v", f"{abs_target_dir}:/workspace",
-            "-e", f"CONVERSATION_FILE=/workspace/.build_conversation.json",
+            "-e", "CONVERSATION_FILE=/workspace/.build_conversation.json",
             "-e", f"EXPERT_CTX={DISTILL_CTX}",
             "-e", f"CLINE_CTX={CLINE_CTX}",
             "cline-builder"

@@ -114,3 +114,25 @@ This flow illustrates the VRAM safety logic when the LLM triggers a heavy tool (
 | **ComfyUI** | `127.0.0.1:8188` (Host routed) | `8188` | REST/WS |
 
 *Note: ComfyUI is run outside the core Docker network for easier access to local model `.safetensors` directories, and is accessed via the host IP.*
+---
+
+## 7. Autonomous Build Pipeline (The Distiller)
+
+The system includes a dedicated **Dockerized Build Pipeline** (`cline-builder`) for fully autonomous project implementation.
+
+### A. The 4-Pass Distillation Engine
+To prevent context window saturation and ensure high-quality code, the pipeline uses a tiered distillation process:
+1. **Architect Pass:** Analyzes the conversation to define business goals and directory structures.
+2. **Engineer Pass:** Maps logic to files and defines design patterns and build orders.
+3. **Test Engineer Pass:** Identifies edge cases and defines verification gates.
+4. **Safety Inspector Pass:** Audits the plan for security vulnerabilities and resource safety.
+
+### B. Execution Flow
+- **Input:** A `.build_conversation.json` file exported by the `!build` command.
+- **Processing:** The `distill.py` engine runs the 4 passes sequentially, loading/unloading models for VRAM efficiency.
+- **Output:** A structured `.clinerules` file embedded with critical directives and implementation roadmaps.
+- **Implementation:** A `Cline` agent (using the `glm-4.7-flash:q4_k_m` model) reads the rules and executes the code modifications autonomously within the workspace.
+
+### C. Build Constraints
+- **Anti-Loop Shield:** The builder is forbidden from attempting the same bug fix more than twice.
+- **Chunked Ingestion:** Long conversations are automatically split into 2k-token "extraction chunks" to prevent CPU ingestion stalls during the distillation process.
