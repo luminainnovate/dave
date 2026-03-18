@@ -383,7 +383,7 @@ def assemble_clinerules(results: dict, config: dict) -> str:
         "- Run all safety checks before declaring the build complete.",
         "- CRITICAL CONTEXT RULE: NEVER search, read, or modify `node_modules`, `.git`, or `.venv`.",
         "- PORT MANAGEMENT: If a port like 8080 is in use, dynamically try alternatives (3000, 3001, 8081).",
-        "- DAEMON EXECUTION: NEVER run blocking server commands (like `python3 -m http.server`) synchronously in the terminal. Always run them in the background so you don't hang.",
+        "- DAEMON EXECUTION (CRITICAL): NEVER run `python3 -m http.server`, `npm start`, or ANY server command directly. It will hang the terminal and break the pipeline. You MUST use background processes: `python3 -m http.server 8000 &` or `nohup npm start &`.",
         "</operational_constraints>",
         "",
         "<reasoning_protocol>",

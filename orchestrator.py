@@ -18,7 +18,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(level
 logger = logging.getLogger("Bob-Orchestrator")
 
 # --- STRICT MODEL CONFIG ---
-EXPERT_MODEL = "qwen3.5:27b"  # Switch this to any model
+EXPERT_MODEL = "glm-fast:latest"  # Switch this to any model
 ROUTER_MODEL = "qwen2.5:1.5b"
 DEFAULT_EXPERT_MODEL = "qwen3.5:27b" # Keep this as default, if you know what youre doing, you can change it with the expert params
 OLLAMA_URL = "http://localhost:11434"

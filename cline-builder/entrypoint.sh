@@ -150,13 +150,13 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     echo "  🔧 Running Cline (Build mode)..."
 
     # [NEW] Dynamic Timeout and Messaging
-    CURRENT_TIMEOUT=300
+    CURRENT_TIMEOUT=600 # 10 minutes
     BUILD_MSG="$CLINE_STARTUP"
 
     if [ $ITERATION -eq $MAX_ITERATIONS ]; then
         echo "  🚨 FINAL ROUND: Shifting to Stabilization and Debugging..."
         BUILD_MSG="CRITICAL: This is the FINAL iteration (${ITERATION} of ${MAX_ITERATIONS}). Your directive is now STABILIZATION. You must ignore the previous 'move on' anti-loop rules. Revisit any TODOs, uncommented code, or failing tests. Your sole priority is to ensure the application compiles, runs correctly end-to-end, and is completely usable. Take your time and fix the root causes of any remaining bugs."
-        CURRENT_TIMEOUT=600  # Give it 10 full minutes for deep debugging
+        CURRENT_TIMEOUT=1200  # Give it 20 full minutes for deep debugging
     elif [ $ITERATION -gt 1 ]; then
         BUILD_MSG="Continue building the project. Review what was done in the previous iteration, fix any issues, and complete remaining tasks from .clinerules. This is iteration ${ITERATION} of ${MAX_ITERATIONS}. Remember: keep momentum and don't get stuck on one bug."
     fi
@@ -191,7 +191,7 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     set +e
     cline task -v -y \
         -m "$CLINE_MODEL" \
-        --timeout 400 \
+        --timeout 600 \
         "$VERIFY_MSG" \
         2>&1 | tee "/workspace/.verify_log_iter_${ITERATION}.txt"
     set -e
@@ -207,7 +207,7 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     set +e
     cline task -v -y \
         -m "$CLINE_MODEL" \
-        --timeout 400 \
+        --timeout 600 \
         "$SAFETY_MSG" \
         2>&1 | tee "/workspace/.safety_log_iter_${ITERATION}.txt"
     set -e
