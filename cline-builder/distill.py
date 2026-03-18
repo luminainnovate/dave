@@ -20,9 +20,10 @@ import threading
 # --- Configuration ---
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://host.docker.internal:11434")
 CONFIG_PATH = os.environ.get("AGENT_CONFIG_PATH", "/app/agent_config.json")
-CONVERSATION_PATH = os.environ.get("CONVERSATION_FILE", "/workspace/.build_conversation.json")
+CONVERSATION_PATH = os.environ.get("CONVERSATION_FILE", "/workspace/.cline_context/conversation.json")
 OUTPUT_PATH = os.environ.get("CLINERULES_PATH", "/workspace/.clinerules")
-STATUS_PATH = os.environ.get("DISTILL_STATUS_PATH", "/workspace/.distill_status")
+STATUS_PATH = os.environ.get("DISTILL_STATUS_PATH", "/workspace/.cline_context/distill_status")
+PROJECT_NAME = os.environ.get("PROJECT_NAME", "unnamed_project")
 CONTEXT_WINDOW = int(os.environ.get("EXPERT_CTX", "16384"))
 
 # Rough approximation: 1 token ≈ 4 characters
@@ -274,10 +275,76 @@ def run_distillation():
     config = load_config()
     models = config.get("models", {})
     prompts = config.get("prompts", {})
-
     messages = load_conversation()
-    conversation_text = conversation_to_text(messages)
-    print(f"\n📄 Conversation: {len(messages)} messages, {len(conversation_text)} chars", flush=True)
+
+    def read_workspace_file(rel_path: str) -> str:
+        """Helper to read a file from the workspace if it exists."""
+        full_path = os.path.join("/workspace", rel_path)
+        if os.path.exists(full_path):
+            try:
+                with open(full_path, "r", encoding="utf-8") as f:
+                    return f.read().strip()
+            except Exception:
+                pass
+        return ""
+    
+    is_rebuild = os.path.exists(OUTPUT_PATH)
+    if is_rebuild:
+        print(f"\n🔄 Rebuild detected for {PROJECT_NAME}: Using structured context and latest instruction.", flush=True)
+        import subprocess
+        try:
+            tree_output = subprocess.check_output(
+                ["tree", "/workspace", "-I", "node_modules|.git|venv|.venv|.cline_context|.cline_logs|__pycache__"], 
+                text=True, stderr=subprocess.DEVNULL
+            )
+        except Exception:
+            tree_output = "(Could not generate directory tree)"
+            
+        latest_instruction = ""
+        for msg in reversed(messages):
+            if msg.get("role") == "user" and "!build" in msg.get("content", "").lower():
+                latest_instruction = msg.get("content", "")
+                break
+                
+        if not latest_instruction and messages:
+            latest_instruction = messages[-1].get("content", "")
+
+        readme_content = read_workspace_file("README.md")
+        issues_content = read_workspace_file(".cline_context/.build_issues.md")
+            
+        conversation_text = (
+            f"<SITUATIONAL_AWARENESS>\n"
+            f"  <MODE>ITERATIVE_REBUILD</MODE>\n"
+            f"  <STATUS>The application is ALREADY PARTIALLY IMPLEMENTED. You are NOT starting from scratch.</STATUS>\n"
+            f"  <DIRECTIVES>\n"
+            f"    1. [P0] ANALYZE: Carefully examine the 'DIRECTORY_STRUCTURE' and 'PROJECT_OVERVIEW' blocks below before planning any code changes.\n"
+            f"    2. [P0] NON-REDUNDANT_PLANNING: DO NOT plan for or recreate files that already exist in the structure unless the 'NEW_REQUEST' explicitly requires a logic change in them.\n"
+            f"    3. [P1] SCOPE_FOCUS: Focus exclusively on fulfilling the 'NEW_REQUEST' and resolving the 'KNOWN_BUILD_ISSUES'.\n"
+            f"  </DIRECTIVES>\n"
+            f"</SITUATIONAL_AWARENESS>\n\n"
+            f"<PROJECT_DATA>\n"
+            f"  <NAME>{PROJECT_NAME}</NAME>\n"
+        )
+        
+        if readme_content:
+            conversation_text += f"  <PROJECT_OVERVIEW>\n```markdown\n{readme_content}\n```\n  </PROJECT_OVERVIEW>\n\n"
+            
+        if issues_content:
+            conversation_text += f"  <KNOWN_BUILD_ISSUES>\n```markdown\n{issues_content}\n```\n  </KNOWN_BUILD_ISSUES>\n\n"
+
+        conversation_text += (
+            f"  <DIRECTORY_STRUCTURE>\n```\n{tree_output}\n```\n  </DIRECTORY_STRUCTURE>\n\n"
+            f"  <NEW_REQUEST>\n{latest_instruction}\n  </NEW_REQUEST>\n"
+            f"</PROJECT_DATA>"
+        )
+    else:
+        print(f"\n✨ Fresh build detected for {PROJECT_NAME}.", flush=True)
+        conversation_text = (
+            f"### PROJECT: {PROJECT_NAME}\n\n"
+            f"{conversation_to_text(messages)}"
+        )
+        
+    print(f"📄 Context size: {len(conversation_text)} chars", flush=True)
 
     passes = [
         ("architect",     "🏗️  Pass 1/4: System Architect"),
@@ -320,8 +387,10 @@ def run_distillation():
             previous_model = model
             print(f"  ✓ Complete ({len(result)} chars)")
 
-            intermediate_path = f"/workspace/.distill_{pass_key}.md"
+            intermediate_path = f"/workspace/.cline_context/distill_{pass_key}.md"
             try:
+                # Ensure context directory exists inside workspace in case running raw
+                os.makedirs(os.path.dirname(intermediate_path), exist_ok=True)
                 with open(intermediate_path, "w", encoding="utf-8") as f:
                     f.write(f"# Distillation Intermediate: {pass_key.title()}\n\n{result}")
                 print(f"  ↳ Saved intermediate result to {intermediate_path}")
@@ -381,7 +450,7 @@ def assemble_clinerules(results: dict, config: dict) -> str:
         "- Finishing the checklist is more important than passing every test.",
         "- Verify each major component after implementation.",
         "- Run all safety checks before declaring the build complete.",
-        "- CRITICAL CONTEXT RULE: NEVER search, read, or modify `node_modules`, `.git`, or `.venv`.",
+        "- CRITICAL CONTEXT RULE: NEVER search, read, or modify `node_modules/`, `.git/`, `__pycache__/` or `.venv/`.",
         "- PORT MANAGEMENT: If a port like 8080 is in use, dynamically try alternatives (3000, 3001, 8081).",
         "- DAEMON EXECUTION (CRITICAL): NEVER run `python3 -m http.server`, `npm start`, or ANY server command directly. It will hang the terminal and break the pipeline. You MUST use background processes: `python3 -m http.server 8000 &` or `nohup npm start &`.",
         "</operational_constraints>",

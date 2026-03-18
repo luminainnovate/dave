@@ -21,7 +21,7 @@ set -euo pipefail
 export CLINE_DIR="/root/.config/Cline"
 
 CONFIG_PATH="${AGENT_CONFIG_PATH:-/app/agent_config.json}"
-CONVERSATION_FILE="${CONVERSATION_FILE:-/workspace/.build_conversation.json}"
+CONVERSATION_FILE="${CONVERSATION_FILE:-/workspace/.cline_context/conversation.json}"
 CLINERULES_PATH="${CLINERULES_PATH:-/workspace/.clinerules}"
 OLLAMA_HOST="${OLLAMA_HOST:-http://host.docker.internal:11434}"
 CLINE_CTX="${CLINE_CTX:-32768}"
@@ -34,8 +34,55 @@ echo "  Conversation: ${CONVERSATION_FILE}"
 echo "  Ollama:       ${OLLAMA_HOST}"
 echo "  Distill CTX:  ${EXPERT_CTX}"
 echo "  Cline CTX:    ${CLINE_CTX}"
+echo "  Project:      ${PROJECT_NAME:-<unnamed>}"
 echo "  Timestamp:    $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "========================================"
+
+# Setup Directories
+mkdir -p /workspace/.cline_context
+mkdir -p /workspace/.cline_logs
+
+# Migrate legacy structures from older pipelines (backwards compatibility)
+mv /workspace/.build_log_iter_*.txt /workspace/.cline_logs/ 2>/dev/null || true
+mv /workspace/.verify_log_iter_*.txt /workspace/.cline_logs/ 2>/dev/null || true
+mv /workspace/.safety_log_iter_*.txt /workspace/.cline_logs/ 2>/dev/null || true
+mv /workspace/.distill_*.md /workspace/.cline_context/ 2>/dev/null || true
+if [ -f "/workspace/.build_conversation.json" ]; then
+    # Move the old conversation out of the root, but don't overwrite the new one 
+    mv -n /workspace/.build_conversation.json /workspace/.cline_context/legacy_conversation.json 2>/dev/null || true
+fi
+if [ -f "/workspace/.build_issues.md" ] && [ ! -f "/workspace/.cline_context/.build_issues.md" ]; then
+    mv /workspace/.build_issues.md /workspace/.cline_context/ 2>/dev/null || true
+fi
+
+# Clear previous run artifacts to ensure no confusion
+echo "🧹 Cleaning previous run logs and distillation files..."
+rm -f /workspace/.cline_logs/*.txt
+rm -f /workspace/.cline_context/distill_*.md
+rm -f /workspace/.build_complete
+
+# --- Noise Suppression Bootstrap ---
+# Ensure node_modules and metadata are physically ignored by the agent's tools
+echo "🚩 Bootstrapping noise suppression (.gitignore)..."
+{
+    echo "node_modules/"
+    echo ".git/"
+    echo ".venv/"
+    echo "venv/"
+    echo ".cline_logs/"
+    echo ".cline_context/"
+    echo "__pycache__/"
+    echo ".pytest_cache/"
+    echo "*.log"
+} >> /workspace/.gitignore_builder
+
+# Sort and unique the gitignore if it exists, otherwise use our builder version
+if [ -f "/workspace/.gitignore" ]; then
+    sort -u /workspace/.gitignore /workspace/.gitignore_builder -o /workspace/.gitignore
+else
+    cp /workspace/.gitignore_builder /workspace/.gitignore
+fi
+rm /workspace/.gitignore_builder
 
 # --- Prerequisite Checks ---
 
@@ -110,6 +157,9 @@ fi
 echo ""
 echo "  ✓ .clinerules generated ($(wc -c < "$CLINERULES_PATH") bytes)"
 
+# Reset completion state in case this is a rebuild
+rm -f /workspace/.build_complete
+
 # =============================================================================
 # PHASE 2: Iterative Cline Build Cycle
 # =============================================================================
@@ -165,7 +215,7 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
         -m "$CLINE_MODEL" \
         --timeout "$CURRENT_TIMEOUT" \
         "$BUILD_MSG" \
-        2>&1 | tee "/workspace/.build_log_iter_${ITERATION}.txt"
+        2>&1 | tee "/workspace/.cline_logs/build_log_iter_${ITERATION}.txt"
     CLINE_EXIT=$?
     set -e
 
@@ -180,34 +230,34 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     # --- Verification Phase ---
     echo "  🔍 Running Cline (Verification mode)..."
 
-    VERIFY_MSG="Review the project in /workspace. 
+    VERIFY_MSG="Review the current project. 
     1) Verify all tasks from .clinerules are implemented and the code runs without errors. 
     2) MUST DO: Create a 'README.md' file that clearly explains what the project is and EXACTLY how to run it. 
-    3) Check if '/workspace/.build_issues.md' already exists. If it does, READ it. Cross off or remove the issues that were fixed in this iteration, and keep the ones that still need work. Do not hallucinate uncompleted tasks. 
-    4) If the app is 100% working, safe, and has a README, create a file at '/workspace/.build_complete' containing 'VERIFIED'. If issues remain, ensure they are accurately documented in '.build_issues.md'.
-    5) Before testing, always run 'pkill -f python' or 'pkill -f node' to clean up old background servers."
+    3) Check if '.cline_context/.build_issues.md' already exists. If it does, READ it. Cross off or remove the issues that were fixed in this iteration, and keep the ones that still need work. Do not hallucinate uncompleted tasks. 
+    4) If the app is 100% working, safe, and has a README, create a file named '.build_complete' in the root directory containing 'VERIFIED'. If issues remain, ensure they are accurately documented in '.cline_context/.build_issues.md'.
+    5) Before testing, clean up old servers using highly specific targets (e.g., 'pkill -f "http.server"')."
     set +e
     cline task -v -y \
         -m "$CLINE_MODEL" \
         --timeout 600 \
         "$VERIFY_MSG" \
-        2>&1 | tee "/workspace/.verify_log_iter_${ITERATION}.txt"
+        2>&1 | tee "/workspace/.cline_logs/verify_log_iter_${ITERATION}.txt"
     set -e
 
     # --- Safety Phase ---
     echo "  🛡️ Running Cline (Safety audit)..."
 
-    SAFETY_MSG="Perform a security and safety audit of all code in /workspace. Check for: 1) Input validation, 2) Path traversal, 3) Hardcoded secrets, 4) Injection risks, 5) Infinite loops/resource leaks, 6) Missing error handling. 
+    SAFETY_MSG="Perform a security and safety audit of all code in the current project. Check for: 1) Input validation, 2) Path traversal, 3) Hardcoded secrets, 4) Injection risks, 5) Infinite loops/resource leaks, 6) Missing error handling. 
     If you find critical issues, attempt to FIX THEM DIRECTLY in the code. 
-    If you fix them or the code is already safe, append 'SAFE' to /workspace/.build_complete. 
-    If you cannot fix them, add them to /workspace/.build_issues.md.
-    Before testing, always run 'pkill -f python' or 'pkill -f node' to clean up old background servers."
+    If you fix them or the code is already safe, append 'SAFE' to the '.build_complete' file. 
+    If you cannot fix them, add them to '.cline_context/.build_issues.md'.
+    Before testing, clean up old servers using highly specific targets (e.g., 'pkill -f "http.server"')."
     set +e
     cline task -v -y \
         -m "$CLINE_MODEL" \
         --timeout 600 \
         "$SAFETY_MSG" \
-        2>&1 | tee "/workspace/.safety_log_iter_${ITERATION}.txt"
+        2>&1 | tee "/workspace/.cline_logs/safety_log_iter_${ITERATION}.txt"
     set -e
 
     # --- Check completion ---
@@ -237,7 +287,7 @@ if [ "$BUILD_COMPLETE" = true ]; then
 else
     echo "⚠️  BUILD PIPELINE ENDED (max iterations reached)"
     echo "   Iterations used: ${ITERATION}/${MAX_ITERATIONS}"
-    echo "   Check .build_issues.md for remaining work"
+    echo "   Check .cline_context/.build_issues.md for remaining work"
 fi
 
 # Final size report

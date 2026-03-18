@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     jq \
     procps \
     git \
+    tree \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies (use --break-system-packages for Debian 12+)

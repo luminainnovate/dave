@@ -657,7 +657,11 @@ def _trigger_build_pipeline(messages: list) -> str:
         
         target_dir = match.group(1)
         abs_target_dir = os.path.abspath(target_dir)
-        conv_file_path = os.path.join(abs_target_dir, ".build_conversation.json")
+        
+        # Create context directory
+        context_dir = os.path.join(abs_target_dir, ".cline_context")
+        os.makedirs(context_dir, exist_ok=True)
+        conv_file_path = os.path.join(context_dir, "conversation.json")
 
         # 2. Save conversation for the container
         with open(conv_file_path, "w", encoding="utf-8") as f:
@@ -666,11 +670,13 @@ def _trigger_build_pipeline(messages: list) -> str:
         # 3. Launch Docker Container (Non-blocking)
         # We mount the SPECIFIC conversation folder as /workspace
         container_name = f"cline-builder-{int(time.time())}"
+        project_name = os.path.basename(abs_target_dir)
         cmd = [
             "docker", "compose", "--profile", "build", "run", "-d",
             "--name", container_name,
             "-v", f"{abs_target_dir}:/workspace",
-            "-e", "CONVERSATION_FILE=/workspace/.build_conversation.json",
+            "-e", "CONVERSATION_FILE=/workspace/.cline_context/conversation.json",
+            "-e", f"PROJECT_NAME={project_name}",
             "-e", f"EXPERT_CTX={DISTILL_CTX}",
             "-e", f"CLINE_CTX={CLINE_CTX}",
             "cline-builder"

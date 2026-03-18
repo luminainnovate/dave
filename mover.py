@@ -260,6 +260,19 @@ def handle_move(messages: list) -> str:
         target_dir = os.path.join("conversations", f"{prefix}_{conv_id}")
         os.makedirs(target_dir, exist_ok=True)
         
+        # --- Safety Check for Autonomous Projects ---
+        if os.path.exists(os.path.join(target_dir, ".clinerules")):
+            logger.info(f"Skipping snippet move for {target_dir} (.clinerules exists)")
+            try:
+                subprocess.run(["code", "."], cwd=target_dir, check=True, capture_output=True)
+                vscode_msg = "Opened folder in VS Code."
+            except Exception as e:
+                logger.error(f"Failed to open VS Code: {e}")
+                vscode_msg = f"Failed to open VS Code automatically (Error: {e})."
+                
+            return f"Project is already managed by the AI Builder pipeline (pointing to `{target_dir}`). Snippets were NOT overwritten to protect autonomous progress.\n\n{vscode_msg}"
+        # ------------------------------------------
+        
         saved_count = 0
         skipped_count = 0
         
