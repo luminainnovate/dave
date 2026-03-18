@@ -371,15 +371,24 @@ def assemble_clinerules(results: dict, config: dict) -> str:
         doc.append("")
 
     doc.extend([
-        "## Constraints",
-        "",
+        "<operational_constraints>",
         f"- Max project size: {limits.get('max_project_size_mb', 4096)} MB",
         f"- Max build iterations: {limits.get('max_build_iterations', 5)}",
         "- ANTI-LOOP RULE: Never attempt the same bug fix more than twice.",
-        "- If a test fails repeatedly, comment it out, add a TODO, and proceed to the next file.",
-        "- Do not get stuck. Finishing the checklist is more important than passing every test.",
-        "- You must verify each major component after implementation",
-        "- Run all safety checks before declaring the build complete",
+        "- FOCUS REMINDER: Keep the main goal in mind. Do not get distracted by hypothetical features.",
+        "- TASK COMPLETION: Relentlessly work through your checklist. Mark impossible tasks as blocked and move on.",
+        "- If a test fails repeatedly, comment it out, add a TODO.",
+        "- Finishing the checklist is more important than passing every test.",
+        "- Verify each major component after implementation.",
+        "- Run all safety checks before declaring the build complete.",
+        "- CRITICAL CONTEXT RULE: NEVER search, read, or modify `node_modules`, `.git`, or `.venv`.",
+        "- PORT MANAGEMENT: If a port like 8080 is in use, dynamically try alternatives (3000, 3001, 8081).",
+        "- DAEMON EXECUTION: NEVER run blocking server commands (like `python3 -m http.server`) synchronously in the terminal. Always run them in the background so you don't hang.",
+        "</operational_constraints>",
+        "",
+        "<reasoning_protocol>",
+        "- You MUST use a <thinking>...</thinking> block to analyze your plan before making any file changes or running terminal commands.",
+        "</reasoning_protocol>",
         "",
     ])
 
