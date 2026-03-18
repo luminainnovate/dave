@@ -32,10 +32,14 @@ def parse_tree_structure(text: str) -> List[str]:
     lines = text.splitlines()
     paths = []
     stack = []
-    
-    # Identify tree lines: lines containing one of the branch symbols
     branch_symbols = ["├──", "└──", "├─", "└─", "|──", "|---"]
     
+    # 1. Clean markdown blockquotes/reasoning artifacts
+    cleaned_lines = []
+    for line in lines:
+        cleaned_lines.append(re.sub(r'^>\s*', '', line))
+    lines = cleaned_lines
+
     # Find the index of the first branch line
     first_branch_idx = -1
     for i, line in enumerate(lines):
@@ -43,15 +47,16 @@ def parse_tree_structure(text: str) -> List[str]:
             first_branch_idx = i
             break
             
-    # Heuristic: the line preceding the first branch is often the root folder
     if first_branch_idx > 0:
         potential_root = lines[first_branch_idx - 1].strip()
-        # Clean potential root name
         potential_root = potential_root.split('#')[0].strip().strip('/')
         if potential_root and not any(sym in potential_root for sym in branch_symbols + ["│", "|"]):
             stack = [potential_root]
             paths.append(potential_root)
 
+    # Used to calibrate 0-depth indentation dynamically
+    base_idx = -1 
+    
     for i, line in enumerate(lines):
         if not line.strip():
             continue
@@ -66,9 +71,22 @@ def parse_tree_structure(text: str) -> List[str]:
                     found_symbol = sym
         
         if found_symbol:
-            # If we don't have a root yet, this branch is at depth 0
-            # Otherwise, symbol_idx 0 is depth 1 relative to the root
-            depth = (symbol_idx // 4) + 1 if stack else symbol_idx // 4
+            # 2. Establish the base index to handle arbitrary block indentations
+            if base_idx == -1:
+                base_idx = symbol_idx
+                
+            relative_idx = symbol_idx - base_idx
+            
+            # Failsafe: if a second tree has less indent, recalibrate
+            if relative_idx < 0:
+                base_idx = symbol_idx
+                relative_idx = 0
+                
+            depth = (relative_idx // 4) + 1 if stack else relative_idx // 4
+            
+            # Prevent runaway stack appending
+            depth = min(depth, len(stack))
+            
             name = line[symbol_idx + len(found_symbol):].strip()
             name = name.split('#')[0].strip().strip('/')
             
@@ -78,7 +96,9 @@ def parse_tree_structure(text: str) -> List[str]:
                 full_path = "/".join(stack)
                 paths.append(full_path)
         else:
-            # Check for root folder line explicitly (if not already handled by lookback)
+            # Reset base_idx so the next tree in the chat calibrates properly
+            base_idx = -1 
+            
             if i < first_branch_idx or first_branch_idx == -1:
                 stripped = line.strip()
                 if "/" in stripped and not any(c in stripped for c in ["├", "─", "└", "│", "|"]):
@@ -209,6 +229,14 @@ def extract_snippets(messages: list) -> tuple[Dict[str, str], Optional[str]]:
                             
                 if best_match:
                     path = best_match
+                    # Strip the suggested root to avoid double-folders in the target dir
+                    if suggested_root and (path == suggested_root or path.startswith(suggested_root + "/")):
+                        if path == suggested_root:
+                            # If the snippet is the root itself (unlikely for a code block), 
+                            # we might not want to save it or save it as a generic file.
+                            pass 
+                        else:
+                            path = path[len(suggested_root)+1:]
 
             # E. Fallback
             if not path:
@@ -258,7 +286,6 @@ def handle_move(messages: list) -> str:
                         break
         
         target_dir = os.path.join("conversations", f"{prefix}_{conv_id}")
-        os.makedirs(target_dir, exist_ok=True)
         
         # --- Safety Check for Autonomous Projects ---
         if os.path.exists(os.path.join(target_dir, ".clinerules")):

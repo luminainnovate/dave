@@ -653,7 +653,10 @@ def _trigger_build_pipeline(messages: list) -> str:
         # Extract target_dir from the mover's response
         match = re.search(r"to `([^`]+)`", status_msg)
         if not match:
-            return "❌ **Critical Error:** Failed to determine workspace path."
+            # Check if mover returned an explicit error
+            if "Error" in status_msg:
+                return f"❌ **Build Aborted.** {status_msg}"
+            return f"❌ **Critical Error:** Failed to determine workspace path. {status_msg}"
         
         target_dir = match.group(1)
         abs_target_dir = os.path.abspath(target_dir)
