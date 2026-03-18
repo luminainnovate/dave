@@ -338,10 +338,41 @@ def run_distillation():
             f"</PROJECT_DATA>"
         )
     else:
-        print(f"\n✨ Fresh build detected for {PROJECT_NAME}.", flush=True)
+        print(f"\n✨ Fresh build detected for {PROJECT_NAME}. Assembling historical context...", flush=True)
+        
+        # Assemble the historical conversation
+        history = []
+        final_command = ""
+        
+        # We assume the last message containing !build is the 'trigger'
+        for i in range(len(messages) - 1, -1, -1):
+            msg = messages[i]
+            if "!build" in msg.get("content", "").lower():
+                final_command = msg.get("content", "")
+                history = messages[:i] # Everything before the trigger
+                break
+        
+        if not final_command and messages:
+            final_command = messages[-1].get("content", "")
+            history = messages[:-1]
+
         conversation_text = (
-            f"### PROJECT: {PROJECT_NAME}\n\n"
-            f"{conversation_to_text(messages)}"
+            f"<SITUATIONAL_AWARENESS>\n"
+            f"  <MODE>FRESH_BUILD</MODE>\n"
+            f"  <STATUS>This is a NEW PROJECT START. Establish the foundational structure and implementation plan.</STATUS>\n"
+            f"  <DIRECTIVES>\n"
+            f"    1. [P0] FOUNDATION: Read the 'PROJECT_HISTORY' to understand the core vision, tech stack, and requirements.\n"
+            f"    2. [P0] EXECUTION: Treat the 'FINAL_BUILD_COMMAND' as your immediate tactical mission.\n"
+            f"    3. [P1] ALIGNMENT: Ensure your output fulfills both the historical vision and the final instruction based strictly on your assigned system role.\n"
+            f"  </DIRECTIVES>\n"
+            f"</SITUATIONAL_AWARENESS>\n\n"
+            f"<PROJECT_DATA>\n"
+            f"  <NAME>{PROJECT_NAME}</NAME>\n"
+            f"  <PROJECT_HISTORY>\n"
+            f"{conversation_to_text(history)}\n"
+            f"  </PROJECT_HISTORY>\n\n"
+            f"  <FINAL_BUILD_COMMAND>\n{final_command}\n  </FINAL_BUILD_COMMAND>\n"
+            f"</PROJECT_DATA>"
         )
         
     print(f"📄 Context size: {len(conversation_text)} chars", flush=True)

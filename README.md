@@ -9,9 +9,14 @@ Bob the Builder, Bob Ross or even Uncle Bob, any way works. If you truly want to
 ## 🚀 Key Features
 
 -   **Autonomous Build Pipeline (`!build`):** Trigger a multi-agent distillation and implementation process for any project extracted from the conversation.
+    - **Steering:** You can add comments to the same prompt where !build exists, it will steer the autonomous build process. E.g. "Lets !build, we must add authentication and a login page."
     -   **Context Distillation:** Automatically compresses long conversations into actionable `.clinerules` through a 4-pass expert review (Architect, Engineer, Test, Safety).
+    -   **Iterative Rebuilding:** Run `!build` on existing projects. The system uses **Situational Awareness** (reading your directory tree and README) to build on top of current progress instead of starting from scratch. You can continue to build on top of existing projects by running `!build` again in the same conversation. 
+    -   **Noise Suppression:** Automatically bootstraps a `.gitignore` to prevent agents from being distracted by `node_modules`, `.git`, or virtual environments.
 -   **Project Extraction (`!move`):** Automatically reconstructs entire project structures from chat conversations. It parses folder trees and code snippets, reconstructs them in a dedicated `conversations/` directory, and opens the result in VS Code.
+    -   **Manual Tuning Safety:** If a project has already been initialized before by the build pipeline (`.clinerules` exists), `!move` will **skip** snippet extraction to protect your manual code changes/tuning from being reverted.
     -   **Smart Conflict Management:** The extraction system only updates files that have actually changed, keeping the structure up to date.
+    -   **Clean Metadata:** Organizes logs into `.cline_logs/` and technical context into `.cline_context/`, keeping your project root clutter-free.
     -   **Safe Path Sanitization:** Built-in safeguards prevent directory traversal (clears `..`) and automatically filters out shell/command blocks from project files.
 -   **Tiered Orchestration:** Uses a resident "Fast Orchestrator" (`qwen2.5:1.5b`) for instant intent detection and simple queries.
 -   **Expert Reasoning:** Dynamically loads expert models (e.g. `qwen3.5:27b`) for complex coding and logic tasks.
