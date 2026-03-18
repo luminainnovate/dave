@@ -149,14 +149,13 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
 # --- Build Phase ---
     echo "  🔧 Running Cline (Build mode)..."
 
-    # [NEW] Dynamic Timeout and Messaging
     CURRENT_TIMEOUT=600 # 10 minutes
     BUILD_MSG="$CLINE_STARTUP"
 
     if [ $ITERATION -eq $MAX_ITERATIONS ]; then
         echo "  🚨 FINAL ROUND: Shifting to Stabilization and Debugging..."
         BUILD_MSG="CRITICAL: This is the FINAL iteration (${ITERATION} of ${MAX_ITERATIONS}). Your directive is now STABILIZATION. You must ignore the previous 'move on' anti-loop rules. Revisit any TODOs, uncommented code, or failing tests. Your sole priority is to ensure the application compiles, runs correctly end-to-end, and is completely usable. Take your time and fix the root causes of any remaining bugs."
-        CURRENT_TIMEOUT=1200  # Give it 20 full minutes for deep debugging
+        CURRENT_TIMEOUT=1200  # Give it 20 minutes for deep debugging
     elif [ $ITERATION -gt 1 ]; then
         BUILD_MSG="Continue building the project. Review what was done in the previous iteration, fix any issues, and complete remaining tasks from .clinerules. This is iteration ${ITERATION} of ${MAX_ITERATIONS}. Remember: keep momentum and don't get stuck on one bug."
     fi
@@ -181,13 +180,12 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     # --- Verification Phase ---
     echo "  🔍 Running Cline (Verification mode)..."
 
-    # [NEW] Instructions to maintain the issue list and write a README
     VERIFY_MSG="Review the project in /workspace. 
     1) Verify all tasks from .clinerules are implemented and the code runs without errors. 
     2) MUST DO: Create a 'README.md' file that clearly explains what the project is and EXACTLY how to run it. 
     3) Check if '/workspace/.build_issues.md' already exists. If it does, READ it. Cross off or remove the issues that were fixed in this iteration, and keep the ones that still need work. Do not hallucinate uncompleted tasks. 
-    4) If the app is 100% working, safe, and has a README, create a file at '/workspace/.build_complete' containing 'VERIFIED'. If issues remain, ensure they are accurately documented in '.build_issues.md'."
-
+    4) If the app is 100% working, safe, and has a README, create a file at '/workspace/.build_complete' containing 'VERIFIED'. If issues remain, ensure they are accurately documented in '.build_issues.md'.
+    5) Before testing, always run 'pkill -f python' or 'pkill -f node' to clean up old background servers."
     set +e
     cline task -v -y \
         -m "$CLINE_MODEL" \
@@ -202,8 +200,8 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     SAFETY_MSG="Perform a security and safety audit of all code in /workspace. Check for: 1) Input validation, 2) Path traversal, 3) Hardcoded secrets, 4) Injection risks, 5) Infinite loops/resource leaks, 6) Missing error handling. 
     If you find critical issues, attempt to FIX THEM DIRECTLY in the code. 
     If you fix them or the code is already safe, append 'SAFE' to /workspace/.build_complete. 
-    If you cannot fix them, add them to /workspace/.build_issues.md."
-
+    If you cannot fix them, add them to /workspace/.build_issues.md.
+    Before testing, always run 'pkill -f python' or 'pkill -f node' to clean up old background servers."
     set +e
     cline task -v -y \
         -m "$CLINE_MODEL" \

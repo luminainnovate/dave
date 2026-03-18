@@ -9,6 +9,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-venv \
     curl \
     jq \
+    procps \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies (use --break-system-packages for Debian 12+)
