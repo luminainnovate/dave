@@ -482,13 +482,10 @@ def assemble_clinerules(results: dict, config: dict) -> str:
         "- Verify each major component after implementation.",
         "- Run all safety checks before declaring the build complete.",
         "- CRITICAL CONTEXT RULE: NEVER search, read, or modify `node_modules/`, `.git/`, `__pycache__/` or `.venv/`.",
-        "- PORT MANAGEMENT: If a port like 8080 is in use, dynamically try alternatives (3000, 3001, 8081).",
+        "- PORT MANAGEMENT: If a port is in use, YOU MUST ONLY use `npx kill-port <port>` to free it. NEVER use pkill or kill commands.",
         "- DAEMON EXECUTION (CRITICAL): NEVER run `python3 -m http.server`, `npm start`, or ANY server command directly. It will hang the terminal and break the pipeline. You MUST use background processes: `python3 -m http.server 8000 &` or `nohup npm start &`.",
+        "- REASONING: Before executing any terminal command or modifying files, you must write out a brief step-by-step logical analysis of your plan.",
         "</operational_constraints>",
-        "",
-        "<reasoning_protocol>",
-        "- You MUST use a <thinking>...</thinking> block to analyze your plan before making any file changes or running terminal commands.",
-        "</reasoning_protocol>",
         "",
     ])
 

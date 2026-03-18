@@ -235,7 +235,7 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     2) MUST DO: Create a 'README.md' file that clearly explains what the project is and EXACTLY how to run it. 
     3) Check if '.cline_context/.build_issues.md' already exists. If it does, READ it. Cross off or remove the issues that were fixed in this iteration, and keep the ones that still need work. Do not hallucinate uncompleted tasks. 
     4) If the app is 100% working, safe, and has a README, create a file named '.build_complete' in the root directory containing 'VERIFIED'. If issues remain, ensure they are accurately documented in '.cline_context/.build_issues.md'.
-    5) Before testing, clean up old servers using highly specific targets (e.g., 'pkill -f "http.server"')."
+    5) Before testing, if a port is in use, YOU MUST ONLY use 'npx kill-port <portnumber>' to free it. DO NOT use pkill, killall, or kill commands under any circumstances."
     set +e
     cline task -v -y \
         -m "$CLINE_MODEL" \
@@ -251,7 +251,7 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     If you find critical issues, attempt to FIX THEM DIRECTLY in the code. 
     If you fix them or the code is already safe, append 'SAFE' to the '.build_complete' file. 
     If you cannot fix them, add them to '.cline_context/.build_issues.md'.
-    Before testing, clean up old servers using highly specific targets (e.g., 'pkill -f "http.server"')."
+    Before testing, if a port is in use, YOU MUST ONLY use 'npx kill-port <portnumber>' to free it. DO NOT use pkill, killall, or kill commands under any circumstances."
     set +e
     cline task -v -y \
         -m "$CLINE_MODEL" \
