@@ -19,24 +19,13 @@ logger = logging.getLogger("Bob-Orchestrator")
 
 # --- STRICT MODEL CONFIG ---
 EXPERT_MODEL = "glm-fast:latest"  # Switch this to any model
-ROUTER_MODEL = "qwen2.5:1.5b"
-DEFAULT_EXPERT_MODEL = "qwen3.5:27b" # Keep this as default, if you know what youre doing, you can change it with the expert params
+ROUTER_MODEL = "qwen2.5:1.5b"     # Switch this if you want to change your default router model (This is the model that decides which model to use)
+DEFAULT_EXPERT_MODEL = "qwen3.5:27b" # Keep this as default, if you know what youre doing, you can change it with the PARAMS_GENERAL/PARAMS_CODING
 OLLAMA_URL = "http://localhost:11434"
 COMFYUI_URL = "http://localhost:8188"
-EXPERT_CTX = 16384
+EXPERT_CTX = 16384   # Context for the expert model
 DISTILL_CTX = 16384  # Context for the distillation engine (Thinking)
 CLINE_CTX = 32768    # Context for the Cline agent (Building)
-
-# --- BUILDER PIPELINE CONFIG ---
-BUILDER_CONFIG = {
-    "architect_model": EXPERT_MODEL,
-    "engineer_model": EXPERT_MODEL,
-    "safety_model": EXPERT_MODEL,
-    "cline_model": EXPERT_MODEL,
-    "max_project_size_mb": 2048,
-    "max_build_iterations": 5,
-    "cline_max_turns": 50,
-}
 
 # --- STATE MANAGEMENT ---
 gpu_lock = asyncio.Lock()
