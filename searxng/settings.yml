@@ -1,0 +1,9 @@
+use_default_settings: True
+server:
+  port: 8080
+  bind_address: "0.0.0.0"
+  secret_key: "setyourkeyhere"
+search:
+  formats:
+    - json
+

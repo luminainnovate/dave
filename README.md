@@ -34,17 +34,126 @@ The system operates on an intelligent **GPU Mutex** principle managed by the **O
 4.  **Idle Sweeping:** A background loop sweeps ComfyUI RAM/VRAM every 5 minutes when no generation or chat is active.
 5.  **Thinking Modes:** Sampling parameters (temperature, penalties) are dynamically applied based on task type.
 
+---
+
+## 🏭 Automated Software Factory
+
+Bob isn't just a chatbot; he's a fully autonomous software factory. By combining tiered orchestration with a dedicated build pipeline, you can turn ideas into full projects without manual intervention.
+
+### 🔄 The Autonomous Loop (Distillation & Implementation)
+
+1.  **Project Extraction (`!move`):** Bob scans your current conversation, identifies the project structure, and reconstructs the entire file tree in a dedicated workspace within `conversations/`.
+2.  **4-Pass Distillation (`!build`):** Does the same as !move and also triggers the build pipeline. The system runs four expert agents in sequence:
+    -   **Architect:** Defines business goals and directory structures.
+    -   **Engineer:** Maps logic to files and defines design patterns.
+    -   **Test Engineer:** Identifies edge cases and verification gates.
+    -   **Safety Inspector:** Audits for security vulnerabilities.
+3.  **Autonomous Implementation:** A specialized `Cline` agent takes the resulting `.clinerules` and executes the code changes, handling everything from file creation and bug fixing to testing and verification.
+
+### 🚥 Factory Management Commands
+
+-   `!move`: Extract project files from the current chat.
+-   `!build`: Kick off the 4-pass autonomous build pipeline.
+-   `!status`: Check the status of active and recent build containers.
+-   `!stop`: Force-stop all running build pipelines and clear VRAM.
+
+---
+
+## 📂 Project Structure
+
+A high-level overview of the **br.ai.n** workspace and its core components:
+
+```text
+.
+├── orchestrator.py          # 🧠 Central FastAPI Proxy (VRAM Manager & Router)
+├── mover.py                 # 📂 Project Extractor (Parses chat to files)
+├── setup_workspace.sh       # 🚀 Automated Installer (WSL2/Linux)
+├── start_workspace.sh       # 🚥 Launch Script (Starts proxy/ComfyUI/Docker)
+├── docker-compose.yml       # 🐳 Multi-Container Stack (WebUI, Search, Builder)
+├── cline-builder/           # 🔨 Autonomous Build Pipeline (The "Factory")
+│   ├── distill.py           #   - 4-Pass Thinking Engine (Architect -> Engineer -> etc.)
+│   ├── agent_config.json    #   - Factory Configuration (Models, Prompts, Limits)
+│   ├── Dockerfile           #   - Pipeline Environment
+│   └── entrypoint.sh        #   - Autonomous Build Execution Flow
+├── searxng/                 # 🔍 Search Engine Configuration
+├── conversations/           # 🏗️ Workspace Root (Autonomous projects live here)
+├── ARCHITECTURE.md          # 📜 Deep Technical documentation
+├── SETUP.md                 # 🛠️ Manual step-by-step setup guide
+└── README.md                # 📖 Main entry point & Quick Start
+```
+
+### 🧩 Core Component Breakdown
+
+-   **Orchestrator Proxy (`orchestrator.py`):** The heart of the system. It handles VRAM safety, model hot-swapping, and routes requests to either the Fast Router or the Expert Model.
+-   **Project Mover (`mover.py`):** Automatically reconstructs file systems from chat history, sanitizing paths and organizing code into the `conversations/` directory.
+-   **Cline Builder (`cline-builder/`):** A specialized Docker environment that runs the autonomous build pipeline. It uses a 4-pass "thinking" process to generate `.clinerules` before implementing code.
+-   **ComfyUI:** Handles high-performance image generation (Flux.2) with automated memory management.
+-   **Open WebUI & SearXNG:** Provides the unified chat interface and live web search capabilities.
+
+---
+
+## ⚙️ Model & Agent Configuration
+
+You can fully customize Bob's brain by editing the configuration files. This allows you to swap models, tune agent behavior, and set operational limits.
+
+### 🧠 Orchestrator (`orchestrator.py`)
+At the top of `orchestrator.py`, you can define the core models used for triage and expert tasks, also the build pipelines context windows:
+
+```python
+EXPERT_MODEL = "qwen3.5:27b"  # The heavy-lifting reasoning model
+ROUTER_MODEL = "qwen2.5:1.5b" # The resident triage model
+EXPERT_CTX = 16384           # Context window for expert tasks
+DISTILL_CTX = 16384          # Context for the distillation engine (Thinking)
+CLINE_CTX = 32768            # Context for the Cline agent (Building)
+```
+
+### 🏗️ Build Pipeline (`cline-builder/agent_config.json`)
+The autonomous factory is highly configurable. You can specify different models for each agent and tune their system prompts.
+
+#### 1. Model Selection
+Define which model each agent in the pipeline should use:
+```json
+"models": {
+    "architect": "qwen3.5:27b",
+    "engineer": "qwen3.5:27b",
+    "test_engineer": "qwen3.5:27b",
+    "safety": "qwen3.5:27b",
+    "cline": "glm-4.7-flash:latest"
+}
+```
+
+#### 2. System Prompts & Logic
+Tune the behavior of each agent by editing the prompts in the `cline-builder/distill.py`. This allows you to define strict rules, output formats, and operational constraints for the Architect, Engineer, and other expert roles.
+
+#### 3. Rounds & Limits
+Control the depth of the build process and safety guardrails:
+-   **max_build_iterations**: The number of **rounds** (4-pass cycles) the pipeline will attempt to complete the project.
+-   **cline_max_turns**: The maximum number of tool calls the Cline agent can make per round.
+-   **context_window**: Manage the total token capacity for the pipeline.
+
+```json
+"limits": {
+    "max_project_size_mb": 4096,
+    "max_build_iterations": 5,
+    "cline_max_turns": 30
+}
+```
+
+---
+
 ## 🛠️ Requirements
 
--   **OS:** Windows 11 with WSL2 (Ubuntu 22.04+ recommended).
--   **GPU:** NVIDIA GPU with 24GB+ VRAM (RTX 3090/4090/5090) is recommended for the default tiered setup, but smaller cards can be used with adjusted model selection.
--   **Software:** Docker Engine (inside WSL2) and NVIDIA Container Toolkit.
+-   **WSL2:** Windows 11 with Ubuntu 22.04+ (Recommended).
+-   **Native Linux:** Ubuntu 22.04+ or any modern distribution with NVIDIA support.
+-   **GPU:** NVIDIA GPU with 24GB+ VRAM (RTX 3090/4090/5090) is recommended.
+-   **Software:** Docker Engine, NVIDIA Container Toolkit, and NVIDIA Drivers.
 
 > [!TIP]
 > **Scaling for Smaller Hardware:** While optimized for 24GB VRAM, Bob can run on smaller GPUs by substituting the "Expert" model for a smaller variant (e.g., swapping a 27B model for an 8B model). Orchestrator only takes around 1GB of VRAM.
 
 ## 📦 Setup & Installation
 
+### 🖥️ Windows (WSL2)
 The setup is automated. Ensure your NVIDIA drivers are up to date on Windows, then run in WSL2:
 
 1.  **Clone the repository:**
@@ -56,13 +165,36 @@ The setup is automated. Ensure your NVIDIA drivers are up to date on Windows, th
 2.  **Run the Installer:**
     The `setup_workspace.sh` script automatically:
     -   Installs required Python virtual environments.
-    -   Pulls the correct Ollama models (`qwen2.5:1.5b`, `qwen3.5:27b`).
+    -   Pulls the correct Ollama models (`qwen2.5:1.5b`, `qwen3.5:27b`). (make sure to change your desired models in the script)
     -   Deploys the Docker stack (Open WebUI & SearXNG).
     -   Sets up and launches ComfyUI and the Orchestrator proxy.
 
     ```bash
     chmod +x setup_workspace.sh
     ./setup_workspace.sh
+    ```
+
+### 🐧 Native Linux
+Setup on native Linux is straightforward. Skip the WSL-specific configurations and ensure you have the NVIDIA Container Toolkit installed.
+
+1.  **Prerequisites:**
+    -   Install [NVIDIA Drivers](https://www.nvidia.com/Download/index.aspx).
+    -   Install [Docker Engine](https://docs.docker.com/engine/install/ubuntu/).
+    -   Install [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
+    -   Install [Ollama](https://ollama.com/download/linux).
+
+2.  **Clone & Setup:**
+    ```bash
+    git clone https://github.com/mitro54/br.ai.n.git
+    cd br.ai.n
+    chmod +x setup_workspace.sh
+    ./setup_workspace.sh
+    ```
+
+3.  **Network Access:**
+    On Native Linux, ensuring the workspace is accessible on your LAN typically only requires opening port 3000 in `ufw` or `iptables`:
+    ```bash
+    sudo ufw allow 3000/tcp
     ```
 
 *Note: The orchestrator proxy handles VRAM management and model swapping automatically.*
@@ -109,7 +241,7 @@ Swap models without touching the code using environment variables:
 > **Hot-Swapping Experts:** You can change `EXPERT_MODEL` at the top of `orchestrator.py` at any time. If you use a model other than the default (`qwen3.5:27b`), the system will automatically bypass custom sampling parameters (temperature, penalties) and use that model's native default settings.
 
 ---
-## ⌨️ Manual Control Commands
+## ⌨️ Full list of Manual Control Commands
 
 While in chat, use these commands to override the orchestrator:
 - `!lock`: Holds the Expert in VRAM indefinitely.
