@@ -38,7 +38,7 @@ The system operates on an intelligent **GPU Mutex** principle managed by the **O
 
 ## 🏭 Automated Software Factory
 
-Bob isn't just a chatbot; he's a fully autonomous software factory. By combining tiered orchestration with a dedicated build pipeline, you can turn ideas into full projects without manual intervention.
+Bob isn't just a chatbot; Bob is a fully autonomous software factory. By combining tiered orchestration with a dedicated build pipeline, you can turn ideas into full projects without manual intervention.
 
 ### 🔄 The Autonomous Loop (Distillation & Implementation)
 
