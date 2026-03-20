@@ -123,7 +123,7 @@ Define which model each agent in the pipeline should use:
 ```
 
 #### 2. System Prompts & Logic
-Tune the behavior of each agent by editing the prompts in the `cline-builder/distill.py`. This allows you to define strict rules, output formats, and operational constraints for the Architect, Engineer, and other expert roles.
+Tune the behavior of each agent by editing the prompts in the `cline-builder/distill.py`. This allows you to define strict rules, output formats, and operational constraints for the Architect, Engineer, and other expert roles. From `cline-builder/entrypoint.sh` you can configure the Cline's part of the pipeline like the task prompts etc.
 
 #### 3. Rounds & Limits
 Control the depth of the build process and safety guardrails:
