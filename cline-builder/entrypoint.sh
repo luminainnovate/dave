@@ -211,7 +211,7 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     fi
 
     set +e
-    cline task -v -y \
+    cline task -v -y --thinking \
         -m "$CLINE_MODEL" \
         --timeout "$CURRENT_TIMEOUT" \
         "$BUILD_MSG" \
@@ -237,7 +237,7 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     4) If the app is 100% working, safe, and has a README, create a file named '.build_complete' in the root directory containing 'VERIFIED'. If issues remain, ensure they are accurately documented in '.cline_context/.build_issues.md'.
     5) Before testing, if a port is in use, YOU MUST ONLY use 'npx kill-port <portnumber>' to free it. DO NOT use pkill, killall, or kill commands under any circumstances."
     set +e
-    cline task -v -y \
+    cline task -v -y --thinking \
         -m "$CLINE_MODEL" \
         --timeout 600 \
         "$VERIFY_MSG" \
@@ -253,7 +253,7 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     If you cannot fix them, add them to '.cline_context/.build_issues.md'.
     Before testing, if a port is in use, YOU MUST ONLY use 'npx kill-port <portnumber>' to free it. DO NOT use pkill, killall, or kill commands under any circumstances."
     set +e
-    cline task -v -y \
+    cline task -v -y --thinking \
         -m "$CLINE_MODEL" \
         --timeout 600 \
         "$SAFETY_MSG" \
