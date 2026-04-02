@@ -165,6 +165,25 @@ def call_llm(client: httpx.Client, model: str, system_prompt: str, user_content:
 
     print("    ↳ All parts finished. Starting Merge Pass...", flush=True)
     
+    # Component 9: Recursive merge if facts are too large
+    merged_facts = "\n\n".join(partial_results)
+    if len(merged_facts) > 60000:
+        print(f"    ↳ Facts too large ({len(merged_facts)} chars). Running consolidation...", flush=True)
+        buckets = [partial_results[i:i+5] for i in range(0, len(partial_results), 5)]
+        consolidated = []
+        for bi, bucket in enumerate(buckets):
+            bucket_text = "\n\n".join(bucket)
+            consolidation_prompt = (
+                f"Consolidate these extracted facts into a concise summary. "
+                f"Remove duplicates. Keep only unique technical requirements.\n\n{bucket_text}"
+            )
+            result = _single_llm_call(client, model,
+                "You are a technical summarizer. Output concise bullet points only.",
+                consolidation_prompt, f"Consolidation {bi+1}/{len(buckets)}")
+            consolidated.append(result)
+        partial_results = consolidated
+        print(f"    ↳ Consolidated {len(buckets)} buckets into {len(consolidated)} summaries.", flush=True)
+    
     # [FIX] Now we apply your STRICT system prompt to the merged bullets
     merge_prompt = (
         "You previously extracted technical details from a larger conversation in parts. "
@@ -266,6 +285,190 @@ def update_status(status: str):
         print(f"  ⚠ Failed to update status file: {e}")
 
 
+# --- Stop words for KB keyword matching ---
+STOP_WORDS = {"the","a","an","is","it","to","and","or","of","in","on","for",
+              "with","this","that","from","be","as","at","by","we","do","if",
+              "not","but","so","make","sure","lets","fix","then","can","will",
+              "should","must","have","has","been","was","are","also","any",
+              "all","just","get","set","use","new","add","now","our","its"}
+
+
+def select_relevant_kb(kb_dir: str, instruction: str, max_chars: int = 100000) -> str:
+    """Score and select only relevant KB files based on keyword matching."""
+    import glob, re
+
+    # 1. Extract keywords from instruction (3+ chars, not stop words)
+    raw_words = re.findall(r'[a-zA-Z0-9_]+', instruction.lower())
+    keywords = {w for w in raw_words if len(w) >= 3 and w not in STOP_WORDS}
+
+    if not keywords:
+        print(f"  📖 KB: No meaningful keywords found in instruction. Skipping KB.", flush=True)
+        return ""
+
+    print(f"  📖 KB Keywords: {', '.join(sorted(keywords)[:15])}", flush=True)
+
+    # 2. Score each file
+    scored_files = []
+    for md_file in glob.glob(f"{kb_dir}/**/*.md", recursive=True):
+        score = 0
+        basename = os.path.basename(md_file).lower()
+
+        # Filename match = high relevance
+        for kw in keywords:
+            if kw in basename:
+                score += 10
+
+        # Content peek match (first 500 chars only)
+        try:
+            with open(md_file, "r", encoding="utf-8") as f:
+                peek = f.read(500).lower()
+            for kw in keywords:
+                if kw in peek:
+                    score += 5
+        except Exception:
+            continue
+
+        scored_files.append((score, md_file))
+
+    # 3. Sort by score (highest first)
+    scored_files.sort(key=lambda x: -x[0])
+
+    # 4. Inject full content for matches, filenames-only for the rest
+    selected_content = []
+    collateral_names = []
+    total_chars = 0
+
+    for score, path in scored_files:
+        if score > 0 and total_chars < max_chars:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                if total_chars + len(content) <= max_chars:
+                    selected_content.append(f"### KB: {os.path.basename(path)}\n{content}")
+                    total_chars += len(content)
+                else:
+                    remaining = max_chars - total_chars
+                    selected_content.append(
+                        f"### KB: {os.path.basename(path)} [TRUNCATED]\n{content[:remaining]}"
+                    )
+                    total_chars = max_chars
+            except Exception:
+                continue
+        else:
+            collateral_names.append(os.path.basename(path))
+
+    result = "\n\n".join(selected_content)
+    if collateral_names:
+        result += f"\n\n### Other KB Files (not loaded - request if needed):\n"
+        result += ", ".join(collateral_names[:50])
+
+    matched = len(selected_content)
+    total = len(scored_files)
+    print(f"  📖 KB Selection: {matched}/{total} files matched, {total_chars} chars injected (cap: {max_chars})", flush=True)
+    return result
+
+
+def detect_project_toolchain(project_dir: str) -> str:
+    """Detect language, package manager, test runner, and formatter from project markers."""
+    markers = {
+        "pyproject.toml":   {"lang": "Python", "pkg": "poetry/pip", "fmt": "black/ruff", "test": "pytest"},
+        "setup.py":         {"lang": "Python", "pkg": "pip", "fmt": "black", "test": "pytest"},
+        "requirements.txt": {"lang": "Python", "pkg": "pip", "fmt": "black", "test": "pytest"},
+        "Pipfile":          {"lang": "Python", "pkg": "pipenv", "fmt": "black", "test": "pytest"},
+        "package.json":     {"lang": "JavaScript/TypeScript", "pkg": "npm/yarn", "fmt": "prettier", "test": "jest/vitest"},
+        "tsconfig.json":    {"lang": "TypeScript", "pkg": "npm", "fmt": "prettier", "test": "jest"},
+        "Cargo.toml":       {"lang": "Rust", "pkg": "cargo", "fmt": "rustfmt", "test": "cargo test"},
+        "go.mod":           {"lang": "Go", "pkg": "go mod", "fmt": "gofmt", "test": "go test"},
+        "CMakeLists.txt":   {"lang": "C/C++", "pkg": "cmake", "fmt": "clang-format", "test": "ctest/make test"},
+        "Makefile":         {"lang": "C/C++", "pkg": "make", "fmt": "clang-format", "test": "make test"},
+        "pom.xml":          {"lang": "Java", "pkg": "maven", "fmt": "google-java-format", "test": "mvn test"},
+        "build.gradle":     {"lang": "Java/Kotlin", "pkg": "gradle", "fmt": "spotless", "test": "gradle test"},
+    }
+
+    detected = []
+    seen_langs = set()
+    for marker, info in markers.items():
+        for root, dirs, files in os.walk(project_dir):
+            dirs[:] = [d for d in dirs if d not in ["node_modules", ".git", "venv", ".venv", "__pycache__"]]
+            if marker in files and info["lang"] not in seen_langs:
+                detected.append(info)
+                seen_langs.add(info["lang"])
+                break
+
+    if not detected:
+        return ""
+
+    result = "<TOOLCHAIN>\n"
+    for d in detected:
+        result += f"  Language: {d['lang']}\n"
+        result += f"  Package Manager: {d['pkg']}\n"
+        result += f"  Formatter: {d['fmt']}\n"
+        result += f"  Test Runner: {d['test']}\n"
+        if len(detected) > 1:
+            result += "  ---\n"
+    result += "</TOOLCHAIN>"
+    print(f"  🔧 Toolchain: {', '.join(d['lang'] for d in detected)}", flush=True)
+    return result
+
+
+def get_symbol_skeleton(project_dir: str) -> str:
+    """Matches class/function signatures AND imports to create a navigable project map."""
+    import re
+    skeleton = ["[PROJECT SYMBOL SKELETON]"]
+    signature_re = re.compile(
+        r"^\s*(?:class|def|function|interface|type|async\s+function)\s+([a-zA-Z0-9_]+)",
+        re.MULTILINE
+    )
+    import_re = re.compile(
+        r"^\s*(?:import\s+.+|from\s+\S+\s+import\s+.+|#include\s+.+|require\(.+\))",
+        re.MULTILINE
+    )
+
+    total_chars = 0
+    MAX_SKELETON_CHARS = 15000
+    SKIP_DIRS = {"node_modules", ".git", "venv", ".venv", "__pycache__",
+                 "dist", "build", "public", ".knowledge_base", ".cline_context", ".cline_logs"}
+
+    for root, dirs, files in os.walk(project_dir):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+
+        for file in files:
+            if file.endswith((".py", ".ts", ".js", ".tsx", ".jsx", ".go", ".rs", ".java", ".c", ".cpp", ".h")):
+                rel_path = os.path.relpath(os.path.join(root, file), project_dir)
+                try:
+                    with open(os.path.join(root, file), "r", encoding="utf-8") as f:
+                        content = f.read()
+
+                    imports = import_re.findall(content)
+                    symbols = signature_re.findall(content)
+                    line_count = content.count('\n') + 1
+
+                    if imports or symbols:
+                        file_block = [f"\n{rel_path} ({line_count} lines)"]
+
+                        if imports:
+                            file_block.append("  imports:")
+                            for imp in imports[:5]:
+                                file_block.append(f"    {imp.strip()}")
+                            if len(imports) > 5:
+                                file_block.append(f"    ... +{len(imports)-5} more")
+
+                        if symbols:
+                            file_block.append("  defines:")
+                            for sym in symbols:
+                                file_block.append(f"    - {sym}")
+
+                        block_str = "\n".join(file_block)
+                        if total_chars + len(block_str) > MAX_SKELETON_CHARS:
+                            skeleton.append("\n... [Skeleton truncated]")
+                            return "\n".join(skeleton)
+                        skeleton.append(block_str)
+                        total_chars += len(block_str)
+                except Exception:
+                    continue
+    return "\n".join(skeleton)
+
+
 def run_distillation():
     """Execute the 4-pass distillation pipeline."""
     print("=" * 60, flush=True)
@@ -288,22 +491,36 @@ def run_distillation():
                 pass
         return ""
     
-    is_rebuild = os.path.exists(OUTPUT_PATH)
+    has_git = os.path.exists("/workspace/.git")
+    has_code = any(f for f in os.listdir("/workspace") if f not in [".cline_context", ".cline_logs", ".knowledge_base", "conversation.json"])
+    is_rebuild = os.path.exists(OUTPUT_PATH) or has_git or has_code
+    
     if is_rebuild:
-        print(f"\n🔄 Rebuild detected for {PROJECT_NAME}: Using structured context and latest instruction.", flush=True)
+        status_text = "ALREADY PARTIALLY IMPLEMENTED" if not has_git else "EXISTING REPOSITORY DETECTED"
+        print(f"\n🔄 {status_text} for {PROJECT_NAME}: Using structured context and latest instruction.", flush=True)
         import subprocess
         try:
             tree_output = subprocess.check_output(
-                ["tree", "/workspace", "-I", "node_modules|.git|venv|.venv|.cline_context|.cline_logs|__pycache__"], 
+                ["tree", "/workspace", "-I", "node_modules|.git|venv|.venv|.cline_context|.cline_logs|__pycache__|dist|build|public|.knowledge_base"], 
                 text=True, stderr=subprocess.DEVNULL
             )
         except Exception:
             tree_output = "(Could not generate directory tree)"
             
+        symbol_skeleton = get_symbol_skeleton("/workspace")
+        toolchain_info = detect_project_toolchain("/workspace")
+        
         latest_instruction = ""
+        user_directives = ""
         for msg in reversed(messages):
             if msg.get("role") == "user" and "!build" in msg.get("content", "").lower():
-                latest_instruction = msg.get("content", "")
+                content = msg.get("content", "")
+                latest_instruction = content
+                # Extract directives: remove !build and flags
+                import re
+                directives = re.sub(r'!build|--repo\s+\S+|--kb\s+\S+', '', content, flags=re.IGNORECASE).strip()
+                if directives:
+                    user_directives = f"\n  <USER_DIRECTIVES>\n{directives}\n  </USER_DIRECTIVES>\n"
                 break
                 
         if not latest_instruction and messages:
@@ -311,20 +528,37 @@ def run_distillation():
 
         readme_content = read_workspace_file("README.md")
         issues_content = read_workspace_file(".cline_context/.build_issues.md")
+        
+        kb_content = ""
+        kb_dir = "/workspace/.knowledge_base"
+        if os.path.exists(kb_dir):
+            kb_content = select_relevant_kb(kb_dir, latest_instruction)
             
         conversation_text = (
             f"<SITUATIONAL_AWARENESS>\n"
             f"  <MODE>ITERATIVE_REBUILD</MODE>\n"
-            f"  <STATUS>The application is ALREADY PARTIALLY IMPLEMENTED. You are NOT starting from scratch.</STATUS>\n"
+            f"  <STATUS>This project is ALREADY PARTIALLY IMPLEMENTED. Use the provided DIRECTORY_STRUCTURE and SYMBOL_SKELETON to understand the current state.</STATUS>\n"
             f"  <DIRECTIVES>\n"
-            f"    1. [P0] ANALYZE: Carefully examine the 'DIRECTORY_STRUCTURE' and 'PROJECT_OVERVIEW' blocks below before planning any code changes.\n"
-            f"    2. [P0] NON-REDUNDANT_PLANNING: DO NOT plan for or recreate files that already exist in the structure unless the 'NEW_REQUEST' explicitly requires a logic change in them.\n"
-            f"    3. [P1] SCOPE_FOCUS: Focus exclusively on fulfilling the 'NEW_REQUEST' and resolving the 'KNOWN_BUILD_ISSUES'.\n"
+            f"    1. [P0] PRESERVATION: Prioritize building on top of existing code. Maintain the current file organization and design idioms. Rework is strictly prohibited.\n"
+            f"    2. [P0] CONTINUITY: Read the 'PROJECT_HISTORY' to pick up exactly where the last agent left off.\n"
+            f"    3. [P0] NAVIGATION: Use the SYMBOL_SKELETON to map out dependencies before reading files.\n"
+            f"    4. [P0] ANALYZE: Carefully examine the 'DIRECTORY_STRUCTURE', 'SYMBOL_SKELETON', and 'PROJECT_OVERVIEW' blocks below before planning any code changes.\n"
+            f"    5. [P0] NON-REDUNDANT_PLANNING: DO NOT plan for or recreate files that already exist in the structure unless the 'NEW_REQUEST' explicitly requires a logic change in them.\n"
+            f"    6. [P0] FILE_STATUS_AWARENESS: If the 'ARCHITECTURE' section (developed by the architect) mentions a file that is NOT present in the 'DIRECTORY_STRUCTURE', it is a NEW component. You MUST create it.\n"
+            f"    7. [P0] CONTEXT_ALIGNMENT: Use the 'PROJECT_HISTORY' to understand the intent and reasoning behind the current request.\n"
+            f"    8. [P1] SCOPE_FOCUS: Focus exclusively on fulfilling the 'NEW_REQUEST' and resolving the 'KNOWN_BUILD_ISSUES'.\n"
             f"  </DIRECTIVES>\n"
+            f"{user_directives}"
             f"</SITUATIONAL_AWARENESS>\n\n"
             f"<PROJECT_DATA>\n"
             f"  <NAME>{PROJECT_NAME}</NAME>\n"
+            f"  <PROJECT_HISTORY>\n"
+            f"{conversation_to_text(messages[:-1])}\n"
+            f"  </PROJECT_HISTORY>\n\n"
         )
+        
+        if kb_content:
+            conversation_text += f"\n<BEST_PRACTICES_KNOWLEDGE_BASE>\n{kb_content}\n</BEST_PRACTICES_KNOWLEDGE_BASE>\n\n"
         
         if readme_content:
             conversation_text += f"  <PROJECT_OVERVIEW>\n```markdown\n{readme_content}\n```\n  </PROJECT_OVERVIEW>\n\n"
@@ -334,6 +568,11 @@ def run_distillation():
 
         conversation_text += (
             f"  <DIRECTORY_STRUCTURE>\n```\n{tree_output}\n```\n  </DIRECTORY_STRUCTURE>\n\n"
+            f"  <SYMBOL_SKELETON>\n{symbol_skeleton}\n  </SYMBOL_SKELETON>\n\n"
+        )
+        if toolchain_info:
+            conversation_text += f"  {toolchain_info}\n\n"
+        conversation_text += (
             f"  <NEW_REQUEST>\n{latest_instruction}\n  </NEW_REQUEST>\n"
             f"</PROJECT_DATA>"
         )
@@ -362,8 +601,10 @@ def run_distillation():
             f"  <STATUS>This is a NEW PROJECT START. Establish the foundational structure and implementation plan.</STATUS>\n"
             f"  <DIRECTIVES>\n"
             f"    1. [P0] FOUNDATION: Read the 'PROJECT_HISTORY' to understand the core vision, tech stack, and requirements.\n"
-            f"    2. [P0] EXECUTION: Treat the 'FINAL_BUILD_COMMAND' as your immediate tactical mission.\n"
-            f"    3. [P1] ALIGNMENT: Ensure your output fulfills both the historical vision and the final instruction based strictly on your assigned system role.\n"
+            f"    2. [P0] PRESERVATION: Maintain consistency with any existing patterns established in the project history.\n"
+            f"    3. [P0] EXECUTION: Treat the 'FINAL_BUILD_COMMAND' as your immediate tactical mission.\n"
+            f"    4. [P1] ALIGNMENT: Ensure your output fulfills both the historical vision and the final instruction based strictly on your assigned system role.\n"
+            f"    5. [P1] CLARITY: Ensure the foundational structure is clean and well-documented.\n"
             f"  </DIRECTIVES>\n"
             f"</SITUATIONAL_AWARENESS>\n\n"
             f"<PROJECT_DATA>\n"
@@ -433,7 +674,7 @@ def run_distillation():
 
     print(f"\n📝 Writing {OUTPUT_PATH}", flush=True)
     update_status("Assembling .clinerules...")
-    clinerules = assemble_clinerules(results, config)
+    clinerules = assemble_clinerules(results, config, messages)
 
     with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
         f.write(clinerules)
@@ -445,12 +686,27 @@ def run_distillation():
     print("=" * 60, flush=True)
 
 
-def assemble_clinerules(results: dict, config: dict) -> str:
+def assemble_clinerules(results: dict, config: dict, messages: list) -> str:
     """Combine the 4-pass results into a structured .clinerules document."""
     limits = config.get("limits", {})
 
+    # Try to extract the target objective from the messages
+    target_obj = "Complete the implementation roadmap as specified."
+    for msg in reversed(messages):
+        if "!build" in msg.get("content", "").lower():
+            import re
+            content = msg.get("content", "")
+            # Filter out !build and flags
+            target_obj = re.sub(r'!build|--repo\s+\S+|--kb\s+\S+', '', content, flags=re.IGNORECASE).strip()
+            if not target_obj:
+                target_obj = "Process project requirements and implement planned architecture."
+            break
+
     doc = [
         "# Project Build Specification",
+        "",
+        "## 🎯 Current Target Objective",
+        f"> {target_obj}",
         "",
         "> Auto-generated by Multi-Agent Distillation Pipeline",
         f"> Timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}",
@@ -474,6 +730,7 @@ def assemble_clinerules(results: dict, config: dict) -> str:
         "<operational_constraints>",
         f"- Max project size: {limits.get('max_project_size_mb', 4096)} MB",
         f"- Max build iterations: {limits.get('max_build_iterations', 5)}",
+        "- PRESERVATION POLICY: Prioritize building on top of existing code. Maintain the current file structure and design patterns. Unsolicited rework, file-splitting, or structural optimization is strictly forbidden.",
         "- ANTI-LOOP RULE: Never attempt the same bug fix more than twice.",
         "- FOCUS REMINDER: Keep the main goal in mind. Do not get distracted by hypothetical features.",
         "- TASK COMPLETION: Relentlessly work through your checklist. Mark impossible tasks as blocked and move on.",
@@ -485,6 +742,12 @@ def assemble_clinerules(results: dict, config: dict) -> str:
         "- PORT MANAGEMENT: If a port is in use, YOU MUST ONLY use `npx kill-port <port>` to free it. NEVER use pkill or kill commands.",
         "- DAEMON EXECUTION (CRITICAL): NEVER run `python3 -m http.server`, `npm start`, or ANY server command directly. It will hang the terminal and break the pipeline. You MUST use background processes: `python3 -m http.server 8000 &` or `nohup npm start &`.",
         "- REASONING: Before executing any terminal command or modifying files, you must write out a brief step-by-step logical analysis of your plan.",
+        "- CONTEXT PRESERVATION: Your context window is limited. NEVER read more than 300 lines at once. Use searchFiles to locate specific code before reading.",
+        "- EXTERNAL MEMORY: After analyzing any file, append a 3-line summary to '.cline_context/analysis_notes.md'. This is your long-term memory.",
+        "- ANTI-AMNESIA: If you feel lost or unsure what you've done, read '.cline_context/.session_state.md' and '.cline_context/analysis_notes.md' BEFORE doing anything else.",
+        "- SYMBOL SKELETON FIRST: Your .clinerules contains a Symbol Skeleton with imports and function names. Use this to navigate, not readFile.",
+        "- DEBUG-FIRST: When you need to understand how code works, write a small probe script, run it, and read the output. This is faster and more accurate than reading 500 lines of source code.",
+        "- MANDATORY TEST GATE: After editing ANY file, run the project's test suite. If tests fail after your edit, fix the regression BEFORE moving to the next task.",
         "</operational_constraints>",
         "",
     ])

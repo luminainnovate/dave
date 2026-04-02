@@ -283,21 +283,35 @@ def handle_move(messages: list) -> str:
             return "No code snippets found in the conversation context."
 
         conv_id = get_conversation_id(messages)
-        prefix = suggested_root or "chat"
         
-        # If no suggested root from tree, try to extract from first user message
-        if not suggested_root:
-            for m in messages:
-                if m.get("role") == "user":
-                    content = m.get("content", "").strip()
-                    if content:
-                        simplified = re.sub(r'[^a-zA-Z0-9]', '_', content)[:20].strip('_')
-                        if simplified:
-                            prefix = simplified
-                        break
+        # --- ID-Centric Linking (Primary Lookup) ---
+        # Before generating a new prefix, check if any existing folder matches this conv_id
+        target_dir = None
+        conv_dir = "conversations"
+        if os.path.exists(conv_dir):
+            for item in os.listdir(conv_dir):
+                if item.endswith(f"_{conv_id}"):
+                    target_dir = os.path.join(conv_dir, item)
+                    logger.info(f"ID Match: Linked conversation {conv_id} to existing project `{target_dir}`")
+                    break
         
-        prefix = (suggested_root or prefix)[:60].strip()
-        target_dir = os.path.join("conversations", f"{prefix}_{conv_id}")
+        # If no match found, proceed with default prefix generation
+        if not target_dir:
+            prefix = suggested_root or "chat"
+            
+            # If no suggested root from tree, try to extract from first user message
+            if not suggested_root:
+                for m in messages:
+                    if m.get("role") == "user":
+                        content = m.get("content", "").strip()
+                        if content:
+                            simplified = re.sub(r'[^a-zA-Z0-9]', '_', content)[:20].strip('_')
+                            if simplified:
+                                prefix = simplified
+                            break
+            
+            prefix = (suggested_root or prefix)[:60].strip()
+            target_dir = os.path.join(conv_dir, f"{prefix}_{conv_id}")
         
         # --- Safety Check for Autonomous Projects ---
         if os.path.exists(os.path.join(target_dir, ".clinerules")):
@@ -312,6 +326,8 @@ def handle_move(messages: list) -> str:
             return f"Project is already managed by the AI Builder pipeline (pointing to `{target_dir}`). Snippets were NOT overwritten to protect autonomous progress.\n\n{vscode_msg}"
         # ------------------------------------------
         
+        is_cloned = os.path.exists(os.path.join(target_dir, ".git"))
+        
         saved_count = 0
         skipped_count = 0
         
@@ -321,6 +337,11 @@ def handle_move(messages: list) -> str:
                 os.makedirs(os.path.dirname(abs_path), exist_ok=True)
                 
                 if os.path.exists(abs_path):
+                    if is_cloned:
+                        logger.info(f"Strict Mode: Skipping overwrite for existing file `{rel_path}`")
+                        skipped_count += 1
+                        continue
+                        
                     with open(abs_path, "r", encoding="utf-8") as f:
                         if f.read() == content:
                             skipped_count += 1

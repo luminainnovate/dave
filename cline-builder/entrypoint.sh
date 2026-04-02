@@ -71,6 +71,7 @@ echo "🚩 Bootstrapping noise suppression (.gitignore)..."
     echo "venv/"
     echo ".cline_logs/"
     echo ".cline_context/"
+    echo ".knowledge_base/"
     echo "__pycache__/"
     echo ".pytest_cache/"
     echo "*.log"
@@ -161,6 +162,78 @@ echo "  ✓ .clinerules generated ($(wc -c < "$CLINERULES_PATH") bytes)"
 rm -f /workspace/.build_complete
 
 # =============================================================================
+# GIT SAFETY NET (Component 7)
+# =============================================================================
+setup_git_safety() {
+    cd /workspace
+    
+    if [ ! -d ".git" ]; then
+        # Project has no git — initialize for local snapshot only
+        git init -q
+        git config user.email "builder@local"
+        git config user.name "Cline Builder"
+        git add -A 2>/dev/null
+        git commit -q -m "snapshot: pre-build state" 2>/dev/null
+        echo "  📸 Created local snapshot (no remote, no pushing)"
+    fi
+    
+    # Always work on a branch, never on main/master
+    local MAIN_BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null || echo "main")
+    local BRANCH_NAME="agent/build-$(date +%s)"
+    git checkout -b "$BRANCH_NAME" 2>/dev/null || true
+    echo "  🌿 Working on branch: ${BRANCH_NAME} (based on ${MAIN_BRANCH})"
+    echo "  💡 To review: git diff ${MAIN_BRANCH}"
+    echo "  💡 To rollback: git checkout ${MAIN_BRANCH}"
+}
+
+echo ""
+echo "🌿 Setting up git safety net..."
+setup_git_safety
+
+# =============================================================================
+# SESSION STATE GENERATOR (Component 3)
+# =============================================================================
+generate_session_state() {
+    local ITERATION=$1
+    local STEP=$2
+    local STATE_FILE="/workspace/.cline_context/.session_state.md"
+    
+    echo "# Session State (Auto-generated)" > "$STATE_FILE"
+    echo "" >> "$STATE_FILE"
+    echo "## Current Position" >> "$STATE_FILE"
+    echo "- **Iteration**: ${ITERATION}/${MAX_ITERATIONS}" >> "$STATE_FILE"
+    echo "- **Step**: ${STEP}" >> "$STATE_FILE"
+    echo "- **Timestamp**: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$STATE_FILE"
+    echo "" >> "$STATE_FILE"
+    
+    # Inject known issues if they exist
+    if [ -f "/workspace/.cline_context/.build_issues.md" ]; then
+        echo "## Known Issues (from previous steps)" >> "$STATE_FILE"
+        cat /workspace/.cline_context/.build_issues.md >> "$STATE_FILE"
+        echo "" >> "$STATE_FILE"
+    fi
+    
+    # Inject analysis notes if agent wrote any
+    if [ -f "/workspace/.cline_context/analysis_notes.md" ]; then
+        echo "## Agent Notes (from previous steps)" >> "$STATE_FILE"
+        tail -c 3000 /workspace/.cline_context/analysis_notes.md >> "$STATE_FILE"
+        echo "" >> "$STATE_FILE"
+    fi
+    
+    # Inject summaries from previous step logs
+    echo "## Previous Step Summaries" >> "$STATE_FILE"
+    for log in /workspace/.cline_logs/*.txt; do
+        if [ -f "$log" ]; then
+            local LOG_NAME=$(basename "$log")
+            echo "### ${LOG_NAME}" >> "$STATE_FILE"
+            grep -iE "(FINAL SUMMARY|attempt_completion|✓|✗|ERROR|TODO|BLOCKED)" "$log" 2>/dev/null \
+                | tail -10 >> "$STATE_FILE" || true
+            echo "" >> "$STATE_FILE"
+        fi
+    done
+}
+
+# =============================================================================
 # PHASE 2: Iterative Cline Build Cycle
 # =============================================================================
 echo ""
@@ -198,16 +271,17 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
 
 # --- Build Phase ---
     echo "  🔧 Running Cline (Build mode)..."
+    generate_session_state "$ITERATION" "build"
 
     CURRENT_TIMEOUT=600 # 10 minutes
-    BUILD_MSG="$CLINE_STARTUP"
+    BUILD_MSG="IMPORTANT: First read '.cline_context/.session_state.md' to understand what has been done so far. Then read '.clinerules' and execute remaining implementation tasks."
 
     if [ $ITERATION -eq $MAX_ITERATIONS ]; then
         echo "  🚨 FINAL ROUND: Shifting to Stabilization and Debugging..."
-        BUILD_MSG="CRITICAL: This is the FINAL iteration (${ITERATION} of ${MAX_ITERATIONS}). Your directive is now STABILIZATION. You must ignore the previous 'move on' anti-loop rules. Revisit any TODOs, uncommented code, or failing tests. Your sole priority is to ensure the application compiles, runs correctly end-to-end, and is completely usable. Take your time and fix the root causes of any remaining bugs."
-        CURRENT_TIMEOUT=1200  # Give it 20 minutes for deep debugging
+        BUILD_MSG="IMPORTANT: First read '.cline_context/.session_state.md'. CRITICAL: This is the FINAL iteration (${ITERATION} of ${MAX_ITERATIONS}). Your directive is now STABILIZATION. Revisit any TODOs, uncommented code, or failing tests. Fix the root causes of any remaining bugs."
+        CURRENT_TIMEOUT=1200
     elif [ $ITERATION -gt 1 ]; then
-        BUILD_MSG="Continue building the project. Review what was done in the previous iteration, fix any issues, and complete remaining tasks from .clinerules. This is iteration ${ITERATION} of ${MAX_ITERATIONS}. Remember: keep momentum and don't get stuck on one bug."
+        BUILD_MSG="IMPORTANT: First read '.cline_context/.session_state.md' to recover your memory. Continue building the project. Review what was done in the previous iteration, fix any issues, and complete remaining tasks from .clinerules. This is iteration ${ITERATION} of ${MAX_ITERATIONS}. Remember: keep momentum and don't get stuck on one bug."
     fi
 
     set +e
@@ -229,8 +303,9 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
 
     # --- Verification Phase ---
     echo "  🔍 Running Cline (Verification mode)..."
+    generate_session_state "$ITERATION" "verify"
 
-    VERIFY_MSG="Review the current project. 
+    VERIFY_MSG="IMPORTANT: First read '.cline_context/.session_state.md' to understand what has been done so far. Then: 
     1) Verify all tasks from .clinerules are implemented and the code runs without errors. 
     2) MUST DO: Create a 'README.md' file that clearly explains what the project is and EXACTLY how to run it. 
     3) Check if '.cline_context/.build_issues.md' already exists. If it does, READ it. Cross off or remove the issues that were fixed in this iteration, and keep the ones that still need work. Do not hallucinate uncompleted tasks. 
@@ -246,8 +321,9 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
 
     # --- Safety Phase ---
     echo "  🛡️ Running Cline (Safety audit)..."
+    generate_session_state "$ITERATION" "safety"
 
-    SAFETY_MSG="Perform a security and safety audit of all code in the current project. Check for: 1) Input validation, 2) Path traversal, 3) Hardcoded secrets, 4) Injection risks, 5) Infinite loops/resource leaks, 6) Missing error handling. 
+    SAFETY_MSG="IMPORTANT: First read '.cline_context/.session_state.md' to understand what has been done so far. Then perform a security and safety audit of all code in the current project. Check for: 1) Input validation, 2) Path traversal, 3) Hardcoded secrets, 4) Injection risks, 5) Infinite loops/resource leaks, 6) Missing error handling. 
     If you find critical issues, attempt to FIX THEM DIRECTLY in the code. 
     If you fix them or the code is already safe, append 'SAFE' to the '.build_complete' file. 
     If you cannot fix them, add them to '.cline_context/.build_issues.md'.

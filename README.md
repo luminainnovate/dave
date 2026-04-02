@@ -55,6 +55,7 @@ Bob isn't just a chatbot; Bob is a fully autonomous software factory. By combini
 -   `!move`: Extract project files from the current chat.
 -   `!build`: Kick off the 4-pass autonomous build pipeline.
 -   `!status`: Check the status of active and recent build containers.
+-   `!logs`: Fetch and display the latest console logs from the active build pipeline.
 -   `!stop`: Force-stop all running build pipelines and clear VRAM.
 
 ---
@@ -251,6 +252,7 @@ While in chat, use these commands to override the orchestrator:
 - `!move`: Scans the conversation, identifies project structure/code, and exports it to `conversations/`.
 - `!build`: Triggers the autonomous build pipeline for the currently moved project.
 - `!status`: Checks the status of active or recent build containers.
+- `!logs`: Fetches the latest terminal logs from the active background build pipeline.
 - `!stop`: Force-stops all running build pipelines.
 - `!bob` / `hey bob`: Force the current turn to use the Fast Orchestrator.
 - `!expert` / `hey expert`: Force the current turn to use the Expert Model.

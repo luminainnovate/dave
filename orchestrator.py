@@ -9,6 +9,7 @@ import time
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
+from typing import Optional
 
 import mover
 
@@ -18,13 +19,13 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(level
 logger = logging.getLogger("Bob-Orchestrator")
 
 # --- STRICT MODEL CONFIG ---
-EXPERT_MODEL = "glm-fast:latest"  # Switch this to any model
+EXPERT_MODEL = "gemma4:26b"  # Switch this to any model
 ROUTER_MODEL = "qwen2.5:1.5b"     # Switch this if you want to change your default router model (This is the model that decides which model to use)
 DEFAULT_EXPERT_MODEL = "qwen3.5:27b" # Keep this as default, if you know what youre doing, you can change it with the PARAMS_GENERAL/PARAMS_CODING
 OLLAMA_URL = "http://localhost:11434"
 COMFYUI_URL = "http://localhost:8188"
-EXPERT_CTX = 16384   # Context for the expert model
-DISTILL_CTX = 16384  # Context for the distillation engine (Thinking)
+EXPERT_CTX = 24576   # Context for the expert model
+DISTILL_CTX = 32768  # Context for the distillation engine (Thinking)
 CLINE_CTX = 32768    # Context for the Cline agent (Building)
 
 # --- STATE MANAGEMENT ---
@@ -453,7 +454,9 @@ async def proxy_ollama(request: Request):
             vram_locked = False
             expert_warm_until = 0
             await verified_unload(EXPERT_MODEL)
-            return _command_response("🔓 **VRAM Unlocked.** Memory cleared.", is_streaming, is_native)
+            await verified_unload(ROUTER_MODEL)
+            await free_comfyui()
+            return _command_response("🔓 **VRAM Unlocked.** Memory cleared (Expert, Router, & ComfyUI).", is_streaming, is_native)
         elif "!code" in prompt_lower:
             expert_mode = "coding"
             logger.info("Command: Switched to Coding Mode.")
@@ -469,6 +472,10 @@ async def proxy_ollama(request: Request):
             logger.info("Command: Build pipeline triggered.")
             build_msg = await _trigger_build_pipeline_safe(messages)
             return _command_response(build_msg, is_streaming, is_native)
+        elif prompt_lower.startswith("!clone"):
+            logger.info("Command: Clone triggered.")
+            clone_msg = await asyncio.to_thread(_handle_clone_command, messages)
+            return _command_response(clone_msg, is_streaming, is_native)
         elif "!stop" in prompt_lower:
             logger.info("Command: Stop pipeline triggered.")
             stop_msg = _stop_build_pipeline()
@@ -477,6 +484,10 @@ async def proxy_ollama(request: Request):
             logger.info("Command: Status check triggered.")
             status_msg = _check_build_status()
             return _command_response(status_msg, is_streaming, is_native)
+        elif "!logs" in prompt_lower:
+            logger.info("Command: Logs check triggered.")
+            logs_msg = _check_build_logs()
+            return _command_response(logs_msg, is_streaming, is_native)
 
     # 4. Request Orchestration
     try:
@@ -494,7 +505,19 @@ async def proxy_ollama(request: Request):
         keep_alive = 0
         is_cold_expert = False
 
-        if is_background_task or is_image_query or is_search_query or is_search_tool or has_search_history:
+        # --- Context-Aware Triage Override ---
+        project_dir = _get_bound_project_dir(messages)
+        has_at_mention = "@" in prompt_lower
+        
+        if project_dir or has_at_mention:
+            target_model = EXPERT_MODEL
+            keep_alive = "10m" if not vram_locked else "-1"
+            is_cold_expert = not is_expert_warm
+            if not vram_locked:
+                expert_warm_until = current_time + 600
+            expert_mode = "coding"
+            logger.info(f"Project context detected ({'bound' if project_dir else '@mention'}): Routing to Expert model.")
+        elif is_background_task or is_image_query or is_search_query or is_search_tool or has_search_history:
             target_model = ROUTER_MODEL
             if is_image_query:
                 logger.info("Image generation intent detected: Routing to Router model.")
@@ -531,10 +554,92 @@ async def proxy_ollama(request: Request):
                     expert_warm_until = current_time + 300
                 is_cold_expert = True
                 expert_mode = "coding" if analysis.get("is_coding") else "general"
-                logger.info(f"Triage: Expert model required ({expert_mode}).")
-            else:
-                target_model = ROUTER_MODEL
                 logger.info("Triage: Router model sufficient.")
+
+        # --- Agent Detection ---
+        # Detect if this is an automated agent (Cline or Distillation pass)
+        is_agent_request = False
+        for m in messages:
+            if m.get("role") == "system":
+                content = str(m.get("content", "")).lower()
+                if "you are cline" in content or "distillation" in content or "architect" in content or "engineer" in content:
+                    is_agent_request = True
+                    break
+
+        # --- Context Binding & Tool Injection ---
+        project_dir = _get_bound_project_dir(messages)
+        project_context = ""
+        
+        # Only inject if it's a bound project AND it's a direct user interaction (not an agent)
+        if project_dir and target_model == EXPERT_MODEL and not is_agent_request:
+            logger.info(f"Injecting project context from {project_dir}")
+            tree = _get_project_tree(project_dir)
+            skeleton = _get_symbol_skeleton(project_dir)
+            mentions = _parse_file_mentions(messages[-1].get("content", ""), project_dir)
+            
+            project_context = (
+                f"\n\n<PROJECT_CONTEXT>\n"
+                f"You are working on a bound project: `{os.path.basename(project_dir)}`\n"
+                f"File Tree:\n{tree}\n"
+                f"Symbol Skeleton:\n{skeleton}\n"
+            )
+            if mentions:
+                project_context += mentions
+            project_context += "\n</PROJECT_CONTEXT>\n"
+            
+            # Inject into the system message (or first available message)
+            injected = False
+            for m in messages:
+                if m.get("role") == "system":
+                    m["content"] = str(m.get("content", "")) + project_context
+                    injected = True
+                    break
+            if not injected:
+                messages.insert(0, {"role": "system", "content": f"Project Awareness Active.{project_context}"})
+
+        # Define native tools
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "orchestrator_read_file",
+                    "description": "Reads the entire content of a file from the project directory. Use this when the Symbol Skeleton is insufficient.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "Relative path to the file"}
+                        },
+                        "required": ["path"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "orchestrator_expand_dir",
+                    "description": "Lists all files and symbols in a specific directory. Use this for recursive exploration of large codebases.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "Relative path to the directory"}
+                        },
+                        "required": ["path"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "orchestrator_build_logs",
+                    "description": "Fetches the latest terminal logs from the active background build pipeline (cline-builder Docker container). Use this when the user asks for the build status, errors, or insights into the build process.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }
+                }
+            }
+        ] if project_dir and target_model == EXPERT_MODEL and not is_agent_request else None
 
         if target_model == EXPERT_MODEL and is_cold_expert:
             await sweep_vram_for_expert()
@@ -557,9 +662,21 @@ async def proxy_ollama(request: Request):
             options.update({"temperature": options.get("temperature", 0.7), "num_ctx": EXPERT_CTX})
 
         body.update({"model": target_model, "keep_alive": keep_alive, "options": options})
-        logger.info(f"Executing {target_model} (ctx: {options['num_ctx']}, warm: {not is_cold_expert})")
+        if tools:
+            body["tools"] = tools
+        logger.info(f"Executing {target_model} (ctx: {options['num_ctx']}, warm: {not is_cold_expert}, tools: {bool(tools)})")
 
         target_path = "/api/chat" if is_native else "/v1/chat/completions"
+
+        if tools:
+            # Shift to the Agentic Loop handler
+            # This will release the lock internally when finished
+            try:
+                return await _handle_agentic_request(body, project_dir, target_path, is_native, gpu_lock)
+            finally:
+                if lock_held:
+                    gpu_lock.release()
+                    lock_held = False
 
         if not is_streaming:
             try:
@@ -625,6 +742,325 @@ def _command_response(text: str, is_streaming: bool = False, is_native: bool = F
     return StreamingResponse(_generator(), media_type="application/x-ndjson" if is_native else "text/event-stream")
 
 
+def _execute_tool(name: str, args: dict, project_dir: str) -> str:
+    """Executes a native orchestrator tool."""
+    path = args.get("path", "")
+    if not path or not project_dir:
+        return "Error: Missing path or project directory."
+        
+    # Sanitize path
+    safe_rel_path = mover.sanitize_path(path)
+    abs_path = os.path.join(project_dir, safe_rel_path)
+    
+    if name == "orchestrator_read_file":
+        try:
+            if not os.path.exists(abs_path):
+                return f"Error: File `{safe_rel_path}` not found."
+            with open(abs_path, "r", encoding="utf-8") as f:
+                content = f.read()
+                return content
+        except Exception as e:
+            return f"Error reading file: {e}"
+            
+    elif name == "orchestrator_build_logs":
+        try:
+            cmd = "docker ps -a --filter name=cline-builder --format '{{.Names}}' | head -n 1"
+            container_name = subprocess.check_output(cmd, shell=True, text=True).strip()
+            if not container_name:
+                return "Error: No build pipelines found."
+                
+            logs_cmd = ["docker", "logs", "--tail", "200", container_name]
+            result = subprocess.run(logs_cmd, capture_output=True, text=True)
+            logs_output = (result.stdout + "\n" + result.stderr).strip()
+            
+            if not logs_output:
+                return f"Logs for {container_name} are currently empty."
+                
+            if len(logs_output) > 5000:
+                logs_output = "... [Logs Truncated]\n" + logs_output[-5000:]
+            return f"Logs for {container_name}:\n{logs_output}"
+        except Exception as e:
+            return f"Error fetching logs: {e}"
+
+    elif name == "orchestrator_expand_dir":
+        try:
+            if not os.path.exists(abs_path) or not os.path.isdir(abs_path):
+                return f"Error: Directory `{safe_rel_path}` not found."
+            
+            # List files and symbols for this dir
+            skeleton = [f"[EXPANDED DIR: {safe_rel_path}]"]
+            signature_re = re.compile(r"^\s*(?:class|def|function|interface|type|async\s+function)\s+([a-zA-Z0-9_]+)", re.MULTILINE)
+            
+            for item in os.listdir(abs_path):
+                item_path = os.path.join(abs_path, item)
+                if os.path.isdir(item_path):
+                    if item not in ["node_modules", ".git", "venv", ".venv", "__pycache__", "dist", "build"]:
+                        skeleton.append(f"{item}/ (directory)")
+                elif item.endswith((".py", ".ts", ".js", ".tsx", ".jsx", ".go", ".rs", ".java", ".c", ".cpp")):
+                    try:
+                        with open(item_path, "r", encoding="utf-8") as f:
+                            content = f.read()
+                            matches = signature_re.findall(content)
+                            skeleton.append(f"{item}")
+                            for m in matches:
+                                skeleton.append(f"  - {m}")
+                    except Exception:
+                        skeleton.append(f"{item}")
+            return "\n".join(skeleton)
+        except Exception as e:
+            return f"Error expanding directory: {e}"
+            
+    return f"Error: Unknown tool `{name}`"
+
+
+async def _handle_agentic_request(body: dict, project_dir: str, target_path: str, is_native: bool, lock: asyncio.Lock):
+    """
+    Handles a tool-enabled request by recursively executing tools and re-running the LLM.
+    Returns the final response (one-shot or stream).
+    """
+    MAX_HOPS = 4
+    current_hops = 0
+    
+    original_messages = body.get("messages", [])
+    
+    while current_hops < MAX_HOPS:
+        current_hops += 1
+        logger.info(f"Agentic Loop: Hop {current_hops}/{MAX_HOPS}")
+        
+        # We always do a NON-STREAMING call for tools
+        temp_body = body.copy()
+        temp_body["stream"] = False
+        
+        try:
+            resp = await http_client.post(f"{OLLAMA_URL}{target_path}", json=temp_body, timeout=600.0)
+            if resp.status_code != 200:
+                return JSONResponse(status_code=resp.status_code, content={"error": "Agentic inference failed."})
+                
+            data = resp.json()
+            message = data.get("message", {}) if is_native else data.get("choices", [{}])[0].get("message", {})
+            
+            tool_calls = message.get("tool_calls", [])
+            if not tool_calls:
+                # No more tools, this is the final answer
+                # If the user originally wanted a stream, we can't easily convert this one-shot back to a stream 
+                # unless we do ONE more call with stream=True or just return the one-shot.
+                # Given the complexity, returning the one-shot is safer.
+                data["model"] = "Bob"
+                if "id" in data: data["id"] = "chatcmpl-Bob"
+                return JSONResponse(content=data)
+            
+            # Execute tools and append results
+            original_messages.append(message)
+            
+            for tc in tool_calls:
+                func = tc.get("function", {})
+                name = func.get("name")
+                args = func.get("arguments", {})
+                if isinstance(args, str):
+                    try: args = json.loads(args)
+                    except: args = {}
+                
+                logger.info(f"Executing Tool: {name}({args})")
+                result = _execute_tool(name, args, project_dir)
+                
+                tool_msg = {
+                    "role": "tool",
+                    "name": name,
+                    "content": result,
+                    "tool_call_id": tc.get("id", f"call_{int(time.time())}")
+                } if not is_native else {
+                    "role": "tool",
+                    "content": result
+                }
+                original_messages.append(tool_msg)
+                
+            body["messages"] = original_messages
+            
+        except Exception as e:
+            logger.error(f"Agentic Loop Error: {e}")
+            break
+            
+    return JSONResponse(status_code=500, content={"error": "Agentic loop exceeded max hops or failed."})
+
+
+def _get_bound_project_dir(messages: list) -> Optional[str]:
+    """Finds the project directory bound to the current conversation ID."""
+    conv_id = mover.get_conversation_id(messages)
+    conv_dir = "conversations"
+    if not os.path.exists(conv_dir):
+        return None
+        
+    for item in os.listdir(conv_dir):
+        if item.endswith(f"_{conv_id}"):
+            return os.path.join(conv_dir, item)
+    return None
+
+
+def _get_project_tree(project_dir: str) -> str:
+    """Generates a pruned directory tree for the project."""
+    try:
+        # Full tree but pruned of noise
+        cmd = ["tree", project_dir, "-I", "node_modules|.git|venv|.venv|__pycache__|dist|build|public|.knowledge_base|.cline_context|.cline_logs"]
+        output = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+        
+        # Scale guard: truncate if too large
+        if len(output) > 5000:
+            # Fallback to depth 1 if still too large? Or just truncate.
+            return output[:5000] + "\n... [Tree truncated for context safety]"
+        return output
+    except Exception:
+        return ""
+
+
+def _get_symbol_skeleton(project_dir: str) -> str:
+    """Matches class and function signatures to create a project skeleton."""
+    skeleton = ["[PROJECT SYMBOL SKELETON]"]
+    
+    # Simple regex-based extraction for Python, JS/TS, etc.
+    # class\s+(\w+)|function\s+(\w+)|(\w+)\s*=\s*(async\s*)?\([^)]*\)\s*=>|def\s+(\w+)
+    signature_re = re.compile(r"^\s*(?:class|def|function|interface|type|async\s+function)\s+([a-zA-Z0-9_]+)", re.MULTILINE)
+    
+    total_chars = 0
+    MAX_SKELETON_CHARS = 10000
+    
+    for root, dirs, files in os.walk(project_dir):
+        # Prune dirs
+        dirs[:] = [d for d in dirs if d not in ["node_modules", ".git", "venv", ".venv", "__pycache__", "dist", "build", "public", ".knowledge_base", ".cline_context", ".cline_logs"]]
+        
+        for file in files:
+            if file.endswith((".py", ".ts", ".js", ".tsx", ".jsx", ".go", ".rs", ".java", ".c", ".cpp")):
+                rel_path = os.path.relpath(os.path.join(root, file), project_dir)
+                try:
+                    with open(os.path.join(root, file), "r", encoding="utf-8") as f:
+                        content = f.read()
+                        matches = signature_re.findall(content)
+                        if matches:
+                            file_block = [f"\n{rel_path}"]
+                            for m in matches:
+                                file_block.append(f"  - {m}")
+                            
+                            block_str = "\n".join(file_block)
+                            if total_chars + len(block_str) > MAX_SKELETON_CHARS:
+                                skeleton.append("\n... [Skeleton truncated: Use <expand_dir> or @filename for more detail]")
+                                return "\n".join(skeleton)
+                                
+                            skeleton.append(block_str)
+                            total_chars += len(block_str)
+                except Exception:
+                    continue
+                    
+    return "\n".join(skeleton)
+
+
+def _parse_file_mentions(text: str, project_dir: str) -> str:
+    """Detects @filename mentions and reads their content."""
+    mentions = re.findall(r"@([a-zA-Z0-9_\-\./\\]+\.[a-zA-Z0-9]+)", text)
+    if not mentions:
+        return ""
+        
+    context_blocks = ["\n[REQUESTED FILE CONTENT]"]
+    for filename in mentions:
+        # Search for file in project_dir
+        found_path = None
+        for root, _, files in os.walk(project_dir):
+            if filename in files:
+                found_path = os.path.join(root, filename)
+                break
+            # Check for partial path matches (e.g. @src/main.py)
+            normalized_target = filename.replace('\\', '/')
+            for f in files:
+                rel = os.path.relpath(os.path.join(root, f), project_dir).replace('\\', '/')
+                if rel == normalized_target or rel.endswith("/" + normalized_target):
+                    found_path = os.path.join(root, f)
+                    break
+            if found_path: break
+            
+        if found_path:
+            try:
+                with open(found_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                    # No truncation for explicit @mentions as per plan
+                    context_blocks.append(f'\n<file name="{os.path.relpath(found_path, project_dir)}">\n{content}\n</file>')
+            except Exception as e:
+                context_blocks.append(f"\n[Error reading {filename}: {e}]")
+                
+    return "\n".join(context_blocks) if len(context_blocks) > 1 else ""
+
+
+def _handle_clone_command(messages: list) -> str:
+    """Handles !clone command by cloning the repo into the conversation project directory."""
+    try:
+        last_msg = messages[-1].get("content", "").strip()
+        parts = last_msg.split()
+        repo_url = None
+        kb_url = None
+        
+        for i, part in enumerate(parts):
+            if part.startswith("http") or part.startswith("git@"):
+                if i > 0 and parts[i-1] == "--kb":
+                    kb_url = part
+                elif repo_url is None:
+                    repo_url = part
+            elif part == "--repo" and i + 1 < len(parts):
+                repo_url = parts[i+1]
+                
+        # Resolve target_dir
+        repo_url_provided = repo_url is not None
+        bound_dir = _get_bound_project_dir(messages)
+        
+        target_dir = None
+        repo_name = "project"
+        
+        if repo_url_provided:
+            repo_name = repo_url.rstrip('/').split('/')[-1].replace('.git', '')
+            prefix = repo_name[:60]
+            conv_id = mover.get_conversation_id(messages)
+            target_dir = os.path.join("conversations", f"{prefix}_{conv_id}")
+        elif bound_dir:
+            target_dir = bound_dir
+            repo_name = os.path.basename(bound_dir).split('_')[0]
+        else:
+            return "❌ **Clone Failed:** No repository URL provided and no existing project is bound."
+
+        if os.path.exists(target_dir):
+            if not kb_url:
+                return f"✅ **Project Bound:** `{repo_name}` is already linked to this conversation."
+            
+            # If KB is provided, check if we need to clone it
+            kb_dir = os.path.join(target_dir, ".knowledge_base")
+            if os.path.exists(kb_dir):
+                return f"✅ **Project & KB Bound:** `{repo_name}` is already linked with its knowledge base."
+            
+            logger.info(f"Existing project found, but KB is missing. Cloning KB from {kb_url}...")
+            subprocess.run(["git", "clone", kb_url, kb_dir], check=True, capture_output=True)
+            return f"✅ **Linked Knowledge Base:** Added `.knowledge_base/` to existing project `{repo_name}`."
+            
+        subprocess.run(["git", "clone", repo_url, target_dir], check=True, capture_output=True)
+        
+        msg = f"✅ **Cloned Repository:** `{repo_name}` into bound conversation folder.\n"
+        
+        if kb_url:
+            kb_dir = os.path.join(target_dir, ".knowledge_base")
+            subprocess.run(["git", "clone", kb_url, kb_dir], check=True, capture_output=True)
+            msg += f"✅ **Linked Knowledge Base:** Cloned into `.knowledge_base/`.\n"
+            
+        # Get pruned directory tree
+        tree_cmd = ["tree", target_dir, "-L", "3", "-I", "node_modules|.git|venv|.venv|__pycache__|dist|build|public|.knowledge_base"]
+        try:
+            tree_output = subprocess.check_output(tree_cmd, text=True, stderr=subprocess.DEVNULL)
+            msg += f"\n**Directory Structure:**\n```\n{tree_output}\n```"
+        except Exception:
+            pass
+            
+        return msg
+        
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Failed to clone: {e.stderr.decode('utf-8', errors='ignore') if e.stderr else e}")
+        return f"❌ **Clone Failed:** Process error occurred."
+    except Exception as e:
+        return f"❌ **Error during clone:** {e}"
+
+
 def _trigger_build_pipeline(messages: list) -> str:
     """
     Orchestrates the build pipeline:
@@ -633,21 +1069,37 @@ def _trigger_build_pipeline(messages: list) -> str:
     3. Launches the cline-builder Docker container.
     """
     try:
-        # 1. Extract files via mover
+        # 1. Handle direct cloning if repo info is provided in the build command
+        last_msg = messages[-1].get("content", "").strip()
+        if "--repo" in last_msg or "http" in last_msg or "git@" in last_msg:
+            logger.info("Direct repo/kb info detected in !build command. Triggering clone sync...")
+            clone_status = _handle_clone_command(messages)
+            if "❌" in clone_status:
+                return clone_status
+
+        # 2. Extract files via mover
         # This creates the project folder in ./conversations/
         status_msg = mover.handle_move(messages)
+        target_dir = None
         if "No code snippets" in status_msg:
-            return f"⚠️ **Build aborted.** {status_msg}"
+            # Check if we already have a bound project
+            bound_dir = _get_bound_project_dir(messages)
+            if bound_dir:
+                logger.info(f"No snippets found, but project is bound to {bound_dir}. Proceeding with build.")
+                target_dir = bound_dir
+            else:
+                return f"⚠️ **Build aborted.** {status_msg}"
+        else:
+            # Extract target_dir from the mover's response
+            match = re.search(r"to `([^`]+)`", status_msg)
+            if not match:
+                # Check if mover returned an explicit error
+                if "Error" in status_msg:
+                    return f"❌ **Build Aborted.** {status_msg}"
+                return f"❌ **Critical Error:** Failed to determine workspace path. {status_msg}"
+            target_dir = match.group(1)
 
-        # Extract target_dir from the mover's response
-        match = re.search(r"to `([^`]+)`", status_msg)
-        if not match:
-            # Check if mover returned an explicit error
-            if "Error" in status_msg:
-                return f"❌ **Build Aborted.** {status_msg}"
-            return f"❌ **Critical Error:** Failed to determine workspace path. {status_msg}"
-        
-        target_dir = match.group(1)
+        # We already have target_dir from above
         abs_target_dir = os.path.abspath(target_dir)
         
         # Create context directory
@@ -683,12 +1135,38 @@ def _trigger_build_pipeline(messages: list) -> str:
             f"- **Container:** `{container_name}`\n"
             f"- **Mode:** Autonomous\n"
             f"- **Status:** Distillation started... Cline will follow.\n\n"
-            f"Check logs with: `docker logs {container_name}`"
+            f"Check logs with: `docker logs -f {container_name}`\n"
+            f"*Tip: You can also type `!logs` to view them in chat, or ask me for build insights!*"
         )
 
     except Exception as e:
         logger.error(f"Failed to trigger build: {e}")
         return f"❌ **Build Trigger Failed:** {e}"
+
+
+def _check_build_logs() -> str:
+    """Fetches the latest logs from the active or most recent build pipeline."""
+    try:
+        cmd = "docker ps -a --filter name=cline-builder --format '{{.Names}}' | head -n 1"
+        container_name = subprocess.check_output(cmd, shell=True, text=True).strip()
+        
+        if not container_name:
+            return "📭 **No build pipelines found.**"
+        
+        logs_cmd = ["docker", "logs", "--tail", "50", container_name]
+        result = subprocess.run(logs_cmd, capture_output=True, text=True)
+        
+        logs_output = (result.stdout + "\n" + result.stderr).strip()
+        
+        if not logs_output:
+            logs_output = "[No logs generated yet or container is empty]"
+            
+        if len(logs_output) > 3000:
+            logs_output = "... [truncated]\n" + logs_output[-3000:]
+            
+        return f"📜 **Latest logs for `{container_name}`:**\n```text\n{logs_output}\n```"
+    except Exception as e:
+        return f"❌ **Failed to fetch logs:** {e}"
 
 
 def _check_build_status() -> str:
