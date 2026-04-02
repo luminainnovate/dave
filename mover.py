@@ -21,7 +21,8 @@ def sanitize_path(path: str) -> str:
     # Normpath to resolve any internal . or ..
     # Then split and filter to ensure no component is '..'
     parts = os.path.normpath(path).split(os.sep)
-    safe_parts = [p for p in parts if p and p != '..' and p != '.']
+    # Truncate each component to a safe maximum length (e.g., 60 chars)
+    safe_parts = [p[:60].strip() for p in parts if p and p != '..' and p != '.']
     
     return os.path.join(*safe_parts) if safe_parts else ""
 
@@ -50,7 +51,11 @@ def parse_tree_structure(text: str) -> List[str]:
     if first_branch_idx > 0:
         potential_root = lines[first_branch_idx - 1].strip()
         potential_root = potential_root.split('#')[0].strip().strip('/')
-        if potential_root and not any(sym in potential_root for sym in branch_symbols + ["│", "|"]):
+        # Strict validation for root: not too long, not many spaces (sentences)
+        if (potential_root and 
+            len(potential_root) < 64 and 
+            potential_root.count(' ') < 4 and
+            not any(sym in potential_root for sym in branch_symbols + ["│", "|"])):
             stack = [potential_root]
             paths.append(potential_root)
 
@@ -74,13 +79,21 @@ def parse_tree_structure(text: str) -> List[str]:
             # 2. Establish the base index to handle arbitrary block indentations
             if base_idx == -1:
                 base_idx = symbol_idx
+                # Check the PRIOR line for a new independent root if the stack is currently confused
+                if i > 0:
+                    prev_line = lines[i-1].strip().split('#')[0].strip().strip('/')
+                    if prev_line and not any(s in prev_line for s in branch_symbols + ["│", "|"]):
+                        if prev_line.count(' ') < 4 and len(prev_line) < 64:
+                            stack = [prev_line]
+                            paths.append(prev_line)
                 
             relative_idx = symbol_idx - base_idx
             
-            # Failsafe: if a second tree has less indent, recalibrate
+            # Failsafe: if a second tree has less indent, recalibrate and reset stack
             if relative_idx < 0:
                 base_idx = symbol_idx
                 relative_idx = 0
+                stack = [] # Reset stack for a new tree
                 
             depth = (relative_idx // 4) + 1 if stack else relative_idx // 4
             
@@ -98,16 +111,10 @@ def parse_tree_structure(text: str) -> List[str]:
         else:
             # Reset base_idx so the next tree in the chat calibrates properly
             base_idx = -1 
-            
-            if i < first_branch_idx or first_branch_idx == -1:
-                stripped = line.strip()
-                if "/" in stripped and not any(c in stripped for c in ["├", "─", "└", "│", "|"]):
-                    name = stripped.strip('/')
-                    if name:
-                        stack = [name]
-                        paths.append(name)
+            # If we hit a very low indentation line that looks like a possible root, 
+            # we don't reset stack immediately but we prepare for one if base_idx is -1.
     
-    return list(set(paths))
+    return list(dict.fromkeys(paths))
 
 def extract_path_from_content(content: str) -> Optional[str]:
     """
@@ -134,19 +141,23 @@ def extract_snippets(messages: list) -> tuple[Dict[str, str], Optional[str]]:
     known_paths = []
     suggested_root = None
     
-    # 1. First pass: Parse all directory trees from EVERY message role
-    for msg in messages:
+    # 1. First pass: Parse ONLY the latest directory tree from assistant messages
+    for msg in reversed(messages):
+        if msg.get("role") != "assistant":
+            continue
         content = msg.get("content", "")
         if any(c in content for c in ["├──", "└──", "├─", "└─"]):
             tree_paths = parse_tree_structure(content)
-            known_paths.extend(tree_paths)
             if tree_paths:
+                known_paths = tree_paths
                 # Root is the shortest path in the tree that has 0 or 1 segments
+                # We take the LAST root found in the message (latest tree)
                 roots = [p for p in tree_paths if '/' not in p]
                 if roots:
-                    suggested_root = roots[0]
-                elif not suggested_root:
-                    suggested_root = tree_paths[0].split('/')[0]
+                    suggested_root = roots[-1]
+                else:
+                    suggested_root = tree_paths[-1].split('/')[0]
+                break # Prioritize the latest tree structure
 
     # 2. Second pass: Extract code blocks
     code_block_re = re.compile(r"```(?P<lang>[\w+#\-]+)?(?P<header>[^\n]*)\n(?P<content>.*?)```", re.DOTALL)
@@ -285,6 +296,7 @@ def handle_move(messages: list) -> str:
                             prefix = simplified
                         break
         
+        prefix = (suggested_root or prefix)[:60].strip()
         target_dir = os.path.join("conversations", f"{prefix}_{conv_id}")
         
         # --- Safety Check for Autonomous Projects ---
@@ -304,20 +316,27 @@ def handle_move(messages: list) -> str:
         skipped_count = 0
         
         for rel_path, content in snippets.items():
-            abs_path = os.path.join(target_dir, rel_path)
-            os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-            
-            if os.path.exists(abs_path):
-                with open(abs_path, "r", encoding="utf-8") as f:
-                    if f.read() == content:
-                        skipped_count += 1
-                        continue
-            
-            with open(abs_path, "w", encoding="utf-8") as f:
-                f.write(content)
-            saved_count += 1
+            try:
+                abs_path = os.path.join(target_dir, rel_path)
+                os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+                
+                if os.path.exists(abs_path):
+                    with open(abs_path, "r", encoding="utf-8") as f:
+                        if f.read() == content:
+                            skipped_count += 1
+                            continue
+                
+                with open(abs_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                saved_count += 1
+            except OSError as e:
+                logger.error(f"Failed to save {rel_path}: {e}")
+                skipped_count += 1
+                continue
             
         try:
+            # Ensure target_dir exists even if no files were saved
+            os.makedirs(target_dir, exist_ok=True)
             subprocess.run(["code", "."], cwd=target_dir, check=True, capture_output=True)
             vscode_msg = "Opened folder in VS Code."
         except Exception as e:
