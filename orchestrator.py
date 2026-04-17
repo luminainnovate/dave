@@ -846,7 +846,8 @@ async def _handle_agentic_request(body: dict, project_dir: str, target_path: str
                 # unless we do ONE more call with stream=True or just return the one-shot.
                 # Given the complexity, returning the one-shot is safer.
                 data["model"] = "Bob"
-                if "id" in data: data["id"] = "chatcmpl-Bob"
+                if "id" in data:
+                    data["id"] = "chatcmpl-Bob"
                 return JSONResponse(content=data)
             
             # Execute tools and append results
@@ -857,8 +858,10 @@ async def _handle_agentic_request(body: dict, project_dir: str, target_path: str
                 name = func.get("name")
                 args = func.get("arguments", {})
                 if isinstance(args, str):
-                    try: args = json.loads(args)
-                    except: args = {}
+                    try:
+                        args = json.loads(args)
+                    except Exception:
+                        args = {}
                 
                 logger.info(f"Executing Tool: {name}({args})")
                 result = _execute_tool(name, args, project_dir)
@@ -973,7 +976,8 @@ def _parse_file_mentions(text: str, project_dir: str) -> str:
                 if rel == normalized_target or rel.endswith("/" + normalized_target):
                     found_path = os.path.join(root, f)
                     break
-            if found_path: break
+            if found_path:
+                break
             
         if found_path:
             try:
@@ -1042,7 +1046,7 @@ def _handle_clone_command(messages: list) -> str:
         if kb_url:
             kb_dir = os.path.join(target_dir, ".knowledge_base")
             subprocess.run(["git", "clone", kb_url, kb_dir], check=True, capture_output=True)
-            msg += f"✅ **Linked Knowledge Base:** Cloned into `.knowledge_base/`.\n"
+            msg += "✅ **Linked Knowledge Base:** Cloned into `.knowledge_base/`.\n"
             
         # Get pruned directory tree
         tree_cmd = ["tree", target_dir, "-L", "3", "-I", "node_modules|.git|venv|.venv|__pycache__|dist|build|public|.knowledge_base"]
@@ -1056,7 +1060,7 @@ def _handle_clone_command(messages: list) -> str:
         
     except subprocess.CalledProcessError as e:
         logger.error(f"Failed to clone: {e.stderr.decode('utf-8', errors='ignore') if e.stderr else e}")
-        return f"❌ **Clone Failed:** Process error occurred."
+        return "❌ **Clone Failed:** Process error occurred."
     except Exception as e:
         return f"❌ **Error during clone:** {e}"
 
