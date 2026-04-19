@@ -36,6 +36,20 @@ The system operates on an intelligent **GPU Mutex** principle managed by the **O
 
 ---
 
+### 🚀 Universal Scale: The 256k Context Milestone
+
+For users with an **NVIDIA RTX 4090 (24GB VRAM)**, br.ai.n has been optimized to support massive context windows that allow for the ingestion of entire repositories.
+
+#### How it works:
+1. **Model:** We utilize MoE architectures like `Qwen 3.6 35B A3B` (GGUF).
+2. **KV Quantization:** By forcing `--cache-type-k q8_0` and `--cache-type-v q8_0`, we halve the memory footprint of the conversation history.
+3. **Flash Attention:** Mandatory for stability and speed at scales above 64k.
+4. **Managed Slots:** The orchestrator forces `-np 1` to ensure all 24GB is dedicated to a single, deep reasoning process.
+
+**Result:** You can fit a **fully offloaded 35B model** with a **256,144 token context window** in ~21.1GB of VRAM, leaving room for the resident router and OS overhead.
+
+---
+
 ## 🏭 Automated Software Factory
 
 Bob isn't just a chatbot; Bob is a fully autonomous software factory. By combining tiered orchestration with a dedicated build pipeline, you can turn ideas into full projects without manual intervention.
@@ -95,38 +109,223 @@ A high-level overview of the **br.ai.n** workspace and its core components:
 
 ## ⚙️ Model & Agent Configuration
 
-You can fully customize Bob's brain by editing the configuration files. This allows you to swap models, tune agent behavior, and set operational limits.
+Bob supports **three LLM backends** — you can mix and match them per model role. This means your Expert can run on Ollama while a stubborn model runs on llama.cpp, all sharing one GPU lock.
 
-### 🧠 Orchestrator (`orchestrator.py`)
-At the top of `orchestrator.py`, you can define the core models used for triage and expert tasks, also the build pipelines context windows:
+| Provider | How It Works | Best For |
+|----------|-------------|----------|
+| **Ollama** | Native model management, auto-loads on request | Daily driver, widest model library |
+| **LM Studio** | Managed via `lms` CLI, OpenAI-compatible API | GUI users, easy model browsing |
+| **llama.cpp** | Orchestrator spawns `llama-server` on demand | HuggingFace models, raw GGUF files, stubborn models |
+
+---
+
+### 🔧 Provider Setup
+
+Before configuring models, ensure the provider you want to use is installed:
+
+<details>
+<summary><b>Ollama</b> (Default — already installed if you ran setup)</summary>
+
+```bash
+# Install (if not already)
+curl -fsSL https://ollama.com/install.sh | sh
+
+# Pull a model
+ollama pull gemma4:26b
+
+# Verify it's running
+curl http://localhost:11434/api/tags
+```
+- **Default port:** `11434`
+- **API format:** Ollama native + OpenAI-compatible (`/v1/chat/completions`)
+- **Model management:** Automatic (loads on first request, unloads via `keep_alive`)
+</details>
+
+<details>
+<summary><b>LM Studio</b></summary>
+
+```bash
+# Install LM Studio from https://lmstudio.ai
+# Then bootstrap the CLI:
+~/.lmstudio/bin/lms bootstrap
+
+# Verify CLI is working
+lms status
+
+# Start the local server (or use the GUI)
+lms server start
+```
+- **Default port:** `1234`
+- **API format:** OpenAI-compatible (`/v1/chat/completions`)
+- **Model management:** Via `lms load <model>` / `lms unload <model>` (orchestrator handles this automatically)
+
+> [!NOTE]
+> The model name in your config must match the identifier shown in `lms ls`. LM Studio uses its own naming convention (e.g., `lmstudio-community/qwen2.5-32b-GGUF`).
+</details>
+
+<details>
+<summary><b>llama.cpp</b></summary>
+
+```bash
+# Option 1: Install from package manager
+# Ubuntu/Debian:
+sudo apt install llama.cpp
+
+# Option 2: Build from source (recommended for GPU support)
+git clone https://github.com/ggml-org/llama.cpp
+cd llama.cpp
+cmake -B build -DGGML_CUDA=ON
+cmake --build build --config Release -j$(nproc)
+sudo cp build/bin/llama-server /usr/local/bin/
+
+# Verify installation
+llama-server --help
+```
+- **Default port:** `8080` (configurable per model)
+- **API format:** OpenAI-compatible (`/v1/chat/completions`)
+- **Model management:** Orchestrator spawns/kills `llama-server` processes automatically
+- **HuggingFace support:** Use `-hf` flag syntax in model names (e.g., `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q3_K_XL`)
+
+> [!TIP]
+> You do NOT need to start `llama-server` manually. The orchestrator manages the process lifecycle — it starts the server when the model is needed and stops it when switching to another model.
+</details>
+
+---
+
+### 🧠 Orchestrator Models (`orchestrator.py`)
+
+At the top of `orchestrator.py`, configure which model and provider to use for the **Expert** (complex tasks) and **Router** (triage):
 
 ```python
-EXPERT_MODEL = "qwen3.5:27b"  # The heavy-lifting reasoning model
-ROUTER_MODEL = "qwen2.5:1.5b" # The resident triage model
-EXPERT_CTX = 16384           # Context window for expert tasks
-DISTILL_CTX = 16384          # Context for the distillation engine (Thinking)
-CLINE_CTX = 32768            # Context for the Cline agent (Building)
-```
-
-### 🏗️ Build Pipeline (`cline-builder/agent_config.json`)
-The autonomous factory is highly configurable. You can specify different models for each agent and tune their system prompts.
-
-#### 1. Model Selection
-Define which model each agent in the pipeline should use:
-```json
-"models": {
-    "architect": "qwen3.5:27b",
-    "engineer": "qwen3.5:27b",
-    "test_engineer": "qwen3.5:27b",
-    "safety": "qwen3.5:27b",
-    "cline": "glm-4.7-flash:latest"
+# --- STRICT MODEL CONFIG ---
+EXPERT_CONFIG = {
+    "model": "gemma4:26b",        # Model name (Ollama tag, LMS identifier, or HF repo)
+    "provider": "ollama",          # "ollama", "lmstudio", or "llamacpp"
+    "base_url": "http://localhost:11434",  # API endpoint
+}
+ROUTER_CONFIG = {
+    "model": "qwen2.5:1.5b",
+    "provider": "ollama",
+    "base_url": "http://localhost:11434",
 }
 ```
 
-#### 2. System Prompts & Logic
+#### Example: Expert on llama.cpp with a HuggingFace model
+
+```python
+EXPERT_CONFIG = {
+    "model": "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q3_K_XL",
+    "provider": "llamacpp",
+    "base_url": "http://localhost:8080",
+}
+```
+
+The orchestrator will automatically:
+1. Start `llama-server` with the `-hf` flag pointing to the HuggingFace repo
+2. Wait for the server to download and load the model (up to 2 minutes)
+3. Route all Expert requests to `http://localhost:8080/v1/chat/completions`
+4. Kill the process when switching to another model
+
+#### Example: Expert on LM Studio
+
+```python
+EXPERT_CONFIG = {
+    "model": "lmstudio-community/qwen2.5-32b-GGUF",
+    "provider": "lmstudio",
+    "base_url": "http://localhost:1234",
+}
+```
+
+The orchestrator will call `lms load <model>` before inference and `lms unload` when switching.
+
+#### llama.cpp Advanced Settings
+
+```python
+# Path to llama-server binary (if not in /usr/local/bin/)
+LLAMACPP_BINARY = "/usr/local/bin/llama-server"
+
+# Default GPU layer count (99 = offload all layers to GPU)
+LLAMACPP_DEFAULT_ARGS = ["-ngl", "99"]
+```
+
+You can also add per-model args in the config dict:
+
+```python
+EXPERT_CONFIG = {
+    "model": "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q3_K_XL",
+    "provider": "llamacpp",
+    "base_url": "http://localhost:8080",
+    "args": ["-ngl", "99", "-fa"],  # Extra CLI flags
+}
+```
+
+#### Context Windows
+
+```python
+EXPERT_CTX = 24576   # Context window for expert chat tasks
+DISTILL_CTX = 32768  # Context for the distillation engine (Thinking)
+CLINE_CTX = 32768    # Context for the Cline agent (Building)
+```
+
+---
+
+### 🏗️ Build Pipeline (`cline-builder/agent_config.json`)
+
+The autonomous factory supports the same multi-provider system. Each agent in the pipeline can use a different backend:
+
+#### Per-Model Provider Config (Recommended)
+
+```json
+{
+    "models": {
+        "architect": {
+            "model": "gemma4:26b",
+            "provider": "ollama",
+            "base_url": "http://host.docker.internal:11434"
+        },
+        "engineer": {
+            "model": "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q3_K_XL",
+            "provider": "llamacpp",
+            "base_url": "http://host.docker.internal:8080"
+        },
+        "test_engineer": {
+            "model": "gemma4:26b",
+            "provider": "ollama",
+            "base_url": "http://host.docker.internal:11434"
+        },
+        "safety": {
+            "model": "gemma4:26b",
+            "provider": "ollama",
+            "base_url": "http://host.docker.internal:11434"
+        },
+        "cline": {
+            "model": "Qwen3.6-35B-Q3-unsloth:latest",
+            "provider": "ollama",
+            "base_url": "http://host.docker.internal:11434"
+        }
+    },
+    "ollama_host": "http://host.docker.internal:11434"
+}
+```
+
+> [!IMPORTANT]
+> The build pipeline runs inside Docker. Use `host.docker.internal` instead of `localhost` for all `base_url` values so the container can reach the host machine's LLM backends.
+
+#### Legacy String Format (Still Works)
+
+For backward compatibility, simple strings still work and default to Ollama:
+
+```json
+"models": {
+    "architect": "gemma4:26b",
+    "engineer": "Qwen3.6-35B-Q3-unsloth:latest"
+}
+```
+
+#### System Prompts & Logic
 Tune the behavior of each agent by editing the prompts in the `cline-builder/distill.py`. This allows you to define strict rules, output formats, and operational constraints for the Architect, Engineer, and other expert roles. From `cline-builder/entrypoint.sh` you can configure the Cline's part of the pipeline like the task prompts etc.
 
-#### 3. Rounds & Limits
+#### Rounds & Limits
 Control the depth of the build process and safety guardrails:
 -   **max_build_iterations**: The number of **rounds** (4-pass cycles) the pipeline will attempt to complete the project.
 -   **cline_max_turns**: The maximum number of tool calls the Cline agent can make per round.
@@ -139,6 +338,37 @@ Control the depth of the build process and safety guardrails:
     "cline_max_turns": 30
 }
 ```
+
+---
+
+### 🔀 Quick Reference: Switching Providers
+
+Here's a cheat sheet for common scenarios:
+
+| Scenario | Where to Edit | What to Change |
+|----------|---------------|----------------|
+| Change Expert model (same provider) | `orchestrator.py` | `EXPERT_CONFIG["model"]` |
+| Move Expert to llama.cpp | `orchestrator.py` | Set `provider: "llamacpp"`, update `base_url` |
+| Move Expert to LM Studio | `orchestrator.py` | Set `provider: "lmstudio"`, update `base_url` |
+| Change a build agent's model | `agent_config.json` | Update the agent's object entry |
+| Run build agent on llama.cpp | `agent_config.json` | Set `provider: "llamacpp"` + `base_url` |
+| Use a HuggingFace model directly | Any config | Set `model` to `org/repo:quantization` with `provider: "llamacpp"` |
+
+> [!NOTE]
+> **Hot-Swapping Experts:** You can change `EXPERT_CONFIG` at the top of `orchestrator.py` at any time. If you use a model other than the default (`qwen3.5:27b`), the system will automatically bypass custom sampling parameters (temperature, penalties) and use that model's native default settings.
+
+---
+
+### 🐛 Troubleshooting Providers
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `llama-server: command not found` | Binary not installed or not in PATH | Set `LLAMACPP_BINARY` to the full path |
+| `lms: command not found` | LM Studio CLI not bootstrapped | Run `~/.lmstudio/bin/lms bootstrap` |
+| `Connection refused` on non-Ollama port | Server not started | For llama.cpp: orchestrator starts it automatically. For LM Studio: run `lms server start` |
+| Model loads but inference is garbled | Wrong model format for provider | Ollama needs Ollama-format models. llama.cpp needs GGUF files. |
+| Docker container can't reach backend | Using `localhost` in `agent_config.json` | Use `host.docker.internal` instead |
+| VRAM conflict between providers | Two models loaded simultaneously | Check that only one model is active — the shared GPU lock should prevent this |
 
 ---
 

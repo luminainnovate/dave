@@ -19,6 +19,7 @@ import threading
 
 # --- Configuration ---
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://host.docker.internal:11434")
+ORCHESTRATOR_URL = os.environ.get("ORCHESTRATOR_URL", "http://host.docker.internal:8000")
 CONFIG_PATH = os.environ.get("AGENT_CONFIG_PATH", "/app/agent_config.json")
 CONVERSATION_PATH = os.environ.get("CONVERSATION_FILE", "/workspace/.cline_context/conversation.json")
 OUTPUT_PATH = os.environ.get("CLINERULES_PATH", "/workspace/.clinerules")
@@ -59,6 +60,23 @@ def conversation_to_text(messages: list) -> str:
     return "\n\n---\n\n".join(parts)
 
 
+def _resolve_model_config(model_entry, default_host: str = None) -> dict:
+    """
+    Resolve a model entry from config into a normalized dict.
+    Supports both legacy string format and new object format.
+    """
+    if default_host is None:
+        default_host = OLLAMA_HOST
+    if isinstance(model_entry, str):
+        return {"model": model_entry, "provider": "ollama", "base_url": default_host}
+    return {
+        "model": model_entry.get("model", ""),
+        "provider": model_entry.get("provider", "ollama"),
+        "base_url": model_entry.get("base_url", default_host),
+        "args": model_entry.get("args", []),
+    }
+
+
 def chunk_text(text: str, max_tokens: int) -> list[str]:
     """
     Split text into chunks that fit within the token budget.
@@ -96,24 +114,41 @@ def chunk_text(text: str, max_tokens: int) -> list[str]:
     return chunks
 
 
-def unload_model(client: httpx.Client, model_name: str):
-    """Ask Ollama to unload a model from VRAM."""
+def unload_model(client: httpx.Client, model_config: dict):
+    """
+    Unload a model from VRAM using the appropriate provider method.
+    For Ollama: direct API call. For others: calls the orchestrator management API.
+    """
+    model_name = model_config.get("model", "") if isinstance(model_config, dict) else model_config
+    provider = model_config.get("provider", "ollama") if isinstance(model_config, dict) else "ollama"
+    base_url = model_config.get("base_url", OLLAMA_HOST) if isinstance(model_config, dict) else OLLAMA_HOST
+
     try:
-        client.post(
-            f"{OLLAMA_HOST}/api/generate",
-            json={"model": model_name, "keep_alive": 0},
-            timeout=10.0
-        )
-        print(f"  ↳ Unloaded model: {model_name}")
+        if provider == "ollama":
+            client.post(
+                f"{base_url}/api/generate",
+                json={"model": model_name, "keep_alive": 0},
+                timeout=10.0
+            )
+            print(f"  ↳ Unloaded model (Ollama): {model_name}")
+        else:
+            # Non-Ollama: call the orchestrator's management API
+            client.post(
+                f"{ORCHESTRATOR_URL}/internal/model/unload",
+                json=model_config if isinstance(model_config, dict) else {"model": model_config, "provider": "ollama"},
+                timeout=30.0
+            )
+            print(f"  ↳ Unloaded model ({provider}): {model_name}")
         time.sleep(1)
     except Exception as e:
         print(f"  ⚠ Failed to unload {model_name}: {e}")
 
 
-def call_llm(client: httpx.Client, model: str, system_prompt: str, user_content: str, prior_context: str = "") -> str:
+def call_llm(client: httpx.Client, model_config, system_prompt: str, user_content: str, prior_context: str = "") -> str:
     """
-    Send a synchronous chat completion request to Ollama.
+    Send a synchronous chat completion request to the configured provider.
     Uses generic extraction prompts for chunks to prevent template deadlocks.
+    Accepts model_config as either a string (legacy Ollama) or a dict with provider info.
     """
     prior_tokens = len(prior_context) // CHARS_PER_TOKEN
     available_tokens = CONTEXT_WINDOW - RESERVED_TOKENS - prior_tokens
@@ -133,7 +168,7 @@ def call_llm(client: httpx.Client, model: str, system_prompt: str, user_content:
         full_input += f"### CURRENT TASK\n{user_content}"
         
         print(f"    ↳ Preparing Single-pass (Ingesting {len(full_input)} chars)...", flush=True)
-        return _single_llm_call(client, model, system_prompt, full_input)
+        return _single_llm_call(client, model_config, system_prompt, full_input)
 
     print(f"    ↳ Processing into {len(chunks)} parts...", flush=True)
     partial_results = []
@@ -160,7 +195,7 @@ def call_llm(client: httpx.Client, model: str, system_prompt: str, user_content:
         
         print(f"    ↳ Preparing {part_label} (Payload: {len(chunk_prompt)} chars)...", flush=True)
         # Use the relaxed prompt for the chunks
-        result = _single_llm_call(client, model, relaxed_chunk_system_prompt, chunk_prompt, part_label)
+        result = _single_llm_call(client, model_config, relaxed_chunk_system_prompt, chunk_prompt, part_label)
         partial_results.append(result)
 
     print("    ↳ All parts finished. Starting Merge Pass...", flush=True)
@@ -177,7 +212,7 @@ def call_llm(client: httpx.Client, model: str, system_prompt: str, user_content:
                 f"Consolidate these extracted facts into a concise summary. "
                 f"Remove duplicates. Keep only unique technical requirements.\n\n{bucket_text}"
             )
-            result = _single_llm_call(client, model,
+            result = _single_llm_call(client, model_config,
                 "You are a technical summarizer. Output concise bullet points only.",
                 consolidation_prompt, f"Consolidation {bi+1}/{len(buckets)}")
             consolidated.append(result)
@@ -195,85 +230,146 @@ def call_llm(client: httpx.Client, model: str, system_prompt: str, user_content:
         merge_prompt += f"#### EXTRACTED FACTS (PART {i + 1})\n{part}\n\n"
 
     # Use the REAL system prompt here
-    return _single_llm_call(client, model, system_prompt, merge_prompt, "Merging Parts")
+    return _single_llm_call(client, model_config, system_prompt, merge_prompt, "Merging Parts")
 
 
-def _single_llm_call(client: httpx.Client, model: str, system_prompt: str, user_content: str, label: str = "Inference") -> str:
-    """Execute a single LLM API call with streaming for live feedback."""
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content}
-        ],
-        "stream": True,
-        "options": {
-            "num_ctx": CONTEXT_WINDOW,
+def _single_llm_call(client: httpx.Client, model_config, system_prompt: str, user_content: str, label: str = "Inference") -> str:
+    """
+    Execute a single LLM API call with streaming for live feedback.
+    Supports both Ollama native and OpenAI-compatible streaming formats.
+
+    Args:
+        model_config: Either a string (model name, Ollama) or a dict with provider info.
+    """
+    # Normalize config
+    if isinstance(model_config, str):
+        cfg = {"model": model_config, "provider": "ollama", "base_url": OLLAMA_HOST}
+    else:
+        cfg = model_config
+
+    model_name = cfg.get("model", "")
+    provider = cfg.get("provider", "ollama")
+    base_url = cfg.get("base_url", OLLAMA_HOST)
+    is_ollama = provider == "ollama"
+
+    if is_ollama:
+        payload = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content}
+            ],
+            "stream": True,
+            "options": {
+                "num_ctx": CONTEXT_WINDOW,
+                "temperature": 0.3,
+            },
+            "keep_alive": "3m"
+        }
+        url = f"{base_url}/api/chat"
+    else:
+        payload = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content}
+            ],
+            "stream": True,
             "temperature": 0.3,
-        },
-        "keep_alive": "3m"
-    }
+        }
+        url = f"{base_url}/v1/chat/completions"
 
-    first_token_received = threading.Event()
-    
-    def heartbeat():
-        start_wait = time.time()
-        while not first_token_received.is_set():
-            time.sleep(5)
-            if not first_token_received.is_set():
-                elapsed = int(time.time() - start_wait)
-                # Improved heartbeat to show exactly how long it's taking
-                print(f"      ↳ [Waiting for LLM... {elapsed}s]", flush=True)
-
-    heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
-    heartbeat_thread.start()
-
-    try:
-        full_response = []
-        print(f"    {label:15} [Generating...]\n    ↳ ", end="", flush=True)
-        start_time = time.time()
+    max_retries = 3
+    for attempt in range(max_retries):
+        first_token_received = threading.Event()
         
-        with httpx.Client() as stream_client:
-            with stream_client.stream("POST", f"{OLLAMA_HOST}/api/chat", json=payload, timeout=600.0) as resp:
-                if resp.status_code != 200:
-                    first_token_received.set()
-                    print("\n  ✗ LLM returned status", resp.status_code)
-                    return f"[ERROR: LLM returned status {resp.status_code}]"
-                
-                dot_count = 0
-                for line in resp.iter_lines():
-                    if not line:
-                        continue
-                    
-                    if not first_token_received.is_set():
+        def heartbeat():
+            start_wait = time.time()
+            while not first_token_received.is_set():
+                time.sleep(5)
+                if not first_token_received.is_set():
+                    elapsed = int(time.time() - start_wait)
+                    print(f"      ↳ [Waiting for LLM... {elapsed}s]", flush=True)
+
+        heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
+        heartbeat_thread.start()
+
+        try:
+            full_response = []
+            print(f"    {label:15} [Generating...]\n    ↳ ", end="", flush=True)
+            start_time = time.time()
+            
+            with httpx.Client() as stream_client:
+                with stream_client.stream("POST", url, json=payload, timeout=600.0) as resp:
+                    if resp.status_code == 503:
                         first_token_received.set()
+                        print(f"\n  ⚠ Orchestrator is busy (503). Retrying in 10s... (Attempt {attempt+1}/{max_retries})")
+                        time.sleep(10)
+                        continue
 
-                    chunk_data = json.loads(line)
-                    # Check for actual text vs blank token hallucination
-                    token = chunk_data.get("message", {}).get("content", "")
-                    if token:
-                        full_response.append(token)
-                        dot_count += 1
-                        if dot_count % 20 == 0:
-                            print(".", end="", flush=True)
-                        if dot_count % 1000 == 0:
-                            print(f"({dot_count})", end="", flush=True)
+                    if resp.status_code != 200:
+                        first_token_received.set()
+                        print("\n  ✗ LLM returned status", resp.status_code)
+                        # Read error if possible
+                        try:
+                            err_body = resp.read().decode()
+                            print(f"    Error: {err_body[:200]}")
+                        except: pass
+                        return f"[ERROR: LLM returned status {resp.status_code}]"
                     
-                    if chunk_data.get("done"):
-                        break
-        
-        elapsed = time.time() - start_time
-        print(f" ✓ ({elapsed:.1f}s)", flush=True)
-        return "".join(full_response)
+                    dot_count = 0
+                    for line in resp.iter_lines():
+                        if not line:
+                            continue
+                        
+                        if not first_token_received.is_set():
+                            first_token_received.set()
 
-    except httpx.TimeoutException:
-        first_token_received.set()
-        print("\n  ✗ LLM request timed out (600s)")
-        return "[ERROR: Request timed out]"
-    except Exception as e:
-        first_token_received.set()
-        print(f"\n  ✗ LLM request failed: {e}")
-        return f"[ERROR: {e}]"
+                        if is_ollama:
+                            chunk_data = json.loads(line)
+                            token = chunk_data.get("message", {}).get("content", "")
+                            done = chunk_data.get("done", False)
+                        else:
+                            if not line.startswith("data: "):
+                                continue
+                            if line == "data: [DONE]":
+                                break
+                            chunk_data = json.loads(line[6:])
+                            choices = chunk_data.get("choices", [{}])
+                            token = choices[0].get("delta", {}).get("content", "") if choices else ""
+                            done = choices[0].get("finish_reason") is not None if choices else False
+
+                        if token:
+                            full_response.append(token)
+                            dot_count += 1
+                            if dot_count % 20 == 0:
+                                print(".", end="", flush=True)
+                        
+                        if done:
+                            break
+            
+            elapsed = time.time() - start_time
+            print(f" ✓ ({elapsed:.1f}s)", flush=True)
+            return "".join(full_response)
+
+        except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as e:
+            first_token_received.set()
+            # If we get a 'Server disconnected' or 'Remote protocol error', it's often transient
+            is_reset = "RemoteProtocolError" in str(type(e)) or "disconnected" in str(e).lower()
+            
+            if attempt < max_retries - 1:
+                wait_time = 10 if is_reset else 5
+                print(f"\n  ⚠ Network/Protocol error: {e}. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+                continue
+            print(f"\n  ❌ LLM request failed after {max_retries} attempts: {e}")
+            return f"[ERROR: {e}]"
+        except Exception as e:
+            first_token_received.set()
+            print(f"\n  ❌ Unexpected error: {e}")
+            return f"[ERROR: {e}]"
+
+    return "[ERROR: Max retries exceeded]"
 
 
 def update_status(status: str):
@@ -626,7 +722,7 @@ def run_distillation():
     ]
 
     results = {}
-    previous_model = None
+    previous_model_config = None
 
     with httpx.Client() as client:
         for pass_key, pass_label in passes:
@@ -634,12 +730,39 @@ def run_distillation():
             print("-" * 40, flush=True)
             update_status(f"Distilling: {pass_label}")
 
-            model = models.get(pass_key, models.get("architect"))
+            model_entry = models.get(pass_key, models.get("architect"))
+            model_config = _resolve_model_config(model_entry)
+            model_name = model_config.get("model", "")
             prompt = prompts.get(pass_key, "Analyze the following conversation.")
 
-            if previous_model and previous_model != model:
-                print(f"  ↳ Switching model: {previous_model} → {model}")
-                unload_model(client, previous_model)
+            # Check if we need to switch models (compare by model name)
+            prev_name = previous_model_config.get("model", "") if previous_model_config else None
+            if prev_name and prev_name != model_name:
+                print(f"  ↳ Switching model: {prev_name} → {model_name} ({model_config.get('provider', 'ollama')})")
+                unload_model(client, previous_model_config)
+
+            # Pre-load non-Ollama models via orchestrator
+            if model_config.get("provider", "ollama") != "ollama":
+                max_retries = 2
+                for attempt in range(max_retries):
+                    try:
+                        print(f"  ↳ Pre-loading model ({model_config.get('provider')}): {model_name} (Attempt {attempt+1}/{max_retries})")
+                        # Pass ctx_size so orchestrator spawns llama-server with correct -c flag
+                        load_payload = {**model_config, "ctx_size": CONTEXT_WINDOW}
+                        client.post(
+                            f"{ORCHESTRATOR_URL}/internal/model/load",
+                            json=load_payload,
+                            timeout=120.0
+                        )
+                        break # Success
+                    except Exception as e:
+                        if attempt < max_retries - 1:
+                            print(f"  ⚠ Pre-load retryable error: {e}. Retrying in 5s...")
+                            time.sleep(5)
+                        else:
+                            print(f"  ❌ Pre-load failed after {max_retries} attempts: {e}")
+                            if "101" in str(e) or "Network is unreachable" in str(e):
+                                print("    TIP: This usually means the host orchestrator is restarting the model. Check orchestrator.log on host.")
 
             prior_context = ""
             if results:
@@ -654,9 +777,9 @@ def run_distillation():
                 # Passes 3 and 4 only read the previous plans. They do not get chunked!
                 target_content = "Review the PREVIOUS ANALYSES provided above based strictly on your system role and required template format. Do not invent new features or write source code."
 
-            result = call_llm(client, model, prompt, target_content, prior_context)
+            result = call_llm(client, model_config, prompt, target_content, prior_context)
             results[pass_key] = result
-            previous_model = model
+            previous_model_config = model_config
             print(f"  ✓ Complete ({len(result)} chars)")
 
             intermediate_path = f"/workspace/.cline_context/distill_{pass_key}.md"
@@ -669,8 +792,10 @@ def run_distillation():
             except Exception as e:
                 print(f"  ⚠ Failed to save intermediate result: {e}")
 
-        if previous_model:
-            unload_model(client, previous_model)
+        # We no longer unload the model at the end of distillation.
+        # This keeps it 'warm' for Phase 2 (the Cline Build cycle).
+        # if previous_model_config:
+        #     unload_model(client, previous_model_config)
 
     print(f"\n📝 Writing {OUTPUT_PATH}", flush=True)
     update_status("Assembling .clinerules...")

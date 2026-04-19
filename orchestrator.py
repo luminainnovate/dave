@@ -7,6 +7,7 @@ import re
 import subprocess
 import time
 from contextlib import asynccontextmanager
+from urllib.parse import urlparse
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from typing import Optional
@@ -19,14 +20,32 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(level
 logger = logging.getLogger("Bob-Orchestrator")
 
 # --- STRICT MODEL CONFIG ---
-EXPERT_MODEL = "gemma4:26b"  # Switch this to any model
-ROUTER_MODEL = "qwen2.5:1.5b"     # Switch this if you want to change your default router model (This is the model that decides which model to use)
+# Each model role is a dict: model name, provider type, and API base URL.
+# Supported providers: "ollama", "lmstudio", "llamacpp"
+EXPERT_CONFIG = {
+    "model": "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q3_K_XL",
+    "provider": "llamacpp",
+    "base_url": "http://localhost:8081",
+}
+ROUTER_CONFIG = {
+    "model": "qwen2.5:1.5b",
+    "provider": "ollama",
+    "base_url": "http://localhost:11434",
+}
+
+# Shorthand names (derived from config, used in routing logic throughout)
+EXPERT_MODEL = EXPERT_CONFIG["model"]
+ROUTER_MODEL = ROUTER_CONFIG["model"]
 DEFAULT_EXPERT_MODEL = "qwen3.5:27b" # Keep this as default, if you know what youre doing, you can change it with the PARAMS_GENERAL/PARAMS_CODING
-OLLAMA_URL = "http://localhost:11434"
+
+# llama.cpp managed process settings (only used when provider is "llamacpp")
+LLAMACPP_BINARY = "/usr/local/bin/llama-server"  # Path to llama-server binary
+LLAMACPP_DEFAULT_ARGS = ["--no-cg", "--cache-type-k", "q8_0", "--cache-type-v", "q8_0", "--flash-attn"]  # Extra CLI args (KV Quant + FA enabled)
+
 COMFYUI_URL = "http://localhost:8188"
-EXPERT_CTX = 24576   # Context for the expert model
-DISTILL_CTX = 32768  # Context for the distillation engine (Thinking)
-CLINE_CTX = 32768    # Context for the Cline agent (Building)
+EXPERT_CTX = 262144   # Context for the expert model (128k)
+DISTILL_CTX = 262144  # Context for the distillation engine (128k)
+CLINE_CTX = 262144    # Context for the Cline agent (128k)
 
 # --- STATE MANAGEMENT ---
 gpu_lock = asyncio.Lock()
@@ -55,6 +74,235 @@ PARAMS_CODING = {
     "repeat_penalty": 1.0,
 }
 
+# =============================================================================
+# PROVIDER MANAGEMENT
+# =============================================================================
+# Tracks managed llama-server subprocesses keyed by model name.
+_managed_processes: dict[str, subprocess.Popen] = {}
+# Locks to prevent multiple concurrent startups of the same llama-server.
+_llamacpp_locks: dict[str, asyncio.Lock] = {}
+# Events to signal when a llama-server is healthy and ready for requests.
+_llamacpp_ready_events: dict[str, asyncio.Event] = {}
+# Debounce timer for !build commands to prevent duplicate triggers from client retries.
+_last_build_trigger_time = 0.0
+
+
+def _resolve_config(model_name: str) -> dict:
+    """Resolve a model name to its full provider configuration."""
+    if model_name == EXPERT_MODEL:
+        return EXPERT_CONFIG
+    elif model_name == ROUTER_MODEL:
+        return ROUTER_CONFIG
+    # Fallback: assume Ollama on default port
+    return {"model": model_name, "provider": "ollama", "base_url": "http://localhost:11434"}
+
+
+def _is_ollama_provider(config: dict) -> bool:
+    """Check if a model config uses the Ollama provider."""
+    return config.get("provider", "ollama") == "ollama"
+
+
+def _get_base_url(config: dict) -> str:
+    """Get the API base URL from a model config."""
+    return config.get("base_url", "http://localhost:11434")
+
+
+def _get_chat_url(config: dict, prefer_native: bool = False) -> str:
+    """
+    Get the full chat endpoint URL for a provider.
+    Ollama supports both /api/chat (native) and /v1/chat/completions.
+    All other providers use /v1/chat/completions exclusively.
+    """
+    base = _get_base_url(config)
+    if _is_ollama_provider(config) and prefer_native:
+        return f"{base}/api/chat"
+    return f"{base}/v1/chat/completions"
+
+
+def _adapt_body(body: dict, config: dict) -> dict:
+    """
+    Adapt an Ollama-format request body for the target provider.
+    Ollama uses an 'options' dict; OpenAI-compatible providers use top-level params.
+    Returns the body unchanged for Ollama, or a translated copy for others.
+    """
+    if _is_ollama_provider(config):
+        return body
+
+    adapted = {
+        "model": body.get("model", config.get("model", "")),
+        "messages": body.get("messages", []),
+        "stream": body.get("stream", True),
+    }
+
+    # Map Ollama `options` to top-level OpenAI parameters
+    options = body.get("options", {})
+    for key in ("temperature", "top_p", "presence_penalty", "frequency_penalty"):
+        if key in options:
+            adapted[key] = options[key]
+
+    if body.get("format") == "json":
+        adapted["response_format"] = {"type": "json_object"}
+
+    if "tools" in body:
+        adapted["tools"] = body["tools"]
+
+    return adapted
+
+
+def _docker_to_host_url(url: str) -> str:
+    """Convert Docker container URLs to host-accessible URLs."""
+    return url.replace("host.docker.internal", "localhost")
+
+
+async def _provider_load(config: dict):
+    """Ensure a model is loaded and ready for its provider."""
+    provider = config.get("provider", "ollama")
+    model = config.get("model", "")
+
+    if provider == "ollama":
+        return  # Ollama auto-loads on first request
+
+    elif provider == "lmstudio":
+        try:
+            logger.info(f"LM Studio: Loading {model}...")
+            proc = await asyncio.create_subprocess_exec(
+                "lms", "load", model, "-y",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode == 0:
+                logger.info(f"LM Studio: Loaded {model}")
+            else:
+                logger.warning(f"LM Studio: Load may have failed: {stderr.decode().strip()}")
+        except FileNotFoundError:
+            logger.error("LM Studio: 'lms' CLI not found. Install with: ~/.lmstudio/bin/lms bootstrap")
+        except Exception as e:
+            logger.error(f"LM Studio: Load error: {e}")
+
+    elif provider == "llamacpp":
+        await _start_llamacpp_server(config)
+
+
+async def _start_llamacpp_server(config: dict):
+    """Start a managed llama-server process and wait for readiness."""
+    model = config.get("model", "")
+    if not model:
+        return
+
+    # Ensure state exists for this model
+    if model not in _llamacpp_locks:
+        _llamacpp_locks[model] = asyncio.Lock()
+    if model not in _llamacpp_ready_events:
+        _llamacpp_ready_events[model] = asyncio.Event()
+
+    # Get the ready event early
+    ready_event = _llamacpp_ready_events[model]
+
+    async with _llamacpp_locks[model]:
+        # Check if already running or starting
+        if model in _managed_processes:
+            proc = _managed_processes[model]
+            if proc.poll() is None:
+                # Still alive. Is it ready?
+                if ready_event.is_set():
+                    logger.info(f"llama.cpp: {model} is already running and ready.")
+                    return
+                else:
+                    logger.info(f"llama.cpp: {model} is already starting. Waiting for readiness...")
+            else:
+                logger.info(f"llama.cpp: Previous process for {model} died. Restarting...")
+                del _managed_processes[model]
+                ready_event.clear()
+
+        # Parse config for startup
+        base_url = config.get("base_url", "http://localhost:8081")
+        extra_args = list(config.get("args", LLAMACPP_DEFAULT_ARGS))
+        binary = config.get("binary_path", LLAMACPP_BINARY)
+
+        # Parse host/port from base_url
+        parsed = urlparse(base_url)
+        port = str(parsed.port or 8081)
+        host = parsed.hostname or "127.0.0.1"
+
+        # Context window: use config override, or fall back to EXPERT_CTX
+        ctx_size = str(config.get("ctx_size", EXPERT_CTX))
+
+        # Context rotation: llama-server natively supports sliding window truncation
+        # Increase to 0.9 to keep more history and avoid the agent 'forgetting' phase 1 results.
+        truncate_args = ["--chat-truncate", "--chat-truncate-max-keep", "0.9"]
+
+        # Build command: detect HuggingFace repo vs local path
+        if "/" in model and not os.path.exists(model):
+            cmd = [binary, "-hf", model, "--host", host, "--port", port, "-c", ctx_size, "-np", "1"] + truncate_args + extra_args
+        else:
+            cmd = [binary, "-m", model, "--host", host, "--port", port, "-c", ctx_size, "-np", "1"] + truncate_args + extra_args
+
+        if model not in _managed_processes:
+            logger.info(f"llama.cpp: Starting: {' '.join(cmd)}")
+            ready_event.clear()
+            
+            # Force Flash Attention ON to save VRAM and improve speed at 128k context
+            env = os.environ.copy()
+            env["LLAMA_ARG_FLASH_ATTN"] = "on"
+            
+            log_file = open("llama-server.log", "a")
+            proc = subprocess.Popen(cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT)
+            _managed_processes[model] = proc
+            
+            # Start background health-check task
+            asyncio.create_task(_poll_llamacpp_health(model, base_url, ready_event))
+
+    # Wait for the background task to signal readiness
+    # This happens OUTSIDE the lock, so other requests can enter and 'wait' for the same event
+    try:
+        await asyncio.wait_for(ready_event.wait(), timeout=120.0)
+        logger.info(f"llama.cpp: {model} is confirmed ready.")
+    except asyncio.TimeoutError:
+        logger.error(f"llama.cpp: Timeout waiting for {model} readiness.")
+        raise Exception(f"Model startup timed out: {model}")
+
+
+async def _poll_llamacpp_health(model: str, base_url: str, ready_event: asyncio.Event):
+    """Background task to poll a model's health and signal readiness."""
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        # Verify the process is still running
+        if model in _managed_processes:
+            proc = _managed_processes[model]
+            if proc.poll() is not None:
+                logger.error(f"llama.cpp: Process for {model} died during startup (code {proc.returncode})")
+                return
+
+        try:
+            resp = await http_client.get(f"{base_url}/health", timeout=2.0)
+            if resp.status_code == 200:
+                logger.info(f"llama.cpp: Background health-check passed for {model}")
+                ready_event.set()
+                return
+        except Exception:
+            pass
+        await asyncio.sleep(2.0)
+    
+    logger.error(f"llama.cpp: Background health-check TIMED OUT for {model}")
+
+
+async def _stop_llamacpp_server(config: dict):
+    """Stop a managed llama-server process and free its resources."""
+    model = config.get("model", "")
+    if model in _managed_processes:
+        proc = _managed_processes[model]
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+            logger.info(f"llama.cpp: Stopped {model}")
+        del _managed_processes[model]
+
+
 # --- LIFESPAN ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -82,50 +330,119 @@ app = FastAPI(title="Bob: AI Workspace Orchestrator", lifespan=lifespan)
 # =============================================================================
 
 async def get_loaded_models() -> list[str]:
-    """Queries the Ollama API to identify models currently residing in VRAM."""
-    try:
-        resp = await http_client.get(f"{OLLAMA_URL}/api/ps", timeout=2.0)
-        if resp.status_code == 200:
-            models = resp.json().get("models", [])
-            return [m.get("name", "") for m in models]
-    except Exception:
-        pass
-    return []
+    """Queries all configured providers to identify models currently in VRAM."""
+    loaded = []
+    checked_ollama_urls = set()
+
+    for cfg in [EXPERT_CONFIG, ROUTER_CONFIG]:
+        provider = cfg.get("provider", "ollama")
+        base_url = _get_base_url(cfg)
+
+        if provider == "ollama" and base_url not in checked_ollama_urls:
+            checked_ollama_urls.add(base_url)
+            try:
+                resp = await http_client.get(f"{base_url}/api/ps", timeout=2.0)
+                if resp.status_code == 200:
+                    models = resp.json().get("models", [])
+                    loaded.extend([m.get("name", "") for m in models])
+            except Exception:
+                pass
+
+        elif provider == "lmstudio":
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "lms", "ps",
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                )
+                stdout, _ = await proc.communicate()
+                if cfg["model"] in stdout.decode():
+                    loaded.append(cfg["model"])
+            except Exception:
+                pass
+
+    # Check managed llama.cpp processes
+    for model_name, proc in list(_managed_processes.items()):
+        if proc.poll() is None:
+            loaded.append(model_name)
+        else:
+            del _managed_processes[model_name]
+
+    return loaded
 
 async def force_unload(model_name: str):
     """
-    Directly requests Ollama to unload the specified model from VRAM.
-    Uses a minimal request payload to ensure high reliability.
+    Unloads a model using the appropriate provider method.
+    Resolves the provider from the model name automatically.
     """
+    config = _resolve_config(model_name)
+    provider = config.get("provider", "ollama")
+    base_url = _get_base_url(config)
+
     try:
-        logger.info(f"Unloading model: {model_name}")
-        await http_client.post(
-            f"{OLLAMA_URL}/api/generate",
-            json={"model": model_name, "keep_alive": 0},
-            timeout=5.0
-        )
+        if provider == "ollama":
+            logger.info(f"Unloading model (Ollama): {model_name}")
+            await http_client.post(
+                f"{base_url}/api/generate",
+                json={"model": model_name, "keep_alive": 0},
+                timeout=5.0
+            )
+        elif provider == "lmstudio":
+            logger.info(f"Unloading model (LM Studio): {model_name}")
+            proc = await asyncio.create_subprocess_exec(
+                "lms", "unload", model_name,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            await proc.communicate()
+        elif provider == "llamacpp":
+            logger.info(f"Unloading model (llama.cpp): {model_name}")
+            await _stop_llamacpp_server(config)
     except Exception as e:
         logger.warning(f"Failed to unload {model_name}: {e}")
 
 async def verified_unload(model_name: str, max_wait: float = 3.0):
     """
     Attempts to unload a model and verifies its removal through short polling.
+    For non-Ollama providers, unloads directly without polling.
     """
-    loaded = await get_loaded_models()
-    if not any(model_name in m for m in loaded):
+    config = _resolve_config(model_name)
+    provider = config.get("provider", "ollama")
+
+    if provider == "ollama":
+        base_url = _get_base_url(config)
+        # Check if currently loaded
+        try:
+            resp = await http_client.get(f"{base_url}/api/ps", timeout=2.0)
+            if resp.status_code == 200:
+                models = resp.json().get("models", [])
+                names = [m.get("name", "") for m in models]
+                if not any(model_name in m for m in names):
+                    return True
+        except Exception:
+            pass
+
+        await force_unload(model_name)
+
+        # Poll for removal
+        deadline = time.time() + max_wait
+        while time.time() < deadline:
+            await asyncio.sleep(0.4)
+            try:
+                resp = await http_client.get(f"{base_url}/api/ps", timeout=2.0)
+                if resp.status_code == 200:
+                    models = resp.json().get("models", [])
+                    names = [m.get("name", "") for m in models]
+                    if not any(model_name in m for m in names):
+                        return True
+            except Exception:
+                pass
+
+        logger.warning(f"{model_name} persistent in VRAM after {max_wait}s; continuing.")
+        return False
+    else:
+        # Non-Ollama: unload and trust it worked
+        await force_unload(model_name)
+        await asyncio.sleep(0.5)
         return True
-
-    await force_unload(model_name)
-
-    deadline = time.time() + max_wait
-    while time.time() < deadline:
-        await asyncio.sleep(0.4)
-        loaded = await get_loaded_models()
-        if not any(model_name in m for m in loaded):
-            return True
-
-    logger.warning(f"{model_name} persistent in VRAM after {max_wait}s; continuing.")
-    return False
 
 
 async def sweep_vram_for_expert():
@@ -213,22 +530,43 @@ async def analyze_request(messages: list) -> dict:
         "Respond ONLY in pure JSON format: {\"complexity\": <int>, \"expect_followups\": <bool>, \"requires_tool\": <bool>, \"is_coding\": <bool>}"
     )
 
-    payload = {
-        "model": ROUTER_MODEL,
-        "format": "json",
-        "messages": [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": context_text[:1000]}
-        ],
-        "stream": False,
-        "keep_alive": 0,
-        "options": {"temperature": 0.0, "num_ctx": 2048}
-    }
+    router_config = _resolve_config(ROUTER_MODEL)
+
+    if _is_ollama_provider(router_config):
+        payload = {
+            "model": ROUTER_MODEL,
+            "format": "json",
+            "messages": [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": context_text[:1000]}
+            ],
+            "stream": False,
+            "keep_alive": 0,
+            "options": {"temperature": 0.0, "num_ctx": 2048}
+        }
+        url = f"{_get_base_url(router_config)}/api/chat"
+    else:
+        payload = {
+            "model": ROUTER_MODEL,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": context_text[:1000]}
+            ],
+            "stream": False,
+            "temperature": 0.0,
+        }
+        url = f"{_get_base_url(router_config)}/v1/chat/completions"
 
     try:
-        resp = await http_client.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=10.0)
+        await _provider_load(router_config)
+        resp = await http_client.post(url, json=payload, timeout=10.0)
         if resp.status_code == 200:
-            content = resp.json().get("message", {}).get("content", "{}")
+            resp_data = resp.json()
+            if _is_ollama_provider(router_config):
+                content = resp_data.get("message", {}).get("content", "{}")
+            else:
+                content = resp_data.get("choices", [{}])[0].get("message", {}).get("content", "{}")
             data = json.loads(content)
             return {
                 "complexity": int(data.get("complexity", 1)),
@@ -245,9 +583,15 @@ async def analyze_request(messages: list) -> dict:
 # STREAMING
 # =============================================================================
 
-async def stream_proxy(url: str, body: dict, lock: asyncio.Lock, is_native: bool = False):
+async def stream_proxy(url: str, body: dict, lock: asyncio.Lock,
+                       is_native: bool = False, backend_is_ollama: bool = True):
     """
     Proxies a streaming response from the backend AI model while managing VRAM locks.
+    Handles format translation between Ollama and OpenAI-compatible backends/clients.
+
+    Args:
+        is_native: True if the CLIENT expects Ollama-native format.
+        backend_is_ollama: True if the BACKEND sends Ollama-native format.
     """
     lock_released = False
 
@@ -260,17 +604,34 @@ async def stream_proxy(url: str, body: dict, lock: asyncio.Lock, is_native: bool
             except RuntimeError:
                 pass
 
+    # Backend sends native Ollama line-JSON only when both backend is Ollama AND
+    # the URL targets /api/chat (indicated by the client requesting native format).
+    backend_sends_native = backend_is_ollama and is_native
+
     try:
         async with http_client.stream("POST", url, json=body, timeout=600.0) as resp:
             if resp.status_code != 200:
-                yield b"ERROR: Backend unavailable"
+                # Read the error for better diagnostics
+                error_body = ""
+                async for chunk in resp.aiter_bytes():
+                    error_body += chunk.decode("utf-8", errors="ignore")
+                error_msg = error_body[:200].strip() or "Backend unavailable"
+                logger.error(f"Backend error ({resp.status_code}): {error_body[:500]}")
+                if is_native:
+                    yield f'{json.dumps({"model": "Bob", "message": {"role": "assistant", "content": f"⚠️ {error_msg}"}, "done": True})}\n'.encode('utf-8')
+                else:
+                    chunk_data = {"id": "chatcmpl-Bob", "object": "chat.completion.chunk", "model": "Bob",
+                                  "choices": [{"index": 0, "delta": {"content": f"⚠️ {error_msg}"}, "finish_reason": "stop"}]}
+                    yield f"data: {json.dumps(chunk_data)}\n\n".encode('utf-8')
+                    yield b"data: [DONE]\n\n"
                 return
 
             async for line in resp.aiter_lines():
                 if not line:
                     continue
 
-                if is_native:
+                if backend_sends_native:
+                    # Path 1: Ollama backend → Native client (direct proxy)
                     try:
                         data = json.loads(line)
                         data["model"] = "Bob"
@@ -278,23 +639,50 @@ async def stream_proxy(url: str, body: dict, lock: asyncio.Lock, is_native: bool
                     except Exception:
                         yield f"{line}\n".encode('utf-8')
                 else:
-                    if line.startswith("data: "):
-                        if line == "data: [DONE]":
+                    # Backend sends OpenAI SSE format (data: {json})
+                    if not line.startswith("data: "):
+                        continue
+                    if line == "data: [DONE]":
+                        if is_native:
+                            # Emit Ollama-format done signal
+                            yield f'{json.dumps({"model": "Bob", "message": {"role": "assistant", "content": ""}, "done": True})}\n'.encode('utf-8')
+                        else:
                             yield b"data: [DONE]\n\n"
-                            continue
-                        try:
-                            data = json.loads(line[6:])
-                            data["model"] = "Bob"
-                            if "id" in data:
-                                data["id"] = "chatcmpl-Bob"
+                        continue
+                    try:
+                        data = json.loads(line[6:])
+                        data["model"] = "Bob"
+                        if "id" in data:
+                            data["id"] = "chatcmpl-Bob"
+
+                        if is_native:
+                            # Path 2: OpenAI backend → Native client (translate)
+                            token = ""
+                            done = False
+                            if "choices" in data and data["choices"]:
+                                choice = data["choices"][0]
+                                token = choice.get("delta", {}).get("content", "")
+                                done = choice.get("finish_reason") is not None
+                            ollama_chunk = {
+                                "model": "Bob",
+                                "message": {"role": "assistant", "content": token},
+                                "done": done
+                            }
+                            yield f"{json.dumps(ollama_chunk)}\n".encode('utf-8')
+                        else:
+                            # Path 3: OpenAI backend → OpenAI client (direct proxy)
                             yield f"data: {json.dumps(data)}\n\n".encode('utf-8')
-                        except (Exception, json.JSONDecodeError):
-                            rewritten = re.sub(r'("model"\s*:\s*")[^"]+(")', r'\1Bob\2', line)
-                            yield f"{rewritten}\n\n".encode('utf-8')
+                    except (Exception, json.JSONDecodeError):
+                        rewritten = re.sub(r'("model"\s*:\s*")[^"]+(")', r'\1Bob\2', line)
+                        yield f"{rewritten}\n\n".encode('utf-8')
     except (GeneratorExit, asyncio.CancelledError):
         pass
     except Exception as e:
-        logger.error(f"Stream Error: {e}")
+        logger.error(f"Stream proxy error: {e}")
+        if is_native:
+            yield f'{json.dumps({"model": "Bob", "message": {"role": "assistant", "content": f"⚠️ Error: {str(e)}"}, "done": True})}\n'.encode('utf-8')
+        else:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n".encode('utf-8')
     finally:
         _release()
 
@@ -491,7 +879,8 @@ async def proxy_ollama(request: Request):
 
     # 4. Request Orchestration
     try:
-        await asyncio.wait_for(gpu_lock.acquire(), timeout=120.0)
+        # Increase timeout to 5 minutes to accommodate 35B model context processing
+        await asyncio.wait_for(gpu_lock.acquire(), timeout=300.0)
     except asyncio.TimeoutError:
         return JSONResponse(status_code=503, content={"error": "The orchestrator is busy."})
 
@@ -644,6 +1033,14 @@ async def proxy_ollama(request: Request):
         if target_model == EXPERT_MODEL and is_cold_expert:
             await sweep_vram_for_expert()
 
+        # --- Resolve Provider Config ---
+        target_config = _resolve_config(target_model)
+        target_is_ollama = _is_ollama_provider(target_config)
+
+        # Pre-load non-Ollama providers (Ollama auto-loads on request)
+        if not target_is_ollama and (is_cold_expert or target_model != EXPERT_MODEL):
+            await _provider_load(target_config)
+
         # --- Payload Config ---
         options = body.get("options", {})
         if is_background_task:
@@ -664,15 +1061,22 @@ async def proxy_ollama(request: Request):
         body.update({"model": target_model, "keep_alive": keep_alive, "options": options})
         if tools:
             body["tools"] = tools
-        logger.info(f"Executing {target_model} (ctx: {options['num_ctx']}, warm: {not is_cold_expert}, tools: {bool(tools)})")
+        logger.info(f"Executing {target_model} (ctx: {options['num_ctx']}, warm: {not is_cold_expert}, tools: {bool(tools)}, provider: {target_config.get('provider', 'ollama')})")
 
-        target_path = "/api/chat" if is_native else "/v1/chat/completions"
+        # --- Compute Target URL ---
+        if target_is_ollama:
+            target_url = f"{_get_base_url(target_config)}{'/api/chat' if is_native else '/v1/chat/completions'}"
+        else:
+            target_url = f"{_get_base_url(target_config)}/v1/chat/completions"
+
+        # --- Adapt body for provider ---
+        dispatch_body = _adapt_body(body, target_config)
 
         if tools:
             # Shift to the Agentic Loop handler
             # This will release the lock internally when finished
             try:
-                return await _handle_agentic_request(body, project_dir, target_path, is_native, gpu_lock)
+                return await _handle_agentic_request(dispatch_body, project_dir, target_url, is_native, gpu_lock, target_is_ollama)
             finally:
                 if lock_held:
                     gpu_lock.release()
@@ -680,13 +1084,30 @@ async def proxy_ollama(request: Request):
 
         if not is_streaming:
             try:
-                resp = await http_client.post(f"{OLLAMA_URL}{target_path}", json=body, timeout=600.0)
+                resp = await http_client.post(target_url, json=dispatch_body, timeout=600.0)
                 if resp.status_code != 200:
-                    return JSONResponse(status_code=resp.status_code, content={"error": "Inference failed."})
+                    error_text = ""
+                    try:
+                        error_text = resp.text[:300]
+                    except Exception:
+                        pass
+                    logger.error(f"Inference failed ({resp.status_code}): {error_text}")
+                    return JSONResponse(status_code=resp.status_code, content={"error": f"Inference failed: {error_text or 'unknown error'}"})
                 data = resp.json()
-                data["model"] = "Bob"
-                if "id" in data:
-                    data["id"] = "chatcmpl-Bob"
+
+                # Translate response format if needed
+                if not target_is_ollama and is_native:
+                    # OpenAI response → Ollama native format
+                    choice = data.get("choices", [{}])[0]
+                    data = {
+                        "model": "Bob",
+                        "message": choice.get("message", {"role": "assistant", "content": ""}),
+                        "done": True
+                    }
+                else:
+                    data["model"] = "Bob"
+                    if "id" in data:
+                        data["id"] = "chatcmpl-Bob"
                 return JSONResponse(content=data)
             finally:
                 if lock_held:
@@ -695,7 +1116,8 @@ async def proxy_ollama(request: Request):
 
         lock_held = False
         return StreamingResponse(
-            stream_proxy(f"{OLLAMA_URL}{target_path}", body, gpu_lock, is_native=is_native),
+            stream_proxy(target_url, dispatch_body, gpu_lock,
+                         is_native=is_native, backend_is_ollama=target_is_ollama),
             media_type="application/x-ndjson" if is_native else "text/event-stream"
         )
     except Exception as e:
@@ -813,7 +1235,8 @@ def _execute_tool(name: str, args: dict, project_dir: str) -> str:
     return f"Error: Unknown tool `{name}`"
 
 
-async def _handle_agentic_request(body: dict, project_dir: str, target_path: str, is_native: bool, lock: asyncio.Lock):
+async def _handle_agentic_request(body: dict, project_dir: str, target_url: str,
+                                  is_native: bool, lock: asyncio.Lock, backend_is_ollama: bool = True):
     """
     Handles a tool-enabled request by recursively executing tools and re-running the LLM.
     Returns the final response (one-shot or stream).
@@ -822,6 +1245,8 @@ async def _handle_agentic_request(body: dict, project_dir: str, target_path: str
     current_hops = 0
     
     original_messages = body.get("messages", [])
+    # For response parsing: native Ollama format only when backend is Ollama AND client is native
+    response_is_native = backend_is_ollama and is_native
     
     while current_hops < MAX_HOPS:
         current_hops += 1
@@ -832,22 +1257,28 @@ async def _handle_agentic_request(body: dict, project_dir: str, target_path: str
         temp_body["stream"] = False
         
         try:
-            resp = await http_client.post(f"{OLLAMA_URL}{target_path}", json=temp_body, timeout=600.0)
+            resp = await http_client.post(target_url, json=temp_body, timeout=600.0)
             if resp.status_code != 200:
                 return JSONResponse(status_code=resp.status_code, content={"error": "Agentic inference failed."})
                 
             data = resp.json()
-            message = data.get("message", {}) if is_native else data.get("choices", [{}])[0].get("message", {})
+            message = data.get("message", {}) if response_is_native else data.get("choices", [{}])[0].get("message", {})
             
             tool_calls = message.get("tool_calls", [])
             if not tool_calls:
                 # No more tools, this is the final answer
-                # If the user originally wanted a stream, we can't easily convert this one-shot back to a stream 
-                # unless we do ONE more call with stream=True or just return the one-shot.
-                # Given the complexity, returning the one-shot is safer.
-                data["model"] = "Bob"
-                if "id" in data:
-                    data["id"] = "chatcmpl-Bob"
+                if not backend_is_ollama and is_native:
+                    # Translate OpenAI response to Ollama native
+                    choice = data.get("choices", [{}])[0]
+                    data = {
+                        "model": "Bob",
+                        "message": choice.get("message", {"role": "assistant", "content": ""}),
+                        "done": True
+                    }
+                else:
+                    data["model"] = "Bob"
+                    if "id" in data:
+                        data["id"] = "chatcmpl-Bob"
                 return JSONResponse(content=data)
             
             # Execute tools and append results
@@ -871,7 +1302,7 @@ async def _handle_agentic_request(body: dict, project_dir: str, target_path: str
                     "name": name,
                     "content": result,
                     "tool_call_id": tc.get("id", f"call_{int(time.time())}")
-                } if not is_native else {
+                } if response_is_native else {
                     "role": "tool",
                     "content": result
                 }
@@ -884,6 +1315,61 @@ async def _handle_agentic_request(body: dict, project_dir: str, target_path: str
             break
             
     return JSONResponse(status_code=500, content={"error": "Agentic loop exceeded max hops or failed."})
+
+
+# =============================================================================
+# INTERNAL MANAGEMENT API (used by distill.py inside Docker containers)
+# =============================================================================
+
+@app.post("/internal/model/load")
+async def internal_model_load(request: Request):
+    """Load a model for a given provider config. Called by distill.py from inside Docker."""
+    try:
+        config = await request.json()
+        # Translate Docker URLs to host URLs
+        if "base_url" in config:
+            config["base_url"] = _docker_to_host_url(config["base_url"])
+        async with gpu_lock:
+            await _provider_load(config)
+        return JSONResponse(content={"status": "ok"})
+    except Exception as e:
+        logger.error(f"Internal model load failed: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.post("/internal/model/unload")
+async def internal_model_unload(request: Request):
+    """Unload a model for a given provider config. Called by distill.py from inside Docker."""
+    try:
+        config = await request.json()
+        if "base_url" in config:
+            config["base_url"] = _docker_to_host_url(config["base_url"])
+        model_name = config.get("model", "")
+        provider = config.get("provider", "ollama")
+
+        if provider == "ollama":
+            base_url = config.get("base_url", "http://localhost:11434")
+            try:
+                await http_client.post(
+                    f"{base_url}/api/generate",
+                    json={"model": model_name, "keep_alive": 0},
+                    timeout=5.0
+                )
+            except Exception as e:
+                logger.warning(f"Internal Ollama unload failed: {e}")
+        elif provider == "lmstudio":
+            proc = await asyncio.create_subprocess_exec(
+                "lms", "unload", model_name,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            await proc.communicate()
+        elif provider == "llamacpp":
+            await _stop_llamacpp_server(config)
+
+        return JSONResponse(content={"status": "ok"})
+    except Exception as e:
+        logger.error(f"Internal model unload failed: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 
 def _get_bound_project_dir(messages: list) -> Optional[str]:
@@ -1127,6 +1613,7 @@ def _trigger_build_pipeline(messages: list) -> str:
             "-e", f"PROJECT_NAME={project_name}",
             "-e", f"EXPERT_CTX={DISTILL_CTX}",
             "-e", f"CLINE_CTX={CLINE_CTX}",
+            "-e", "ORCHESTRATOR_URL=http://host.docker.internal:8000",
             "cline-builder"
         ]
         
@@ -1212,11 +1699,26 @@ async def _trigger_build_pipeline_safe(messages: list) -> str:
     """
     Triggers the build pipeline while ensuring VRAM is cleared and
     waiting for any active LLM tasks to finish.
+    Includes a cooldown to prevent duplicate triggers from client retries.
     """
+    global _last_build_trigger_time
+    current_time = time.time()
+    if current_time - _last_build_trigger_time < 10:
+        logger.warning("Duplicate build trigger ignored (cooldown).")
+        return "⚠️ **Build already starting.** Please wait a few seconds for the status update."
+    
+    _last_build_trigger_time = current_time
+
     async with gpu_lock:
         logger.info("Acquired GPU lock for pipeline trigger. Clearing VRAM...")
-        # Ensure the expert model is unloaded to free as much VRAM as possible
-        await verified_unload(EXPERT_MODEL)
+        
+        # Don't kill the Expert if it is a managed llama.cpp process
+        # This prevents the 'Network unreachable' error when the container starts
+        expert_cfg = _resolve_config(EXPERT_MODEL)
+        if expert_cfg.get("provider") != "llamacpp":
+            await verified_unload(EXPERT_MODEL)
+            
+        # Router and ComfyUI should always be cleared as they are small/fast to reload
         await verified_unload(ROUTER_MODEL)
         await free_comfyui()
         

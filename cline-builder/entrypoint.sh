@@ -24,7 +24,7 @@ CONFIG_PATH="${AGENT_CONFIG_PATH:-/app/agent_config.json}"
 CONVERSATION_FILE="${CONVERSATION_FILE:-/workspace/.cline_context/conversation.json}"
 CLINERULES_PATH="${CLINERULES_PATH:-/workspace/.clinerules}"
 OLLAMA_HOST="${OLLAMA_HOST:-http://host.docker.internal:11434}"
-CLINE_CTX="${CLINE_CTX:-32768}"
+CLINE_CTX="${CLINE_CTX:-262144}"
 
 echo "========================================"
 echo "🔨 Cline Builder Pipeline"
@@ -97,27 +97,79 @@ if [ ! -f "$CONFIG_PATH" ]; then
     exit 1
 fi
 
-# Wait for Ollama to be reachable (up to 30 seconds)
+# Wait for backend providers to be reachable (up to 30 seconds each)
 echo ""
-echo "🔌 Checking Ollama connectivity..."
-RETRIES=0
-MAX_RETRIES=15
-until curl -sf "${OLLAMA_HOST}/api/tags" > /dev/null 2>&1; do
-    RETRIES=$((RETRIES + 1))
-    if [ $RETRIES -ge $MAX_RETRIES ]; then
-        echo "✗ FATAL: Cannot reach Ollama at ${OLLAMA_HOST} after ${MAX_RETRIES} attempts"
-        exit 1
+echo "🔌 Checking backend connectivity..."
+
+# Extract all unique base_urls from the config (handles both string and object model formats)
+# For string models, the default is ollama_host; for objects, use base_url
+DEFAULT_HOST=$(jq -r '.ollama_host // "http://host.docker.internal:11434"' "$CONFIG_PATH")
+ORCHESTRATOR_URL="${ORCHESTRATOR_URL:-http://host.docker.internal:8000}"
+
+# Get base_urls paired with their provider type (skip llamacpp — orchestrator manages those on demand)
+PROVIDER_URLS=$(jq -r --arg dh "$DEFAULT_HOST" '
+  [.models | to_entries[] | .value |
+    if type == "object" then
+      select(.provider != "llamacpp") | .base_url // $dh
+    else $dh
+    end
+  ] | unique | .[]' "$CONFIG_PATH" 2>/dev/null || echo "$DEFAULT_HOST")
+
+# Check if any models use llamacpp (need orchestrator connectivity instead)
+HAS_LLAMACPP=$(jq -r '[.models | to_entries[] | .value | select(type == "object" and .provider == "llamacpp")] | length' "$CONFIG_PATH" 2>/dev/null || echo "0")
+
+for BASE_URL in $PROVIDER_URLS; do
+    # Determine the health endpoint based on the URL
+    # Ollama uses /api/tags, OpenAI-compatible uses /v1/models
+    HEALTH_URL="${BASE_URL}/api/tags"
+    if [[ "$BASE_URL" != *":11434"* ]]; then
+        HEALTH_URL="${BASE_URL}/v1/models"
     fi
-    echo "  Waiting for Ollama... (${RETRIES}/${MAX_RETRIES})"
-    sleep 2
+
+    echo "  Checking ${BASE_URL}..."
+    RETRIES=0
+    MAX_RETRIES=15
+    until curl -sf "${HEALTH_URL}" > /dev/null 2>&1; do
+        RETRIES=$((RETRIES + 1))
+        if [ $RETRIES -ge $MAX_RETRIES ]; then
+            echo "  ⚠ WARNING: Cannot reach ${BASE_URL} after ${MAX_RETRIES} attempts (continuing anyway)"
+            break
+        fi
+        echo "    Waiting... (${RETRIES}/${MAX_RETRIES})"
+        sleep 2
+    done
+    if [ $RETRIES -lt $MAX_RETRIES ]; then
+        echo "  ✓ ${BASE_URL} is reachable"
+    fi
 done
-echo "  ✓ Ollama is reachable"
+
+# If any models use llamacpp, verify the orchestrator is reachable (it manages llama-server lifecycle)
+if [ "$HAS_LLAMACPP" -gt 0 ]; then
+    echo "  Checking orchestrator (manages llamacpp)..."
+    RETRIES=0
+    MAX_RETRIES=10
+    until curl -sf "${ORCHESTRATOR_URL}/health" > /dev/null 2>&1; do
+        RETRIES=$((RETRIES + 1))
+        if [ $RETRIES -ge $MAX_RETRIES ]; then
+            echo "  ⚠ WARNING: Cannot reach orchestrator at ${ORCHESTRATOR_URL} (llamacpp models may fail)"
+            break
+        fi
+        echo "    Waiting for orchestrator... (${RETRIES}/${MAX_RETRIES})"
+        sleep 2
+    done
+    if [ $RETRIES -lt $MAX_RETRIES ]; then
+        echo "  ✓ Orchestrator reachable (will manage llamacpp on demand)"
+    fi
+fi
 
 # --- Read Config ---
 MAX_SIZE_MB=$(jq -r '.limits.max_project_size_mb // 2048' "$CONFIG_PATH")
 MAX_ITERATIONS=$(jq -r '.limits.max_build_iterations // 3' "$CONFIG_PATH")
 CLINE_MAX_TURNS=$(jq -r '.limits.cline_max_turns // 10' "$CONFIG_PATH")
-CLINE_MODEL=$(jq -r '.models.cline // "qwen3.5:27b"' "$CONFIG_PATH")
+# Extract cline model: handle both string ("model_name") and object ({"model": "..."}) formats
+CLINE_MODEL=$(jq -r 'if (.models.cline | type) == "object" then .models.cline.model else (.models.cline // "qwen3.5:27b") end' "$CONFIG_PATH")
+CLINE_PROVIDER=$(jq -r 'if (.models.cline | type) == "object" then (.models.cline.provider // "ollama") else "ollama" end' "$CONFIG_PATH")
+CLINE_BASE_URL=$(jq -r --arg dh "$DEFAULT_HOST" 'if (.models.cline | type) == "object" then (.models.cline.base_url // $dh) else $dh end' "$CONFIG_PATH")
 CLINE_STARTUP=$(jq -r '.cline_startup_message // "Read .clinerules and execute all tasks."' "$CONFIG_PATH")
 
 # --- Project Size Check ---
@@ -247,13 +299,19 @@ echo "  Max turns/iter: ${CLINE_MAX_TURNS}"
 echo ""
 
 # --- Phase 2 Setup: Auto-Auth for CLI ---
-echo "  🔑 Configuring local provider (Ollama)..."
+# Determine the API base URL for Cline (always use /v1 for OpenAI-compatible auth)
+if [ "$CLINE_PROVIDER" = "ollama" ]; then
+    CLINE_AUTH_URL="${CLINE_BASE_URL}/v1"
+else
+    CLINE_AUTH_URL="${CLINE_BASE_URL}/v1"
+fi
+echo "  🔑 Configuring provider (${CLINE_PROVIDER}) for Cline CLI..."
 
 cline auth \
     -p openai \
     -k "dummy" \
     -m "$CLINE_MODEL" \
-    -b "${OLLAMA_HOST}/v1"
+    -b "${CLINE_AUTH_URL}"
 
 ITERATION=0
 BUILD_COMPLETE=false

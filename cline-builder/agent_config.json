@@ -1,12 +1,33 @@
 {
     "_comment": "Multi-Agent Builder Pipeline Configuration",
+    "_provider_help": "Each model can be a string (uses ollama_host + ollama provider) or an object: {model, provider, base_url, args?}. Providers: ollama, lmstudio, llamacpp",
 
     "models": {
-        "architect": "glm-fast:latest",
-        "engineer": "glm-fast:latest",
-        "test_engineer": "glm-fast:latest",
-        "safety": "glm-fast:latest",
-        "cline": "glm-fast:latest"
+        "architect": {
+            "model": "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q3_K_XL",
+            "provider": "llamacpp",
+            "base_url": "http://host.docker.internal:8081"
+        },
+        "engineer": {
+            "model": "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q3_K_XL",
+            "provider": "llamacpp",
+            "base_url": "http://host.docker.internal:8081"
+        },
+        "test_engineer": {
+            "model": "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q3_K_XL",
+            "provider": "llamacpp",
+            "base_url": "http://host.docker.internal:8081"
+        },
+        "safety": {
+            "model": "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q3_K_XL",
+            "provider": "llamacpp",
+            "base_url": "http://host.docker.internal:8081"
+        },
+        "cline": {
+            "model": "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q3_K_XL",
+            "provider": "llamacpp",
+            "base_url": "http://host.docker.internal:8081"
+        }
     },
 
     "ollama_host": "http://host.docker.internal:11434",

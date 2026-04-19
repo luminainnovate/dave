@@ -15,15 +15,14 @@ The system operates on a strict hardware limit. All agentic routing and tool exe
 * **GPU:** 1x NVIDIA RTX 4090 (24GB VRAM). 
 * **OS:** Windows 11 Host running WSL2 (Ubuntu).
 * **VRAM Baseline Allocation:**
-  * Windows OS / Display: ~2.8GB 
-  * Open WebUI (Embedding Model - `nomic-embed-text`): ~1.5GB
-  * **Optimization:** To save 1.5GB of GPU VRAM, the embedding model should be configured to run on **CPU** (`ollama run nomic-embed-text` usually defaults to GPU, but can be forced to CPU in the service config or by using a smaller model).
-  * **Total Usable VRAM:** ~19.7GB - 21.2GB (depending on Embedding location)
-* **Dynamic VRAM Allocations:**
-  * **Resident Orchestrator (`qwen2.5:1.5b`):** ~1.2GB (Pinned to VRAM for instant routing/chat).
-  * **Expert LLM (`qwen3.5:27b` quant):** ~15GB (Loaded on-demand).
-  * **Image Model (Flux 2):** ~12GB (Loaded on-demand).
-* **Rule:** The Resident Orchestrator stays in memory. The Expert LLM and Visual/Image models **cannot** exist in VRAM simultaneously. 
+  * Windows OS / Display / System: ~2.5GB 
+  * Resident Orchestrator (Ollama - `qwen2.5:1.5b`): ~1.2GB
+  * **Available Expert VRAM:** ~20GB
+* **Expert Model Budget (RTX 4090 Optimized):**
+  * **Model Weights (Q3_K_XL 35B-A3B):** ~15.7GB
+  * **KV Cache (256k Context @ Q8_0):** ~5.4GB (utilizing GQA and KV Quantization)
+  * **Total:** ~21.1GB (Fits comfortably in 24GB VRAM)
+* **Rule:** The Resident Orchestrator stays pinned. The Expert LLM and Visual/Image models **cannot** exist in VRAM simultaneously and must be hard-swapped via the GPU Mutex.
 
 ---
 
@@ -44,9 +43,16 @@ The system operates on a strict hardware limit. All agentic routing and tool exe
     *   Fast Path requests (greetings, simple knowledge) are answered by the Orchestrator immediately.
     *   Expert Path requests (Coding, Vision, RAG) or Image Generations trigger the Mutex lock and model swap.
 
-### ADR 003: Hybrid Native/Docker Orchestration
-*   **Context:** Running Ollama in Docker within WSL2 adds overhead and complications for GPU passthrough.
-*   **Decision:** Ollama will run natively in WSL2 for maximum performance. Open WebUI and SearXNG will run on a custom Docker bridge network (`ai-workspace-net`). Open WebUI will communicate with the host-bound Orchestrator and native Ollama via `host.docker.internal`.
+### ADR 005: Managed Subprocess Lifecycle for llama.cpp
+*   **Context:** Native Ollama is great for general tasks, but `llama-server` provides superior control over HuggingFace models, GGUF quants, and KV cache settings.
+*   **Decision:** The Orchestrator will act as a **Process Manager** for `llama-server`. 
+    *   It spawns instances on-demand with specific flags (`-hf`, `-c`, `-np`).
+    *   It uses `asyncio.Event` readiness signals and background health-polling to ensure the server is fully up before routing traffic.
+    *   It provides internal APIs (`/internal/model/load`) to allow Dockerized pipelines to trigger host-level model swaps.
+
+### ADR 006: Extended Memory via KV Quantization
+*   **Context:** Standard 16-bit KV caches consume ~10GB+ at 128k context, leading to OOM on 24GB cards when combined with 35B models.
+*   **Decision:** We enforce **Q8_0 KV Cache Quantization** and **Flash Attention** across all expert roles. This halves the memory footprint of the context window, allowing for 256k tokens to fit in the same space previously required for 128k.
 
 ### ADR 004: ComfyUI-to-OpenAI Bridge (Prompt-to-Graph)
 *   **Context:** Open WebUI expects DALL-E (OpenAI) schema, while ComfyUI requires a workflow graph JSON.
@@ -58,13 +64,11 @@ The system operates on a strict hardware limit. All agentic routing and tool exe
 
 ## 4. Core Component Definitions
 
-### A. The LLM Engine: Ollama
-* **Role:** Hosts text, vision, and audio models.
-* **Resident Orchestrator:** `qwen2.5:1.5b` (Always-on for intent detection).
-* **Expert Model:** `qwen3.5:27b` (Dense logic, coding).
-* **Deployment:** Native WSL2 binary (for optimal GPU/VRAM performance).
-* **Configuration:** 
-    *   VRAM managed dynamically by the Orchestrator proxy.
+### A. LLM Engines: The Universal Trio
+* **Ollama (Native):** Daily driver for resident routing and general chat.
+* **llama.cpp (Managed):** Power-user engine for HuggingFace models and extreme context coding (128k+).
+* **LM Studio (External):** Integration via `lms` CLI for easy model discovery and experimentation.
+* **Expert Model:** `unsloth/Qwen3.6-35B-A3B` (MoE architecture optimized for coding and long context).
 
 ### B. The Orchestrator & Frontend: Open WebUI
 * **Role:** Unified UI, RAG document processing, voice transcription (Whisper), embedding generation, and agentic tool routing.
@@ -131,7 +135,7 @@ To prevent context window saturation and ensure high-quality code, the pipeline 
 - **Input:** A `.build_conversation.json` file exported by the `!build` command.
 - **Processing:** The `distill.py` engine runs the 4 passes sequentially, loading/unloading models for VRAM efficiency.
 - **Output:** A structured `.clinerules` file embedded with critical directives and implementation roadmaps.
-- **Implementation:** A `Cline` agent (using the `glm-4.7-flash:q4_k_m` model) reads the rules and executes the code modifications autonomously within the workspace.
+- **Implementation:** A `Cline` agent (using the `unsloth/Qwen3.6-35B-A3B:Q3_K_XL` model via `llama-server`) reads the rules and executes code autonomously within a **256k context window**.
 
 ### C. Build Constraints
 - **Anti-Loop Shield:** The builder is forbidden from attempting the same bug fix more than twice.

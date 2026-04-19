@@ -282,13 +282,24 @@ def handle_move(messages: list) -> str:
         if not snippets:
             return "No code snippets found in the conversation context."
 
-        conv_id = get_conversation_id(messages)
-        
-        # --- ID-Centric Linking (Primary Lookup) ---
-        # Before generating a new prefix, check if any existing folder matches this conv_id
+        # --- History-Aware Binding (Scan for existing links) ---
         target_dir = None
+        workspace_pattern = re.compile(r"conversations/([a-zA-Z0-9_\-]+_[a-f0-9]{12})")
+        for msg in reversed(messages):
+            content = str(msg.get("content", ""))
+            match = workspace_pattern.search(content)
+            if match:
+                folder_name = match.group(0)
+                if os.path.exists(folder_name):
+                    target_dir = folder_name
+                    logger.info(f"History Match: Bound conversation to existing workspace `{target_dir}`")
+                    break
+
+        conv_id = get_conversation_id(messages)
         conv_dir = "conversations"
-        if os.path.exists(conv_dir):
+        
+        # If no history match, try ID-Centric Linking
+        if not target_dir and os.path.exists(conv_dir):
             for item in os.listdir(conv_dir):
                 if item.endswith(f"_{conv_id}"):
                     target_dir = os.path.join(conv_dir, item)
