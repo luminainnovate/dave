@@ -4,27 +4,27 @@
 
     "models": {
         "architect": {
-            "model": "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q3_K_XL",
+            "model": "unsloth/Qwen3.6-35B-A3B-GGUF:UD-IQ4_NL",
             "provider": "llamacpp",
             "base_url": "http://host.docker.internal:8081"
         },
         "engineer": {
-            "model": "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q3_K_XL",
+            "model": "unsloth/Qwen3.6-35B-A3B-GGUF:UD-IQ4_NL",
             "provider": "llamacpp",
             "base_url": "http://host.docker.internal:8081"
         },
         "test_engineer": {
-            "model": "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q3_K_XL",
+            "model": "unsloth/Qwen3.6-35B-A3B-GGUF:UD-IQ4_NL",
             "provider": "llamacpp",
             "base_url": "http://host.docker.internal:8081"
         },
         "safety": {
-            "model": "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q3_K_XL",
+            "model": "unsloth/Qwen3.6-35B-A3B-GGUF:UD-IQ4_NL",
             "provider": "llamacpp",
             "base_url": "http://host.docker.internal:8081"
         },
         "cline": {
-            "model": "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q3_K_XL",
+            "model": "unsloth/Qwen3.6-35B-A3B-GGUF:UD-IQ4_NL",
             "provider": "llamacpp",
             "base_url": "http://host.docker.internal:8081"
         }
@@ -32,7 +32,7 @@
 
     "ollama_host": "http://host.docker.internal:11434",
 
-    "context_window": 32768,
+    "context_window": 131072,
 
     "prompts": {
         "architect": "<role_alignment>System Architect</role_alignment>\n<operational_constraints>Your sole output is a high-level structural document. Do not include conversational text or code blocks. If SITUATIONAL_AWARENESS mode is ITERATIVE_REBUILD, you MUST scope your output to ONLY the files affected by the NEW_REQUEST. PRESERVE exactly the existing file structure and architectural patterns. Do NOT redesign or describe the full architecture of files unrelated to the request. Keep your output under 3000 characters.</operational_constraints>\n<expected_output_format>You must format your response EXACTLY matching this Markdown template:\n# 1. Business Goals\n[List goals here - scoped to the NEW_REQUEST only]\n# 2. Directory Structure\n[Use a tree format - show ONLY affected files]\n# 3. Technology Stack\n[List tools/frameworks relevant to the change]\n# 4. Data Flows\n[Describe flows affected by the change]</expected_output_format>",
@@ -48,6 +48,6 @@
     "limits": {
         "max_project_size_mb": 4096,
         "max_build_iterations": 5,
-        "cline_max_turns": 30
+        "cline_max_turns": 100
     }
 }

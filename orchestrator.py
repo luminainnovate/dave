@@ -23,7 +23,7 @@ logger = logging.getLogger("Bob-Orchestrator")
 # Each model role is a dict: model name, provider type, and API base URL.
 # Supported providers: "ollama", "lmstudio", "llamacpp"
 EXPERT_CONFIG = {
-    "model": "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q3_K_XL",
+   "model": "unsloth/Qwen3.6-35B-A3B-GGUF:UD-IQ4_NL",
     "provider": "llamacpp",
     "base_url": "http://localhost:8081",
 }
@@ -43,9 +43,9 @@ LLAMACPP_BINARY = "/usr/local/bin/llama-server"  # Path to llama-server binary
 LLAMACPP_DEFAULT_ARGS = ["--no-cg", "--cache-type-k", "q8_0", "--cache-type-v", "q8_0", "--flash-attn"]  # Extra CLI args (KV Quant + FA enabled)
 
 COMFYUI_URL = "http://localhost:8188"
-EXPERT_CTX = 262144   # Context for the expert model (128k)
-DISTILL_CTX = 262144  # Context for the distillation engine (128k)
-CLINE_CTX = 262144    # Context for the Cline agent (128k)
+EXPERT_CTX = 131072   # Context for the expert model (128k)
+DISTILL_CTX = 131072  # Context for the distillation engine (128k)
+CLINE_CTX = 131072    # Context for the Cline agent (128k)
 
 # --- STATE MANAGEMENT ---
 gpu_lock = asyncio.Lock()
@@ -229,8 +229,15 @@ async def _start_llamacpp_server(config: dict):
         ctx_size = str(config.get("ctx_size", EXPERT_CTX))
 
         # Context rotation: llama-server natively supports sliding window truncation
-        # Increase to 0.9 to keep more history and avoid the agent 'forgetting' phase 1 results.
-        truncate_args = ["--chat-truncate", "--chat-truncate-max-keep", "0.9"]
+        # Set to 0.7 to give massive breathing room and reduce rotation frequency.
+        # Disable similarity matching to force linear slot persistence.
+        truncate_args = [
+            "--chat-truncate", 
+            "--chat-truncate-max-keep", "0.7",
+            "--slot-prompt-similarity", "0.0",
+            "--batch-size", "1024",
+            "--ubatch-size", "1024"
+        ]
 
         # Build command: detect HuggingFace repo vs local path
         if "/" in model and not os.path.exists(model):
@@ -608,10 +615,12 @@ async def stream_proxy(url: str, body: dict, lock: asyncio.Lock,
     # the URL targets /api/chat (indicated by the client requesting native format).
     backend_sends_native = backend_is_ollama and is_native
 
+    last_activity = asyncio.get_event_loop().time()
+    heartbeat_interval = 10.0  # Pulse every 10s of silence
+
     try:
         async with http_client.stream("POST", url, json=body, timeout=600.0) as resp:
             if resp.status_code != 200:
-                # Read the error for better diagnostics
                 error_body = ""
                 async for chunk in resp.aiter_bytes():
                     error_body += chunk.decode("utf-8", errors="ignore")
@@ -620,18 +629,56 @@ async def stream_proxy(url: str, body: dict, lock: asyncio.Lock,
                 if is_native:
                     yield f'{json.dumps({"model": "Bob", "message": {"role": "assistant", "content": f"⚠️ {error_msg}"}, "done": True})}\n'.encode('utf-8')
                 else:
-                    chunk_data = {"id": "chatcmpl-Bob", "object": "chat.completion.chunk", "model": "Bob",
+                    err_chunk = {"id": "chatcmpl-Bob", "object": "chat.completion.chunk", "model": "Bob",
                                   "choices": [{"index": 0, "delta": {"content": f"⚠️ {error_msg}"}, "finish_reason": "stop"}]}
-                    yield f"data: {json.dumps(chunk_data)}\n\n".encode('utf-8')
+                    yield f"data: {json.dumps(err_chunk)}\n\n".encode('utf-8')
                     yield b"data: [DONE]\n\n"
                 return
 
-            async for line in resp.aiter_lines():
-                if not line:
-                    continue
+            line_iter = resp.aiter_lines().__aiter__()
+            
+            # Check if scrubbing is disabled via header
+            scrub_disabled = request.headers.get("X-No-Scrub", "false").lower() == "true"
+            
+            # Non-destructive heartbeat logic
+            next_line_task = asyncio.create_task(line_iter.__anext__())
+            
+            # Syntax Scrubber state
+            content_buffer = ""
+            lookahead_buffer = "" # For split-chunk tag reconstruction
+            in_tool_tag = False
+            active_tag_name = ""
+            
+            while True:
+                try:
+                    # Wait for next line or heartbeat timeout (60s)
+                    done, _ = await asyncio.wait(
+                        [next_line_task],
+                        timeout=60.0,
+                        return_when=asyncio.FIRST_COMPLETED
+                    )
+                    
+                    if next_line_task not in done:
+                        # Timeout! Send keeping-alive pulse
+                        yield b": heartbeat\n\n"
+                        continue
+                    
+                    # Task is done, get the line
+                    try:
+                        line = next_line_task.result()
+                        # Prepare the next line task immediately
+                        next_line_task = asyncio.create_task(line_iter.__anext__())
+                    except StopAsyncIteration:
+                        break
+                    
+                    if not line:
+                        continue
+                except Exception as e:
+                    logger.error(f"Iterator error: {e}")
+                    break
 
                 if backend_sends_native:
-                    # Path 1: Ollama backend → Native client (direct proxy)
+                    # Path 1: Ollama backend -> Native client (direct proxy)
                     try:
                         data = json.loads(line)
                         data["model"] = "Bob"
@@ -644,37 +691,131 @@ async def stream_proxy(url: str, body: dict, lock: asyncio.Lock,
                         continue
                     if line == "data: [DONE]":
                         if is_native:
-                            # Emit Ollama-format done signal
                             yield f'{json.dumps({"model": "Bob", "message": {"role": "assistant", "content": ""}, "done": True})}\n'.encode('utf-8')
                         else:
                             yield b"data: [DONE]\n\n"
                         continue
                     try:
                         data = json.loads(line[6:])
+                        
+                        # VALIDATION: Discard chunks that don't have choices
+                        if not is_native and "choices" not in data and not line.endswith("[DONE]"):
+                            continue
+
                         data["model"] = "Bob"
                         if "id" in data:
                             data["id"] = "chatcmpl-Bob"
 
+                        # Syntax Scrubber: Handle IQ4 'nested tag' hallucinations
+                        choices = data.get("choices", [])
+                        if choices and not is_native and not scrub_disabled:
+                            delta = choices[0].get("delta", {})
+                            content = delta.get("content", "")
+                            
+                            if content:
+                                # Look-Ahead Reconstruction: Handle tags split across chunks
+                                raw_content = lookahead_buffer + content
+                                lookahead_buffer = ""
+                                
+                                # If chunk ends with a partial tag, hold it for the next packet
+                                if "<" in raw_content and ">" not in raw_content[raw_content.rfind("<"):]:
+                                    split_idx = raw_content.rfind("<")
+                                    # Limit lookahead to avoid stalling on just a solitary '<'
+                                    if len(raw_content) - split_idx < 100:
+                                        lookahead_buffer = raw_content[split_idx:]
+                                        content = raw_content[:split_idx]
+                                    else:
+                                        content = raw_content
+                                else:
+                                    content = raw_content
+
+                        if content:
+                            # Look-Ahead Reconstruction: Handle tags split across chunks
+                            raw_content = lookahead_buffer + content
+                            lookahead_buffer = ""
+                            
+                            # If chunk ends with a partial tag, hold it for the next packet
+                            if "<" in raw_content and ">" not in raw_content[raw_content.rfind("<"):]:
+                                split_idx = raw_content.rfind("<")
+                                if len(raw_content) - split_idx < 100:
+                                    lookahead_buffer = raw_content[split_idx:]
+                                    content = raw_content[:split_idx]
+                                else:
+                                    content = raw_content
+                            else:
+                                content = raw_content
+
+                            if content:
+                                # Track start of any tool call generically
+                                if not in_tool_tag:
+                                    tag_match = re.search(r'<([a-z0-9_]+)>', content)
+                                    if tag_match:
+                                        tag_name = tag_match.group(1)
+                                        AGENT_TOOLS = ["read_file", "write_to_file", "search_files", "execute_command", 
+                                                      "list_files", "list_dir", "grep_search", "read_browser_page",
+                                                      "replace_in_file", "insert_content", "ask_followup_question", "attempt_completion"]
+                                        if tag_name in AGENT_TOOLS:
+                                            in_tool_tag = True
+                                            active_tag_name = tag_name
+                                            logger.info(f"[Scrubber] Detected tool call across window: <{tag_name}>.")
+                                
+                                # Process scrubbing if active
+                                if in_tool_tag:
+                                    if "<task_progress>" in content:
+                                        content_buffer += content
+                                        delta["content"] = "" 
+                                    elif active_tag_name and f"</{active_tag_name}>" in content:
+                                        if content_buffer:
+                                            delta["content"] = content + "\n\n" + content_buffer.replace("<task_progress>", "### Progress:\n").replace("</task_progress>", "")
+                                            content_buffer = ""
+                                            logger.info(f"[Scrubber] De-nested progress for <{active_tag_name}>.")
+                                        in_tool_tag = False
+                                        active_tag_name = ""
+                                    else:
+                                        if len(content_buffer) > 512:
+                                            logger.warning(f"[Scrubber] Safety Valve triggered. Flushing <{active_tag_name}>.")
+                                            delta["content"] = content_buffer + content
+                                            content_buffer = ""
+                                            in_tool_tag = False
+                                            active_tag_name = ""
+                                else:
+                                    delta["content"] = content
+
                         if is_native:
-                            # Path 2: OpenAI backend → Native client (translate)
-                            token = ""
-                            done = False
-                            if "choices" in data and data["choices"]:
-                                choice = data["choices"][0]
-                                token = choice.get("delta", {}).get("content", "")
-                                done = choice.get("finish_reason") is not None
+                            # Path 2: OpenAI backend -> Native client (translate)
+                            token = delta.get("content", "")
+                            done = choices[0].get("finish_reason") is not None
                             ollama_chunk = {
-                                "model": "Bob",
-                                "message": {"role": "assistant", "content": token},
-                                "done": done
+                                "model": "Bob", "message": {"role": "assistant", "content": token}, "done": done
                             }
                             yield f"{json.dumps(ollama_chunk)}\n".encode('utf-8')
                         else:
-                            # Path 3: OpenAI backend → OpenAI client (direct proxy)
+                            # Path 3: OpenAI backend -> OpenAI client (direct proxy)
                             yield f"data: {json.dumps(data)}\n\n".encode('utf-8')
-                    except (Exception, json.JSONDecodeError):
+                    except Exception:
                         rewritten = re.sub(r'("model"\s*:\s*")[^"]+(")', r'\1Bob\2', line)
                         yield f"{rewritten}\n\n".encode('utf-8')
+
+            # FINAL FLUSH: Handle dangling tags AND held lookahead fragments
+            final_fix = ""
+            if lookahead_buffer:
+                final_fix += lookahead_buffer
+            
+            if in_tool_tag and active_tag_name:
+                if content_buffer:
+                    final_fix += "\n\n" + content_buffer.replace("<task_progress>", "### Progress:\n").replace("</task_progress>", "")
+                final_fix += f"</{active_tag_name}>"
+                logger.info(f"[Scrubber] Performing final auto-close for <{active_tag_name}>.")
+
+            if final_fix:
+                if is_native:
+                    yield f'{json.dumps({"model": "Bob", "message": {"role": "assistant", "content": final_fix}, "done": True})}\n'.encode('utf-8')
+                else:
+                    final_chunk = {"id": "chatcmpl-Bob", "object": "chat.completion.chunk", "model": "Bob",
+                                  "choices": [{"index": 0, "delta": {"content": final_fix}, "finish_reason": "stop"}]}
+                    yield f"data: {json.dumps(final_chunk)}\n\n".encode('utf-8')
+                    yield b"data: [DONE]\n\n"
+
     except (GeneratorExit, asyncio.CancelledError):
         pass
     except Exception as e:
@@ -682,7 +823,10 @@ async def stream_proxy(url: str, body: dict, lock: asyncio.Lock,
         if is_native:
             yield f'{json.dumps({"model": "Bob", "message": {"role": "assistant", "content": f"⚠️ Error: {str(e)}"}, "done": True})}\n'.encode('utf-8')
         else:
-            yield f"data: {json.dumps({'error': str(e)})}\n\n".encode('utf-8')
+            err_chunk = {"id": "chatcmpl-Bob", "object": "chat.completion.chunk", "model": "Bob",
+                          "choices": [{"index": 0, "delta": {"content": f"\n\n⚠️ **Error:** {str(e)}"}, "finish_reason": "error"}]}
+            yield f"data: {json.dumps(err_chunk)}\n\n".encode('utf-8')
+            yield b"data: [DONE]\n\n"
     finally:
         _release()
 
@@ -718,6 +862,33 @@ async def health_check():
         "vram_locked": vram_locked,
         "gpu_lock_held": gpu_lock.locked()
     })
+
+@app.post("/v1/shutdown_expert")
+async def shutdown_expert():
+    """Explicitly shutdown any managed expert processes and release VRAM."""
+    global expert_warm_until, vram_locked
+    expert_warm_until = 0
+    vram_locked = False
+    
+    killed_count = 0
+    for model_name, proc in list(_managed_processes.items()):
+        if proc.poll() is None:
+            logger.info(f"Shutting down managed process for {model_name}...")
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except:
+                proc.kill()
+            killed_count += 1
+        
+        # Cleanup state
+        if model_name in _managed_processes:
+            del _managed_processes[model_name]
+        if model_name in _llamacpp_ready_events:
+            _llamacpp_ready_events[model_name].clear()
+            
+    logger.info(f"VRAM Cleanup: Terminated {killed_count} expert processes.")
+    return JSONResponse(content={"status": "ok", "processes_killed": killed_count})
 
 @app.post("/api/chat")
 @app.post("/v1/chat/completions")
@@ -1551,7 +1722,7 @@ def _handle_clone_command(messages: list) -> str:
         return f"❌ **Error during clone:** {e}"
 
 
-def _trigger_build_pipeline(messages: list) -> str:
+async def _trigger_build_pipeline(messages: list) -> str:
     """
     Orchestrates the build pipeline:
     1. Extracts conversation files to a unique project folder.
@@ -1620,14 +1791,16 @@ def _trigger_build_pipeline(messages: list) -> str:
         logger.info(f"Launching pipeline command: {' '.join(cmd)}")
         subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+        # Launch the Watchdog to ensure VRAM is released when container stops/deleted
+        asyncio.create_task(_docker_watchdog(container_name))
+
         return (
-            f"🔨 **Build pipeline triggered.**\n\n"
+            f"🚀 **Build Pipeline Launched!**\n\n"
             f"- **Workspace:** `{target_dir}`\n"
             f"- **Container:** `{container_name}`\n"
-            f"- **Mode:** Autonomous\n"
-            f"- **Status:** Distillation started... Cline will follow.\n\n"
+            f"- **Safety Net:** Watchdog active (VRAM auto-release on stop)\n\n"
             f"Check logs with: `docker logs -f {container_name}`\n"
-            f"*Tip: You can also type `!logs` to view them in chat, or ask me for build insights!*"
+            f"*Tip: You can also type `!logs` to view them in chat!*"
         )
 
     except Exception as e:
@@ -1695,6 +1868,46 @@ async def is_pipeline_active() -> bool:
         return False
 
 
+async def _docker_watchdog(container_name: str):
+    """
+    Background task that monitors a specific Docker container.
+    When the container stops, it automatically triggers a VRAM cleanup.
+    """
+    logger.info(f"[Watchdog] Starting monitor for {container_name}")
+    try:
+        # Initial wait to let it start
+        await asyncio.sleep(10)
+        
+        while True:
+            # Check container status
+            proc = await asyncio.create_subprocess_exec(
+                "docker", "inspect", "-f", "{{.State.Running}}", container_name,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await proc.communicate()
+            
+            if proc.returncode != 0:
+                # Container likely deleted or vanished
+                logger.info(f"[Watchdog] Container {container_name} vanished. Releasing VRAM.")
+                await shutdown_expert()
+                break
+            
+            status = stdout.decode().strip().lower()
+            if status == "false":
+                logger.info(f"[Watchdog] Container {container_name} stopped. Releasing VRAM.")
+                await shutdown_expert()
+                break
+                
+            # Wait before next poll
+            await asyncio.sleep(10)
+            
+    except asyncio.CancelledError:
+        logger.info(f"[Watchdog] Monitor for {container_name} cancelled.")
+    except Exception as e:
+        logger.error(f"[Watchdog] Error monitoring {container_name}: {e}")
+
+
 async def _trigger_build_pipeline_safe(messages: list) -> str:
     """
     Triggers the build pipeline while ensuring VRAM is cleared and
@@ -1723,7 +1936,7 @@ async def _trigger_build_pipeline_safe(messages: list) -> str:
         await free_comfyui()
         
         # Now trigger the actual command
-        return _trigger_build_pipeline(messages)
+        return await _trigger_build_pipeline(messages)
 
 
 def _stop_build_pipeline() -> str:

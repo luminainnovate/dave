@@ -20,11 +20,26 @@ set -euo pipefail
 # Set the global config directory so ALL cline commands use it
 export CLINE_DIR="/root/.config/Cline"
 
+# --- VRAM Safety Guard ---
+# Ensure that we release the GPU expert model when the container shuts down
+# regardless of success or failure.
+cleanup_vram() {
+    echo ""
+    echo "========================================"
+    echo "🧹 VRAM VACUUM: Releasing GPU Expert..."
+    echo "========================================"
+    # Send shutdown signal to orchestrator
+    ORCHESTRATOR_URL="${ORCHESTRATOR_URL:-http://host.docker.internal:8000}"
+    curl -s -X POST "${ORCHESTRATOR_URL}/v1/shutdown_expert" > /dev/null || true
+    echo "  ✓ Expert unloaded. GPU Safe."
+}
+trap cleanup_vram EXIT INT TERM
+
 CONFIG_PATH="${AGENT_CONFIG_PATH:-/app/agent_config.json}"
 CONVERSATION_FILE="${CONVERSATION_FILE:-/workspace/.cline_context/conversation.json}"
 CLINERULES_PATH="${CLINERULES_PATH:-/workspace/.clinerules}"
 OLLAMA_HOST="${OLLAMA_HOST:-http://host.docker.internal:11434}"
-CLINE_CTX="${CLINE_CTX:-262144}"
+CLINE_CTX="${CLINE_CTX:-131072}"
 
 echo "========================================"
 echo "🔨 Cline Builder Pipeline"
@@ -164,8 +179,8 @@ fi
 
 # --- Read Config ---
 MAX_SIZE_MB=$(jq -r '.limits.max_project_size_mb // 2048' "$CONFIG_PATH")
-MAX_ITERATIONS=$(jq -r '.limits.max_build_iterations // 3' "$CONFIG_PATH")
-CLINE_MAX_TURNS=$(jq -r '.limits.cline_max_turns // 10' "$CONFIG_PATH")
+MAX_ITERATIONS=$(jq -r '.limits.max_build_iterations // 5' "$CONFIG_PATH")
+CLINE_MAX_TURNS=$(jq -r '.limits.cline_max_turns // 100' "$CONFIG_PATH")
 # Extract cline model: handle both string ("model_name") and object ({"model": "..."}) formats
 CLINE_MODEL=$(jq -r 'if (.models.cline | type) == "object" then .models.cline.model else (.models.cline // "qwen3.5:27b") end' "$CONFIG_PATH")
 CLINE_PROVIDER=$(jq -r 'if (.models.cline | type) == "object" then (.models.cline.provider // "ollama") else "ollama" end' "$CONFIG_PATH")
@@ -219,14 +234,24 @@ rm -f /workspace/.build_complete
 setup_git_safety() {
     cd /workspace
     
+    # Try to initialize if missing, but don't fail if we can't
     if [ ! -d ".git" ]; then
         # Project has no git — initialize for local snapshot only
-        git init -q
-        git config user.email "builder@local"
-        git config user.name "Cline Builder"
-        git add -A 2>/dev/null
-        git commit -q -m "snapshot: pre-build state" 2>/dev/null
-        echo "  📸 Created local snapshot (no remote, no pushing)"
+        if git init -q 2>/dev/null; then
+            git config user.email "builder@local"
+            git config user.name "Cline Builder"
+            git add -A 2>/dev/null
+            git commit -q -m "snapshot: pre-build state" 2>/dev/null
+            echo "  📸 Created local snapshot (no remote, no pushing)"
+        else
+            echo "  ⚠️ Skipping git safety net (not a repository and cannot initialize)"
+            return 0
+        fi
+    fi
+    
+    # Final check to ensure we are in a working tree
+    if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        return 0
     fi
     
     # Always work on a branch, never on main/master
@@ -331,13 +356,13 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     echo "  🔧 Running Cline (Build mode)..."
     generate_session_state "$ITERATION" "build"
 
-    CURRENT_TIMEOUT=600 # 10 minutes
+    CURRENT_TIMEOUT=1800 # 30 minutes
     BUILD_MSG="IMPORTANT: First read '.cline_context/.session_state.md' to understand what has been done so far. Then read '.clinerules' and execute remaining implementation tasks."
 
     if [ $ITERATION -eq $MAX_ITERATIONS ]; then
         echo "  🚨 FINAL ROUND: Shifting to Stabilization and Debugging..."
         BUILD_MSG="IMPORTANT: First read '.cline_context/.session_state.md'. CRITICAL: This is the FINAL iteration (${ITERATION} of ${MAX_ITERATIONS}). Your directive is now STABILIZATION. Revisit any TODOs, uncommented code, or failing tests. Fix the root causes of any remaining bugs."
-        CURRENT_TIMEOUT=1200
+        CURRENT_TIMEOUT=1800
     elif [ $ITERATION -gt 1 ]; then
         BUILD_MSG="IMPORTANT: First read '.cline_context/.session_state.md' to recover your memory. Continue building the project. Review what was done in the previous iteration, fix any issues, and complete remaining tasks from .clinerules. This is iteration ${ITERATION} of ${MAX_ITERATIONS}. Remember: keep momentum and don't get stuck on one bug."
     fi
@@ -372,7 +397,7 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     set +e
     cline task -v -y --thinking \
         -m "$CLINE_MODEL" \
-        --timeout 600 \
+        --timeout 1800 \
         "$VERIFY_MSG" \
         2>&1 | tee "/workspace/.cline_logs/verify_log_iter_${ITERATION}.txt"
     set -e
@@ -389,7 +414,7 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     set +e
     cline task -v -y --thinking \
         -m "$CLINE_MODEL" \
-        --timeout 600 \
+        --timeout 1800 \
         "$SAFETY_MSG" \
         2>&1 | tee "/workspace/.cline_logs/safety_log_iter_${ITERATION}.txt"
     set -e
