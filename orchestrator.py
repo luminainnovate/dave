@@ -71,7 +71,7 @@ PARAMS_CODING = {
     "top_k": 20,
     "min_p": 0.0,
     "presence_penalty": 0.0,
-    "repeat_penalty": 1.0,
+    "repeat_penalty": 1.15,
 }
 
 # =============================================================================
@@ -591,16 +591,19 @@ async def analyze_request(messages: list) -> dict:
 # =============================================================================
 
 async def stream_proxy(url: str, body: dict, lock: asyncio.Lock,
-                       is_native: bool = False, backend_is_ollama: bool = True):
+                       is_native: bool = False, backend_is_ollama: bool = True,
+                       request_headers: dict = {}):
     """
     Proxies a streaming response from the backend AI model while managing VRAM locks.
     Handles format translation between Ollama and OpenAI-compatible backends/clients.
-
+    
     Args:
         is_native: True if the CLIENT expects Ollama-native format.
         backend_is_ollama: True if the BACKEND sends Ollama-native format.
+        request_headers: Headers from the initial request (for X-No-Scrub).
     """
     lock_released = False
+    turn_throughput = 0  # Character counter to detect infinite reasoning loops
 
     def _release():
         nonlocal lock_released
@@ -614,9 +617,6 @@ async def stream_proxy(url: str, body: dict, lock: asyncio.Lock,
     # Backend sends native Ollama line-JSON only when both backend is Ollama AND
     # the URL targets /api/chat (indicated by the client requesting native format).
     backend_sends_native = backend_is_ollama and is_native
-
-    last_activity = asyncio.get_event_loop().time()
-    heartbeat_interval = 10.0  # Pulse every 10s of silence
 
     try:
         async with http_client.stream("POST", url, json=body, timeout=600.0) as resp:
@@ -638,7 +638,7 @@ async def stream_proxy(url: str, body: dict, lock: asyncio.Lock,
             line_iter = resp.aiter_lines().__aiter__()
             
             # Check if scrubbing is disabled via header
-            scrub_disabled = request.headers.get("X-No-Scrub", "false").lower() == "true"
+            scrub_disabled = request_headers.get("X-No-Scrub", "false").lower() == "true"
             
             # Non-destructive heartbeat logic
             next_line_task = asyncio.create_task(line_iter.__anext__())
@@ -708,11 +708,12 @@ async def stream_proxy(url: str, body: dict, lock: asyncio.Lock,
 
                         # Syntax Scrubber: Handle IQ4 'nested tag' hallucinations
                         choices = data.get("choices", [])
-                        if choices and not is_native and not scrub_disabled:
+                        content = ""
+                        if choices:
                             delta = choices[0].get("delta", {})
                             content = delta.get("content", "")
                             
-                            if content:
+                            if content and not scrub_disabled:
                                 # Look-Ahead Reconstruction: Handle tags split across chunks
                                 raw_content = lookahead_buffer + content
                                 lookahead_buffer = ""
@@ -729,57 +730,47 @@ async def stream_proxy(url: str, body: dict, lock: asyncio.Lock,
                                 else:
                                     content = raw_content
 
-                        if content:
-                            # Look-Ahead Reconstruction: Handle tags split across chunks
-                            raw_content = lookahead_buffer + content
-                            lookahead_buffer = ""
-                            
-                            # If chunk ends with a partial tag, hold it for the next packet
-                            if "<" in raw_content and ">" not in raw_content[raw_content.rfind("<"):]:
-                                split_idx = raw_content.rfind("<")
-                                if len(raw_content) - split_idx < 100:
-                                    lookahead_buffer = raw_content[split_idx:]
-                                    content = raw_content[:split_idx]
-                                else:
-                                    content = raw_content
-                            else:
-                                content = raw_content
-
-                            if content:
-                                # Track start of any tool call generically
-                                if not in_tool_tag:
-                                    tag_match = re.search(r'<([a-z0-9_]+)>', content)
-                                    if tag_match:
-                                        tag_name = tag_match.group(1)
-                                        AGENT_TOOLS = ["read_file", "write_to_file", "search_files", "execute_command", 
-                                                      "list_files", "list_dir", "grep_search", "read_browser_page",
-                                                      "replace_in_file", "insert_content", "ask_followup_question", "attempt_completion"]
-                                        if tag_name in AGENT_TOOLS:
-                                            in_tool_tag = True
-                                            active_tag_name = tag_name
-                                            logger.info(f"[Scrubber] Detected tool call across window: <{tag_name}>.")
-                                
-                                # Process scrubbing if active
-                                if in_tool_tag:
-                                    if "<task_progress>" in content:
-                                        content_buffer += content
-                                        delta["content"] = "" 
-                                    elif active_tag_name and f"</{active_tag_name}>" in content:
-                                        if content_buffer:
-                                            delta["content"] = content + "\n\n" + content_buffer.replace("<task_progress>", "### Progress:\n").replace("</task_progress>", "")
-                                            content_buffer = ""
-                                            logger.info(f"[Scrubber] De-nested progress for <{active_tag_name}>.")
-                                        in_tool_tag = False
-                                        active_tag_name = ""
-                                    else:
-                                        if len(content_buffer) > 512:
-                                            logger.warning(f"[Scrubber] Safety Valve triggered. Flushing <{active_tag_name}>.")
-                                            delta["content"] = content_buffer + content
-                                            content_buffer = ""
+                                if content:
+                                    # Track start of any tool call generically
+                                    if not in_tool_tag:
+                                        tag_match = re.search(r'<([a-z0-9_]+)>', content)
+                                        if tag_match:
+                                            tag_name = tag_match.group(1)
+                                            AGENT_TOOLS = ["read_file", "write_to_file", "search_files", "execute_command", 
+                                                          "list_files", "list_dir", "grep_search", "read_browser_page",
+                                                          "replace_in_file", "insert_content", "ask_followup_question", "attempt_completion"]
+                                            if tag_name in AGENT_TOOLS:
+                                                in_tool_tag = True
+                                                active_tag_name = tag_name
+                                                logger.info(f"[Scrubber] Detected tool call across window: <{tag_name}>.")
+                                    
+                                    # Process scrubbing if active
+                                    if in_tool_tag:
+                                        if "<task_progress>" in content:
+                                            content_buffer += content
+                                            delta["content"] = "" 
+                                        elif active_tag_name and f"</{active_tag_name}>" in content:
+                                            if content_buffer:
+                                                # Found closing tag - clean and release entire buffer
+                                                delta["content"] = content + "\n\n" + content_buffer.replace("<task_progress>", "### Progress:\n").replace("</task_progress>", "")
+                                                content_buffer = ""
+                                                logger.info(f"[Scrubber] De-nested progress for <{active_tag_name}>.")
                                             in_tool_tag = False
                                             active_tag_name = ""
-                                else:
-                                    delta["content"] = content
+                                        else:
+                                            # Not at a closing tag yet
+                                            if len(content_buffer) > 512:
+                                                # Safety valve: Clean and flush what we have to prevent 'darkness'
+                                                logger.warning(f"[Scrubber] Safety Valve triggered. Flushing CLEANED buffer for <{active_tag_name}>.")
+                                                delta["content"] = content_buffer.replace("<task_progress>", "### Progress:\n").replace("</task_progress>", "") + content
+                                                content_buffer = ""
+                                    else:
+                                        # Loop Watchdog: If we have > 20k chars of thought with zero tools, it's a loop
+                                        turn_throughput += len(content)
+                                        if not in_tool_tag and turn_throughput > 20000:
+                                            logger.error(f"[Watchdog] Loop detected! {turn_throughput} chars without a tool. Breaking.")
+                                            raise Exception("Infinite Reasoning Loop Detected")
+                                        delta["content"] = content
 
                         if is_native:
                             # Path 2: OpenAI backend -> Native client (translate)
@@ -887,7 +878,15 @@ async def shutdown_expert():
         if model_name in _llamacpp_ready_events:
             _llamacpp_ready_events[model_name].clear()
             
-    logger.info(f"VRAM Cleanup: Terminated {killed_count} expert processes.")
+    # Fallback: Hard-kill any stray llama-server processes just in case
+    try:
+        # Use killall as a universal sweep for any binary name match
+        subprocess.run(["killall", "-9", "llama-server"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        logger.info("VRAM Cleanup: Executed killall -9 llama-server sweep.")
+    except:
+        pass
+
+    logger.info(f"VRAM Cleanup: Terminated {killed_count} tracked expert processes.")
     return JSONResponse(content={"status": "ok", "processes_killed": killed_count})
 
 @app.post("/api/chat")
@@ -924,6 +923,12 @@ async def proxy_ollama(request: Request):
 
         # Background tasks (Follow-ups, titles, etc.)
         is_suggestion_ping = any(kw in last_content for kw in ["suggest 3-5", "generate a title", "generate a short title", "summarize", "short label", "tags"])
+        
+        # Suppress suggestions immediately after a build launch to conserve VRAM for the 35B Expert
+        if is_suggestion_ping and any("build pipeline launched" in str(m.get("content", "")).lower() for m in messages[-3:]):
+            logger.info("Suppressing suggestion ping due to recent Build Launch context.")
+            is_suggestion_ping = False
+
         # Prompt Expansion (Inhibited by policy)
         is_expansion_ping = "generate a detailed prompt" in last_content or "### task:\ngenerate a detailed prompt" in last_content
 
@@ -1216,6 +1221,10 @@ async def proxy_ollama(request: Request):
         options = body.get("options", {})
         if is_background_task:
             options.update({"temperature": 0.0, "num_ctx": 2048})
+            # If the expert is warm or a build is active, force the Router to unload immediately
+            if expert_warm_until > time.time() or vram_locked:
+                keep_alive = 0
+                logger.info("Background task detected in build context: Forcing immediate Router unload.")
         elif target_model == EXPERT_MODEL:
             # Apply Thinking Mode parameters for Expert only if using the default model
             if EXPERT_MODEL == DEFAULT_EXPERT_MODEL:
@@ -1288,7 +1297,8 @@ async def proxy_ollama(request: Request):
         lock_held = False
         return StreamingResponse(
             stream_proxy(target_url, dispatch_body, gpu_lock,
-                         is_native=is_native, backend_is_ollama=target_is_ollama),
+                         is_native=is_native, backend_is_ollama=target_is_ollama,
+                         request_headers=dict(request.headers)),
             media_type="application/x-ndjson" if is_native else "text/event-stream"
         )
     except Exception as e:
