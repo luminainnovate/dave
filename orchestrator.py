@@ -149,6 +149,42 @@ def _adapt_body(body: dict, config: dict) -> dict:
     return adapted
 
 
+def _prune_messages(messages: list, max_chars: int = 90000) -> list:
+    """
+    In-place pruner that ensures the conversation remains below a safe threshold.
+    Preserves the system message (first) and the most recent turns (last 4).
+    """
+    if not messages or len(messages) <= 5:
+        return messages
+
+    total_chars = sum(len(str(m.get("content", ""))) for m in messages)
+    if total_chars <= max_chars:
+        return messages
+
+    logger.info(f"[Safety Monitor] Pruning context: {total_chars} chars > {max_chars} limit.")
+    
+    # Keep system message and last 4 turns
+    system_msg = messages[0] if messages[0].get("role") == "system" else None
+    footer = messages[-4:]
+    
+    # Prune from the middle (starting after system message)
+    middle = messages[1:-4] if system_msg else messages[:-4]
+    
+    # Simple strategy: Keep removing oldest middle messages until under limit
+    while total_chars > max_chars and middle:
+        removed = middle.pop(0)
+        total_chars -= len(str(removed.get("content", "")))
+    
+    new_messages = []
+    if system_msg:
+        new_messages.append(system_msg)
+    new_messages.extend(middle)
+    new_messages.extend(footer)
+    
+    logger.info(f"[Safety Monitor] New context size: {sum(len(str(m.get('content', ''))) for m in new_messages)} chars.")
+    return new_messages
+
+
 def _docker_to_host_url(url: str) -> str:
     """Convert Docker container URLs to host-accessible URLs."""
     return url.replace("host.docker.internal", "localhost")
@@ -234,7 +270,7 @@ async def _start_llamacpp_server(config: dict):
         truncate_args = [
             "--chat-truncate", 
             "--chat-truncate-max-keep", "0.7",
-            "--slot-prompt-similarity", "0.0",
+            "--slot-prompt-similarity", "0.95",
             "--batch-size", "1024",
             "--ubatch-size", "1024"
         ]
@@ -647,6 +683,7 @@ async def stream_proxy(url: str, body: dict, lock: asyncio.Lock,
             content_buffer = ""
             lookahead_buffer = "" # For split-chunk tag reconstruction
             in_tool_tag = False
+            in_progress_block = False
             active_tag_name = ""
             
             while True:
@@ -713,6 +750,38 @@ async def stream_proxy(url: str, body: dict, lock: asyncio.Lock,
                             delta = choices[0].get("delta", {})
                             content = delta.get("content", "")
                             
+                            # Safety Monitor: 100k capacity for complex systems engineering.
+                            # We track this REGARDLESS of scrubbing status to protect Distillation passes.
+                            if content and not in_tool_tag:
+                                turn_throughput += len(content)
+                                if turn_throughput > 100000:
+                                    logger.error(f"[Safety Monitor] Analytical capacity exceeded ({turn_throughput} chars). Triggering stability protocol.")
+                                    # Inject closing tag if we are inside a tool call to prevent UI crash
+                                    closure = ""
+                                    if in_tool_tag and active_tag_name:
+                                        logger.warning(f"[Safety Monitor] Force-closing tag </{active_tag_name}> due to capacity limit.")
+                                        closure = f"</{active_tag_name}>\n\n[STABILITY MONITOR: Analytical capacity reached. Turn was terminated while '{active_tag_name}' was active. DO NOT re-read this file/data from the beginning. Use 'grep' or continue from line 1000+ if needed.]\n\n"
+                                    
+                                    delta["content"] = content + closure + "[STABILITY PROTOCOL: Analytical reasoning capacity exceeded (100k). Forcing turn completion.]"
+                                    
+                                    # Fragment Recovery: If server ends turn prematurely while tag is open
+                                    finish_reason = choices[0].get("finish_reason")
+                                    if (finish_reason == "length" or (is_native and data.get("done"))) and in_tool_tag and active_tag_name:
+                                        logger.warning(f"[Safety Monitor] Server-side cutoff detected. Force-closing </{active_tag_name}>.")
+                                        delta["content"] = (delta.get("content", "") or "") + f"</{active_tag_name}>\n\n[STABILITY PROTOCOL: Analytical capacity reached context limit. Session state preserved.]"
+                                        # Ensure finish_reason is still set correctly for UI
+                                        if not is_native:
+                                            data["choices"][0]["finish_reason"] = "length"
+                                        else:
+                                            data["done"] = True
+
+                                    if is_native:
+                                        native_chunk = {"model": "Bob", "message": delta, "done": data.get("done", False)}
+                                        yield f"{json.dumps(native_chunk)}\n".encode("utf-8")
+                                    else:
+                                        yield f"data: {json.dumps(data)}\n\n".encode("utf-8")
+                                    return
+
                             if content and not scrub_disabled:
                                 # Look-Ahead Reconstruction: Handle tags split across chunks
                                 raw_content = lookahead_buffer + content
@@ -725,6 +794,8 @@ async def stream_proxy(url: str, body: dict, lock: asyncio.Lock,
                                     if len(raw_content) - split_idx < 100:
                                         lookahead_buffer = raw_content[split_idx:]
                                         content = raw_content[:split_idx]
+                                        # IMPORTANT: Clear outgoing content so we don't send the partial tag yet
+                                        delta["content"] = content
                                     else:
                                         content = raw_content
                                 else:
@@ -746,31 +817,38 @@ async def stream_proxy(url: str, body: dict, lock: asyncio.Lock,
                                     
                                     # Process scrubbing if active
                                     if in_tool_tag:
+                                        # Use a sub-state to track if we are specifically inside a progress block
                                         if "<task_progress>" in content:
+                                            # If tag is split, handle with lookahead (already done above)
+                                            in_progress_block = True
                                             content_buffer += content
-                                            delta["content"] = "" 
+                                            delta["content"] = " " # Heartbeat
+                                        elif "</task_progress>" in content:
+                                            in_progress_block = False
+                                            content_buffer += content
+                                            delta["content"] = " " # Heartbeat
                                         elif active_tag_name and f"</{active_tag_name}>" in content:
+                                            # Release the cleaned progress buffer after the tool call closes
                                             if content_buffer:
-                                                # Found closing tag - clean and release entire buffer
-                                                delta["content"] = content + "\n\n" + content_buffer.replace("<task_progress>", "### Progress:\n").replace("</task_progress>", "")
+                                                clean_progress = content_buffer.replace("<task_progress>", "### Progress:\n").replace("</task_progress>", "")
+                                                delta["content"] = content + "\n\n" + clean_progress
                                                 content_buffer = ""
-                                                logger.info(f"[Scrubber] De-nested progress for <{active_tag_name}>.")
+                                            else:
+                                                delta["content"] = content
                                             in_tool_tag = False
                                             active_tag_name = ""
+                                        elif in_progress_block:
+                                            # Buffer progress content
+                                            content_buffer += content
+                                            delta["content"] = " " # Heartbeat
                                         else:
-                                            # Not at a closing tag yet
-                                            if len(content_buffer) > 512:
-                                                # Safety valve: Clean and flush what we have to prevent 'darkness'
-                                                logger.warning(f"[Scrubber] Safety Valve triggered. Flushing CLEANED buffer for <{active_tag_name}>.")
-                                                delta["content"] = content_buffer.replace("<task_progress>", "### Progress:\n").replace("</task_progress>", "") + content
-                                                content_buffer = ""
+                                            # Allow standard tool parameters (command, path, etc) to pass through
+                                            delta["content"] = content
                                     else:
-                                        # Loop Watchdog: If we have > 20k chars of thought with zero tools, it's a loop
-                                        turn_throughput += len(content)
-                                        if not in_tool_tag and turn_throughput > 20000:
-                                            logger.error(f"[Watchdog] Loop detected! {turn_throughput} chars without a tool. Breaking.")
-                                            raise Exception("Infinite Reasoning Loop Detected")
                                         delta["content"] = content
+                            elif content and scrub_disabled:
+                                # Distillation path: Scrubber is off, but watchdog already tracked throughput above
+                                delta["content"] = content
 
                         if is_native:
                             # Path 2: OpenAI backend -> Native client (translate)
@@ -868,7 +946,7 @@ async def shutdown_expert():
             proc.terminate()
             try:
                 proc.wait(timeout=5)
-            except:
+            except Exception:
                 proc.kill()
             killed_count += 1
         
@@ -878,12 +956,11 @@ async def shutdown_expert():
         if model_name in _llamacpp_ready_events:
             _llamacpp_ready_events[model_name].clear()
             
-    # Fallback: Hard-kill any stray llama-server processes just in case
     try:
         # Use killall as a universal sweep for any binary name match
         subprocess.run(["killall", "-9", "llama-server"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         logger.info("VRAM Cleanup: Executed killall -9 llama-server sweep.")
-    except:
+    except Exception:
         pass
 
     logger.info(f"VRAM Cleanup: Terminated {killed_count} tracked expert processes.")
@@ -925,8 +1002,8 @@ async def proxy_ollama(request: Request):
         is_suggestion_ping = any(kw in last_content for kw in ["suggest 3-5", "generate a title", "generate a short title", "summarize", "short label", "tags"])
         
         # Suppress suggestions immediately after a build launch to conserve VRAM for the 35B Expert
-        if is_suggestion_ping and any("build pipeline launched" in str(m.get("content", "")).lower() for m in messages[-3:]):
-            logger.info("Suppressing suggestion ping due to recent Build Launch context.")
+        if is_suggestion_ping and any("build pipeline" in str(m.get("content", "")).lower() for m in messages[-3:]):
+            logger.info("Suppressing suggestion ping due to recent build pipeline trigger.")
             is_suggestion_ping = False
 
         # Prompt Expansion (Inhibited by policy)
@@ -1208,6 +1285,10 @@ async def proxy_ollama(request: Request):
 
         if target_model == EXPERT_MODEL and is_cold_expert:
             await sweep_vram_for_expert()
+
+        # --- Context Pruning (Analytical Resilience) ---
+        messages = _prune_messages(messages)
+        body["messages"] = messages
 
         # --- Resolve Provider Config ---
         target_config = _resolve_config(target_model)
@@ -1801,16 +1882,17 @@ async def _trigger_build_pipeline(messages: list) -> str:
         logger.info(f"Launching pipeline command: {' '.join(cmd)}")
         subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        # Launch the Watchdog to ensure VRAM is released when container stops/deleted
-        asyncio.create_task(_docker_watchdog(container_name))
+        # Launch the Safety Monitor to ensure VRAM is released when container stops/deleted
+        asyncio.create_task(_docker_safety_monitor(container_name))
 
         return (
-            f"🚀 **Build Pipeline Launched!**\n\n"
-            f"- **Workspace:** `{target_dir}`\n"
+            f"🔨 **Build pipeline triggered.**\n\n"
+            f"- **Workspace:** `conversations/{os.path.basename(target_dir)}`\n"
             f"- **Container:** `{container_name}`\n"
-            f"- **Safety Net:** Watchdog active (VRAM auto-release on stop)\n\n"
+            f"- **Mode:** `Autonomous`\n"
+            f"- **Status:** *Distillation started... Cline will follow.*\n\n"
             f"Check logs with: `docker logs -f {container_name}`\n"
-            f"*Tip: You can also type `!logs` to view them in chat!*"
+            f"Tip: You can also type `!logs` to view them in chat, or ask me for build insights!"
         )
 
     except Exception as e:
@@ -1878,12 +1960,12 @@ async def is_pipeline_active() -> bool:
         return False
 
 
-async def _docker_watchdog(container_name: str):
+async def _docker_safety_monitor(container_name: str):
     """
     Background task that monitors a specific Docker container.
     When the container stops, it automatically triggers a VRAM cleanup.
     """
-    logger.info(f"[Watchdog] Starting monitor for {container_name}")
+    logger.info(f"[Safety Monitor] Starting monitor for {container_name}")
     try:
         # Initial wait to let it start
         await asyncio.sleep(10)
@@ -1899,13 +1981,13 @@ async def _docker_watchdog(container_name: str):
             
             if proc.returncode != 0:
                 # Container likely deleted or vanished
-                logger.info(f"[Watchdog] Container {container_name} vanished. Releasing VRAM.")
+                logger.info(f"[Safety Monitor] Container {container_name} vanished. Releasing VRAM.")
                 await shutdown_expert()
                 break
             
             status = stdout.decode().strip().lower()
             if status == "false":
-                logger.info(f"[Watchdog] Container {container_name} stopped. Releasing VRAM.")
+                logger.info(f"[Safety Monitor] Container {container_name} stopped. Releasing VRAM.")
                 await shutdown_expert()
                 break
                 

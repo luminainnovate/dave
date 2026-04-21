@@ -31,7 +31,7 @@ cleanup_vram() {
     # Send shutdown signal to orchestrator
     ORCHESTRATOR_URL="${ORCHESTRATOR_URL:-http://host.docker.internal:8000}"
     curl -s -X POST "${ORCHESTRATOR_URL}/v1/shutdown_expert" > /dev/null || true
-    echo "  ✓ Expert unloaded. GPU Safe."
+    echo "  ✓ Expert unloaded."
 }
 trap cleanup_vram EXIT INT TERM
 
@@ -290,9 +290,17 @@ generate_session_state() {
         echo "" >> "$STATE_FILE"
     fi
     
+    # Inject quality audit if it exists
+    if [ -f "/workspace/.cline_context/quality_audit.md" ]; then
+        echo "## 🛡️ Architectural & Quality Critique" >> "$STATE_FILE"
+        echo "> These notes represent the project's quality conscience. Address these critiques before implementation." >> "$STATE_FILE"
+        cat /workspace/.cline_context/quality_audit.md >> "$STATE_FILE"
+        echo "" >> "$STATE_FILE"
+    fi
+
     # Inject analysis notes if agent wrote any
     if [ -f "/workspace/.cline_context/analysis_notes.md" ]; then
-        echo "## Agent Notes (from previous steps)" >> "$STATE_FILE"
+        echo "## Agent Discovery Notes" >> "$STATE_FILE"
         tail -c 3000 /workspace/.cline_context/analysis_notes.md >> "$STATE_FILE"
         echo "" >> "$STATE_FILE"
     fi
@@ -388,12 +396,15 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     echo "  🔍 Running Cline (Verification mode)..."
     generate_session_state "$ITERATION" "verify"
 
-    VERIFY_MSG="IMPORTANT: First read '.cline_context/.session_state.md' to understand what has been done so far. Then: 
-    1) Verify all tasks from .clinerules are implemented and the code runs without errors. 
-    2) MUST DO: Create a 'README.md' file that clearly explains what the project is and EXACTLY how to run it. 
-    3) Check if '.cline_context/.build_issues.md' already exists. If it does, READ it. Cross off or remove the issues that were fixed in this iteration, and keep the ones that still need work. Do not hallucinate uncompleted tasks. 
-    4) If the app is 100% working, safe, and has a README, create a file named '.build_complete' in the root directory containing 'VERIFIED'. If issues remain, ensure they are accurately documented in '.cline_context/.build_issues.md'.
-    5) Before testing, if a port is in use, YOU MUST ONLY use 'npx kill-port <portnumber>' to free it. DO NOT use pkill, killall, or kill commands under any circumstances."
+    VERIFY_MSG="IMPORTANT: First read '.cline_context/.session_state.md' to understand what has been done so far. 
+    [STABILITY PROTOCOL]: Do not start by reading the entire codebase. Run the project's primary test suite immediately (check the TOOLCHAIN block in .clinerules for the correct command). Use the failures to identify which files actually need inspection.
+    1) Verify all tasks from .clinerules are implemented and the code runs as expected. 
+    2) [QUALITY RECONCILIATION]: Read '.cline_context/quality_audit.md'. If current implementation has resolved any of these critiques, REMOVE them from the file.
+    3) MUST DO: Create a 'README.md' file that clearly explains what the project is and EXACTLY how to run it. 
+    4) Check if '.cline_context/.build_issues.md' already exists. If it does, READ it. Cross off or remove the issues that were fixed in this iteration.
+    5) If the app is 100% working, safe, and has a README, create a file named '.build_complete' in the root directory containing 'VERIFIED'.
+    6) CONTINUITY: Watch for '[STABILITY MONITOR]' markers in history. If a turn was cut off, do not re-read from the beginning; pick up exactly where you left off.
+    7) Before testing, if a port is in use, YOU MUST ONLY use 'npx kill-port <portnumber>' to free it."
     set +e
     cline task -v -y --thinking \
         -m "$CLINE_MODEL" \
@@ -406,11 +417,13 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     echo "  🛡️ Running Cline (Safety audit)..."
     generate_session_state "$ITERATION" "safety"
 
-    SAFETY_MSG="IMPORTANT: First read '.cline_context/.session_state.md' to understand what has been done so far. Then perform a security and safety audit of all code in the current project. Check for: 1) Input validation, 2) Path traversal, 3) Hardcoded secrets, 4) Injection risks, 5) Infinite loops/resource leaks, 6) Missing error handling. 
-    If you find critical issues, attempt to FIX THEM DIRECTLY in the code. 
-    If you fix them or the code is already safe, append 'SAFE' to the '.build_complete' file. 
-    If you cannot fix them, add them to '.cline_context/.build_issues.md'.
-    Before testing, if a port is in use, YOU MUST ONLY use 'npx kill-port <portnumber>' to free it. DO NOT use pkill, killall, or kill commands under any circumstances."
+    SAFETY_MSG="IMPORTANT: First read '.cline_context/.session_state.md' to understand what has been done so far.
+    [STABILITY PROTOCOL]: Do not perform an exhaustive top-to-bottom audit of every file. Use 'searchFiles' (grep) to hunt for hazardous patterns like 'unsafe', 'shell', or hardcoded paths. Only deep-dive into the specific files and lines that flag these risks.
+    1) Audit for: Input validation, Path traversal, Hardcoded secrets, Injection risks, Infinite loops, Missing error handling. 
+    2) If you find critical issues, attempt to FIX THEM DIRECTLY in the code. 
+    3) If you fix them or the code is already safe, append 'SAFE' to the '.build_complete' file. 
+    4) CONTINUITY: Watch for '[STABILITY MONITOR]' markers in history. If a turn was cut off, do not re-read from the beginning; pick up exactly where you left off.
+    5) Before testing, if a port is in use, YOU MUST ONLY use 'npx kill-port <portnumber>' to free it."
     set +e
     cline task -v -y --thinking \
         -m "$CLINE_MODEL" \

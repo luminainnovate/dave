@@ -188,9 +188,11 @@ def call_llm(client: httpx.Client, model_config, system_prompt: str, user_conten
             chunk_prompt += f"### PREVIOUS ANALYSES\n{prior_context}\n\n---\n\n"
             
         chunk_prompt += (
-            f"### CURRENT TASK (PART {i + 1} OF {len(chunks)})\n"
-            f"Extract key technical information from this text chunk.\n\n"
-            f"{chunk}"
+            f"### CURRENT TASK\n"
+            f"Extract key technical information from the following text chunk.\n\n"
+            f"{chunk}\n\n"
+            f"---\n"
+            f"CHUNK IDENTIFIER: PART {i + 1} OF {len(chunks)}"
         )
         
         print(f"    ↳ Preparing {part_label} (Payload: {len(chunk_prompt)} chars)...", flush=True)
@@ -302,57 +304,80 @@ def _single_llm_call(client: httpx.Client, model_config, system_prompt: str, use
             with httpx.Client() as stream_client:
                 # Disable orchestrator scrubbing for distillation passes
                 headers = {"X-No-Scrub": "true"}
-                with stream_client.stream("POST", url, json=payload, headers=headers, timeout=600.0) as resp:
-                    if resp.status_code == 503:
-                        first_token_received.set()
-                        print(f"\n  ⚠ Orchestrator is busy (503). Retrying in 10s... (Attempt {attempt+1}/{max_retries})")
-                        time.sleep(10)
-                        continue
-
-                    if resp.status_code != 200:
-                        first_token_received.set()
-                        print("\n  ✗ LLM returned status", resp.status_code)
-                        # Read error if possible
-                        try:
-                            err_body = resp.read().decode()
-                            print(f"    Error: {err_body[:200]}")
-                        except: pass
-                        return f"[ERROR: LLM returned status {resp.status_code}]"
-                    
-                    dot_count = 0
-                    for line in resp.iter_lines():
-                        if not line:
-                            continue
-                        
-                        if not first_token_received.is_set():
+                # Stability Protocol: 60s budget per part.
+                try:
+                    with stream_client.stream("POST", url, json=payload, headers=headers, timeout=60.0) as resp:
+                        if resp.status_code == 503:
                             first_token_received.set()
+                            print(f"\n  ⚠ Orchestrator is busy (503). Retrying in 10s... (Attempt {attempt+1}/{max_retries})")
+                            time.sleep(10)
+                            continue
 
-                        if is_ollama:
-                            chunk_data = json.loads(line)
-                            token = chunk_data.get("message", {}).get("content", "")
-                            done = chunk_data.get("done", False)
-                        else:
-                            if not line.startswith("data: "):
-                                continue
-                            if line == "data: [DONE]":
-                                break
-                            chunk_data = json.loads(line[6:])
-                            choices = chunk_data.get("choices", [{}])
-                            token = choices[0].get("delta", {}).get("content", "") if choices else ""
-                            done = choices[0].get("finish_reason") is not None if choices else False
-
-                        if token:
-                            full_response.append(token)
-                            dot_count += 1
-                            if dot_count % 20 == 0:
-                                print(".", end="", flush=True)
+                        if resp.status_code != 200:
+                            first_token_received.set()
+                            print("\n  ✗ LLM returned status", resp.status_code)
+                            # Read error if possible
+                            try:
+                                err_body = resp.read().decode()
+                                print(f"    Error: {err_body[:200]}")
+                            except Exception:
+                                pass
+                            return f"[ERROR: LLM returned status {resp.status_code}]"
                         
-                        if done:
-                            break
-            
-            elapsed = time.time() - start_time
-            print(f" ✓ ({elapsed:.1f}s)", flush=True)
-            return "".join(full_response)
+                        dot_count = 0
+                        for line in resp.iter_lines():
+                            if not line:
+                                continue
+                            
+                            if not first_token_received.is_set():
+                                first_token_received.set()
+
+                            if is_ollama:
+                                chunk_data = json.loads(line)
+                                token = chunk_data.get("message", {}).get("content", "")
+                                done = chunk_data.get("done", False)
+                            else:
+                                if not line.startswith("data: "):
+                                    continue
+                                if line == "data: [DONE]":
+                                    break
+                                chunk_data = json.loads(line[6:])
+                                choices = chunk_data.get("choices", [{}])
+                                token = choices[0].get("delta", {}).get("content", "") if choices else ""
+                                done = choices[0].get("finish_reason") is not None if choices else False
+
+                            if token:
+                                full_response.append(token)
+                                # Stability Protocol: 60s budget per part.
+                                if time.time() - start_time > 60:
+                                    if attempt < max_retries - 1:
+                                        print(f"\n      ⚠ [STABILITY PROTOCOL] Analytical capacity exceeded. Retrying part ({attempt+2}/{max_retries})...")
+                                        first_token_received.set()
+                                        raise httpx.ReadTimeout("Analytical capacity exceeded")
+                                    else:
+                                        print(f"\n      ✗ [STABILITY PROTOCOL] Analytical capacity exceeded on FINAL ATTEMPT. Salvaging {len(full_response)} tokens.")
+                                        first_token_received.set()
+                                        return "".join(full_response)
+                                
+                                dot_count += 1
+                                if dot_count % 20 == 0:
+                                    print(".", end="", flush=True)
+                            
+                            if done:
+                                break
+                    
+                    elapsed = time.time() - start_time
+                    print(f" ✓ ({elapsed:.1f}s)", flush=True)
+                    return "".join(full_response)
+
+                except httpx.ReadTimeout:
+                    first_token_received.set()
+                    if attempt < max_retries - 1:
+                        print(f"\n      ⚠ [Stability Protocol] Analytical capacity exceeded (timeout). Retrying part ({attempt+2}/{max_retries})...")
+                        continue
+                    else:
+                        print(f"\n      ✗ [Stability Protocol] Analytical capacity exceeded on FINAL ATTEMPT. Salvaging {len(full_response)} tokens.")
+                        return "".join(full_response) if full_response else "[ERROR: ReadTimeout]"
 
         except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as e:
             first_token_received.set()
@@ -393,14 +418,15 @@ STOP_WORDS = {"the","a","an","is","it","to","and","or","of","in","on","for",
 
 def select_relevant_kb(kb_dir: str, instruction: str, max_chars: int = 100000) -> str:
     """Score and select only relevant KB files based on keyword matching."""
-    import glob, re
+    import glob
+    import re
 
     # 1. Extract keywords from instruction (3+ chars, not stop words)
     raw_words = re.findall(r'[a-zA-Z0-9_]+', instruction.lower())
     keywords = {w for w in raw_words if len(w) >= 3 and w not in STOP_WORDS}
 
     if not keywords:
-        print(f"  📖 KB: No meaningful keywords found in instruction. Skipping KB.", flush=True)
+        print("  📖 KB: No meaningful keywords found in instruction. Skipping KB.", flush=True)
         return ""
 
     print(f"  📖 KB Keywords: {', '.join(sorted(keywords)[:15])}", flush=True)
@@ -457,7 +483,7 @@ def select_relevant_kb(kb_dir: str, instruction: str, max_chars: int = 100000) -
 
     result = "\n\n".join(selected_content)
     if collateral_names:
-        result += f"\n\n### Other KB Files (not loaded - request if needed):\n"
+        result += "\n\n### Other KB Files (not loaded - request if needed):\n"
         result += ", ".join(collateral_names[:50])
 
     matched = len(selected_content)
