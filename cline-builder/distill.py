@@ -326,6 +326,18 @@ def _single_llm_call(client: httpx.Client, model_config, system_prompt: str, use
                         
                         dot_count = 0
                         for line in resp.iter_lines():
+                            # Stability Protocol: 60s hard budget per part (wall-clock time)
+                            # This must run REGARDLESS of whether we received a token or a heartbeat.
+                            if time.time() - start_time > 60:
+                                if attempt < max_retries - 1:
+                                    print(f"\n      ⚠ [STABILITY PROTOCOL] Analytical capacity exceeded (60s). Retrying part ({attempt+2}/{max_retries})...")
+                                    first_token_received.set()
+                                    raise httpx.ReadTimeout("Analytical capacity exceeded")
+                                else:
+                                    print(f"\n      ✗ [STABILITY PROTOCOL] Analytical capacity exceeded on FINAL ATTEMPT. Salvaging {len(full_response)} tokens.")
+                                    first_token_received.set()
+                                    return "".join(full_response)
+
                             if not line:
                                 continue
                             
@@ -338,27 +350,21 @@ def _single_llm_call(client: httpx.Client, model_config, system_prompt: str, use
                                 done = chunk_data.get("done", False)
                             else:
                                 if not line.startswith("data: "):
+                                    # Handle orchestrator heartbeats and non-data SSE events
                                     continue
                                 if line == "data: [DONE]":
                                     break
-                                chunk_data = json.loads(line[6:])
-                                choices = chunk_data.get("choices", [{}])
-                                token = choices[0].get("delta", {}).get("content", "") if choices else ""
-                                done = choices[0].get("finish_reason") is not None if choices else False
+                                try:
+                                    chunk_data = json.loads(line[6:])
+                                    choices = chunk_data.get("choices", [{}])
+                                    token = choices[0].get("delta", {}).get("content", "") if choices else ""
+                                    done = choices[0].get("finish_reason") is not None if choices else False
+                                except Exception:
+                                    # Skip malformed chunks or internal proxy metadata
+                                    continue
 
                             if token:
                                 full_response.append(token)
-                                # Stability Protocol: 60s budget per part.
-                                if time.time() - start_time > 60:
-                                    if attempt < max_retries - 1:
-                                        print(f"\n      ⚠ [STABILITY PROTOCOL] Analytical capacity exceeded. Retrying part ({attempt+2}/{max_retries})...")
-                                        first_token_received.set()
-                                        raise httpx.ReadTimeout("Analytical capacity exceeded")
-                                    else:
-                                        print(f"\n      ✗ [STABILITY PROTOCOL] Analytical capacity exceeded on FINAL ATTEMPT. Salvaging {len(full_response)} tokens.")
-                                        first_token_received.set()
-                                        return "".join(full_response)
-                                
                                 dot_count += 1
                                 if dot_count % 20 == 0:
                                     print(".", end="", flush=True)

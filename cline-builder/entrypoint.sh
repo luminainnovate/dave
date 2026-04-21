@@ -376,7 +376,7 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     fi
 
     set +e
-    cline task -v -y --thinking \
+    cline task -v -y \
         -m "$CLINE_MODEL" \
         --timeout "$CURRENT_TIMEOUT" \
         "$BUILD_MSG" \
@@ -406,7 +406,7 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     6) CONTINUITY: Watch for '[STABILITY MONITOR]' markers in history. If a turn was cut off, do not re-read from the beginning; pick up exactly where you left off.
     7) Before testing, if a port is in use, YOU MUST ONLY use 'npx kill-port <portnumber>' to free it."
     set +e
-    cline task -v -y --thinking \
+    cline task -v -y \
         -m "$CLINE_MODEL" \
         --timeout 1800 \
         "$VERIFY_MSG" \
@@ -425,7 +425,7 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     4) CONTINUITY: Watch for '[STABILITY MONITOR]' markers in history. If a turn was cut off, do not re-read from the beginning; pick up exactly where you left off.
     5) Before testing, if a port is in use, YOU MUST ONLY use 'npx kill-port <portnumber>' to free it."
     set +e
-    cline task -v -y --thinking \
+    cline task -v -y \
         -m "$CLINE_MODEL" \
         --timeout 1800 \
         "$SAFETY_MSG" \

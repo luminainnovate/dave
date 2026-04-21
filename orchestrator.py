@@ -40,7 +40,7 @@ DEFAULT_EXPERT_MODEL = "qwen3.5:27b" # Keep this as default, if you know what yo
 
 # llama.cpp managed process settings (only used when provider is "llamacpp")
 LLAMACPP_BINARY = "/usr/local/bin/llama-server"  # Path to llama-server binary
-LLAMACPP_DEFAULT_ARGS = ["--no-cg", "--cache-type-k", "q8_0", "--cache-type-v", "q8_0", "--flash-attn"]  # Extra CLI args (KV Quant + FA enabled)
+LLAMACPP_DEFAULT_ARGS = ["--cache-type-k", "q8_0", "--cache-type-v", "q8_0"]  # Extra CLI args (KV Quant enabled)
 
 COMFYUI_URL = "http://localhost:8188"
 EXPERT_CTX = 131072   # Context for the expert model (128k)
@@ -685,6 +685,7 @@ async def stream_proxy(url: str, body: dict, lock: asyncio.Lock,
             in_tool_tag = False
             in_progress_block = False
             active_tag_name = ""
+            seen_openers = set() # Track starting tags to prevent dangling closures
             
             while True:
                 try:
@@ -801,51 +802,61 @@ async def stream_proxy(url: str, body: dict, lock: asyncio.Lock,
                                 else:
                                     content = raw_content
 
-                                if content:
-                                    # Track start of any tool call generically
-                                    if not in_tool_tag:
-                                        tag_match = re.search(r'<([a-z0-9_]+)>', content)
-                                        if tag_match:
-                                            tag_name = tag_match.group(1)
-                                            AGENT_TOOLS = ["read_file", "write_to_file", "search_files", "execute_command", 
-                                                          "list_files", "list_dir", "grep_search", "read_browser_page",
-                                                          "replace_in_file", "insert_content", "ask_followup_question", "attempt_completion"]
-                                            if tag_name in AGENT_TOOLS:
-                                                in_tool_tag = True
-                                                active_tag_name = tag_name
-                                                logger.info(f"[Scrubber] Detected tool call across window: <{tag_name}>.")
-                                    
-                                    # Process scrubbing if active
-                                    if in_tool_tag:
-                                        # Use a sub-state to track if we are specifically inside a progress block
-                                        if "<task_progress>" in content:
-                                            # If tag is split, handle with lookahead (already done above)
-                                            in_progress_block = True
-                                            content_buffer += content
-                                            delta["content"] = " " # Heartbeat
-                                        elif "</task_progress>" in content:
-                                            in_progress_block = False
-                                            content_buffer += content
-                                            delta["content"] = " " # Heartbeat
-                                        elif active_tag_name and f"</{active_tag_name}>" in content:
-                                            # Release the cleaned progress buffer after the tool call closes
-                                            if content_buffer:
-                                                clean_progress = content_buffer.replace("<task_progress>", "### Progress:\n").replace("</task_progress>", "")
-                                                delta["content"] = content + "\n\n" + clean_progress
-                                                content_buffer = ""
-                                            else:
-                                                delta["content"] = content
-                                            in_tool_tag = False
-                                            active_tag_name = ""
-                                        elif in_progress_block:
-                                            # Buffer progress content
-                                            content_buffer += content
-                                            delta["content"] = " " # Heartbeat
+                                # UNIVERSAL FIELD SCRUBBER: Sanitize all delta fields (content, reasoning_content, thought, etc.)
+                                scrub_targets = ["thinking", "thought", "thought_process", "read_file", "write_to_file", "execute_command"]
+                                for key, value in list(delta.items()):
+                                    if isinstance(value, str) and value:
+                                        # Track openers in this Turn/Request
+                                        for opener in re.findall(r'<\s*([a-zA-Z0-9_]+)\s*>', value):
+                                            seen_openers.add(opener.lower())
+                                        
+                                        # Identify and strip dangling closures
+                                        closures = re.findall(r'</\s*([a-zA-Z0-9_]+)\s*>', value, re.IGNORECASE)
+                                        for closure in closures:
+                                            if closure.lower() not in seen_openers:
+                                                if closure.lower() in scrub_targets:
+                                                    logger.warning(f"[Scrubber] Stripped dangling tag from delta['{key}']: </{closure}>")
+                                                    value = re.sub(f'</\\s*{re.escape(closure)}\\s*>', "", value, flags=re.IGNORECASE)
+                                        
+                                        delta[key] = value
+
+                                # Standard content extraction for tool-state tracking
+                                content = delta.get("content", "")
+
+                                if in_tool_tag:
+                                    if "<task_progress>" in content:
+                                        in_progress_block = True
+                                        content_buffer += content
+                                        delta["content"] = " " 
+                                    elif "</task_progress>" in content:
+                                        in_progress_block = False
+                                        content_buffer += content
+                                        delta["content"] = " " 
+                                    elif active_tag_name and f"</{active_tag_name}>" in content:
+                                        if content_buffer:
+                                            clean_progress = content_buffer.replace("<task_progress>", "### Progress:\n").replace("</task_progress>", "")
+                                            delta["content"] = content + "\n\n" + clean_progress
+                                            content_buffer = ""
                                         else:
-                                            # Allow standard tool parameters (command, path, etc) to pass through
                                             delta["content"] = content
+                                        in_tool_tag = False
+                                        active_tag_name = ""
+                                    elif in_progress_block:
+                                        content_buffer += content
+                                        delta["content"] = " " 
                                     else:
                                         delta["content"] = content
+                                else:
+                                    tag_match = re.search(r'<([a-z0-9_]+)>', content)
+                                    if tag_match:
+                                        tag_name = tag_match.group(1)
+                                        if tag_name in ["read_file", "write_to_file", "search_files", "execute_command", 
+                                                      "list_files", "list_dir", "grep_search", "read_browser_page",
+                                                      "replace_in_file", "insert_content", "ask_followup_question", "attempt_completion"]:
+                                            in_tool_tag = True
+                                            active_tag_name = tag_name
+                                            logger.info(f"[Scrubber] Detected tool call across window: <{tag_name}>.")
+                                    delta["content"] = content
                             elif content and scrub_disabled:
                                 # Distillation path: Scrubber is off, but watchdog already tracked throughput above
                                 delta["content"] = content
