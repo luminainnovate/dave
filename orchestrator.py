@@ -1904,7 +1904,7 @@ async def _trigger_build_pipeline(messages: list) -> str:
         container_name = f"cline-builder-{int(time.time())}"
         project_name = os.path.basename(abs_target_dir)
         cmd = [
-            "docker", "compose", "--profile", "build", "run", "-d",
+            "docker", "compose", "--profile", "build", "run", "-d", "--rm",
             "--name", container_name,
             "-v", f"{abs_target_dir}:/workspace",
             "-e", "CONVERSATION_FILE=/workspace/.cline_context/conversation.json",
