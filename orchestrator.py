@@ -259,7 +259,9 @@ async def _start_llamacpp_server(config: dict):
         # Parse host/port from base_url
         parsed = urlparse(base_url)
         port = str(parsed.port or 8081)
-        host = parsed.hostname or "127.0.0.1"
+        # Force bind to 0.0.0.0 so Docker containers (like cline-builder) can connect
+        # via host.docker.internal, otherwise 127.0.0.1 blocks them.
+        host = "0.0.0.0"
 
         # Context window: use config override, or fall back to EXPERT_CTX
         ctx_size = str(config.get("ctx_size", EXPERT_CTX))
@@ -2040,7 +2042,7 @@ async def _trigger_build_pipeline_safe(messages: list) -> str:
     waiting for any active LLM tasks to finish.
     Includes a cooldown to prevent duplicate triggers from client retries.
     """
-    global _last_build_trigger_time
+    global _last_build_trigger_time, vram_locked
     current_time = time.time()
     if current_time - _last_build_trigger_time < 10:
         logger.warning("Duplicate build trigger ignored (cooldown).")
@@ -2050,6 +2052,8 @@ async def _trigger_build_pipeline_safe(messages: list) -> str:
 
     async with gpu_lock:
         logger.info("Acquired GPU lock for pipeline trigger. Clearing VRAM...")
+        # Protect VRAM from periodic cleanup while build runs
+        vram_locked = True
         
         # Don't kill the Expert if it is a managed llama.cpp process
         # This prevents the 'Network unreachable' error when the container starts
