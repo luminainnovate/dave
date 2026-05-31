@@ -341,7 +341,7 @@ fi
 echo "  🔑 Configuring provider (${CLINE_PROVIDER}) for Cline CLI..."
 
 cline auth \
-    -p openaiCompatible \
+    -p openai-compatible \
     -k "dummy" \
     -m "$CLINE_MODEL" \
     -b "${CLINE_AUTH_URL}"
@@ -378,7 +378,7 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     set +e
     export CLINE_MODEL CURRENT_TIMEOUT BUILD_MSG
     script -q -e -c 'cline -v --auto-approve true \
-        -P openaiCompatible \
+        -P openai-compatible \
         -m "$CLINE_MODEL" \
         --timeout "$CURRENT_TIMEOUT" \
         "$BUILD_MSG"' \
@@ -410,7 +410,7 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     set +e
     export CLINE_MODEL VERIFY_MSG
     script -q -e -c 'cline -v --auto-approve true \
-        -P openaiCompatible \
+        -P openai-compatible \
         -m "$CLINE_MODEL" \
         --timeout 1800 \
         "$VERIFY_MSG"' \
@@ -431,7 +431,7 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     set +e
     export CLINE_MODEL SAFETY_MSG
     script -q -e -c 'cline -v --auto-approve true \
-        -P openaiCompatible \
+        -P openai-compatible \
         -m "$CLINE_MODEL" \
         --timeout 1800 \
         "$SAFETY_MSG"' \
