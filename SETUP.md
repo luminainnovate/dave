@@ -10,6 +10,13 @@ chmod +x setup_workspace.sh
 ./setup_workspace.sh
 ```
 
+**For a Distributed (2-Device) Setup:**
+If you are offloading the frontend router to a Raspberry Pi, run the Pi-specific installer on that device instead:
+```bash
+chmod +x setup_pi.sh
+./setup_pi.sh
+```
+
 ---
 
 **Prerequisite:** Please read `ARCHITECTURE.md` first to understand the VRAM constraints, network rules, and GPU Mutex locking requirements.
@@ -416,5 +423,5 @@ jobs:
         python -m pip install --upgrade pip
         pip install ruff fastapi uvicorn httpx
     - name: Lint with Ruff
-      run: ruff check orchestrator.py
+      run: ruff check .
 ```
