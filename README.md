@@ -82,9 +82,13 @@ A high-level overview of the **br.ai.n** workspace and its core components:
 .
 ├── orchestrator.py          # 🧠 Central FastAPI Proxy (VRAM Manager & Router)
 ├── mover.py                 # 📂 Project Extractor (Parses chat to files)
-├── setup_workspace.sh       # 🚀 Automated Installer (WSL2/Linux)
-├── start_workspace.sh       # 🚥 Launch Script (Starts proxy/ComfyUI/Docker)
-├── docker-compose.yml       # 🐳 Multi-Container Stack (WebUI, Search, Builder)
+├── setup_workspace.sh       # 🚀 Automated Installer (Standalone/Desktop)
+├── setup_pi.sh              # 🍓 Automated Installer for Raspberry Pi
+├── start_standalone.sh      # 🚥 Launch Script (1-Device: Full Stack)
+├── start_desktop.sh         # 🚥 Launch Script (2-Device: Desktop Worker Node)
+├── start_router.sh          # 🚥 Launch Script (2-Device: Pi Router Node)
+├── docker-compose.yml       # 🐳 Multi-Container Stack (1-Device)
+├── docker-compose.pi.yml    # 🐳 Lightweight Container Stack (2-Device Pi)
 ├── cline-builder/           # 🔨 Autonomous Build Pipeline (The "Factory")
 │   ├── distill.py           #   - 4-Pass Thinking Engine (Architect -> Engineer -> etc.)
 │   ├── agent_config.json    #   - Factory Configuration (Models, Prompts, Limits)
@@ -432,17 +436,31 @@ Setup on native Linux is straightforward. Skip the WSL-specific configurations a
 
 ## 🚥 Usage
 
-To start the workspace:
+The project dynamically supports both **1-Device (Standalone)** and **2-Device (Distributed)** setups natively.
 
+### 1-Device Setup (Standalone)
+If you are running everything on a single powerful machine:
 ```bash
-chmod +x start_workspace.sh
-./start_workspace.sh
+chmod +x start_standalone.sh
+./start_standalone.sh
 ```
 
--   **Web UI:** [http://localhost:3000](http://localhost:3000)
--   **Proxy Health/State:** [http://localhost:8000/health](http://localhost:8000/health)
--   **Logs (Orchestrator):** `tail -f orchestrator.log`
--   **Logs (ComfyUI):** `tail -f comfyui.log`
+### 2-Device Setup (Distributed)
+If you want to offload the frontend routing to a Raspberry Pi and keep heavy LLM lifting on your Desktop:
+1. **On the Desktop (Worker Node):**
+   ```bash
+   chmod +x start_desktop.sh
+   ./start_desktop.sh
+   ```
+2. **On the Raspberry Pi (Router Node):**
+   ```bash
+   chmod +x start_router.sh
+   ./start_router.sh
+   ```
+
+-   **Web UI:** [http://localhost:3000](http://localhost:3000) (Or your Pi's IP address)
+-   **Proxy Health/State:** [http://localhost:8000/health](http://localhost:8000/health) (Or your Pi's IP on port 8001)
+-   **Logs:** `tail -f orchestrator.log` (Desktop) or `tail -f router.log` (Pi)
 
 ## 🌐 Network Access (Multi-Device)
 

@@ -341,7 +341,7 @@ fi
 echo "  🔑 Configuring provider (${CLINE_PROVIDER}) for Cline CLI..."
 
 cline auth \
-    -p openai \
+    -p openai-compatible \
     -k "dummy" \
     -m "$CLINE_MODEL" \
     -b "${CLINE_AUTH_URL}"
@@ -376,11 +376,13 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     fi
 
     set +e
-    cline task -v -y \
+    export CLINE_MODEL CURRENT_TIMEOUT BUILD_MSG
+    script -q -e -c 'cline -v --auto-approve true \
+        -P openai-compatible \
         -m "$CLINE_MODEL" \
         --timeout "$CURRENT_TIMEOUT" \
-        "$BUILD_MSG" \
-        2>&1 | tee "/workspace/.cline_logs/build_log_iter_${ITERATION}.txt"
+        "$BUILD_MSG"' \
+        "/workspace/.cline_logs/build_log_iter_${ITERATION}.txt"
     CLINE_EXIT=$?
     set -e
 
@@ -406,11 +408,13 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     6) CONTINUITY: Watch for '[STABILITY MONITOR]' markers in history. If a turn was cut off, do not re-read from the beginning; pick up exactly where you left off.
     7) Before testing, if a port is in use, YOU MUST ONLY use 'npx kill-port <portnumber>' to free it."
     set +e
-    cline task -v -y \
+    export CLINE_MODEL VERIFY_MSG
+    script -q -e -c 'cline -v --auto-approve true \
+        -P openai-compatible \
         -m "$CLINE_MODEL" \
         --timeout 1800 \
-        "$VERIFY_MSG" \
-        2>&1 | tee "/workspace/.cline_logs/verify_log_iter_${ITERATION}.txt"
+        "$VERIFY_MSG"' \
+        "/workspace/.cline_logs/verify_log_iter_${ITERATION}.txt"
     set -e
 
     # --- Safety Phase ---
@@ -425,11 +429,13 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     4) CONTINUITY: Watch for '[STABILITY MONITOR]' markers in history. If a turn was cut off, do not re-read from the beginning; pick up exactly where you left off.
     5) Before testing, if a port is in use, YOU MUST ONLY use 'npx kill-port <portnumber>' to free it."
     set +e
-    cline task -v -y \
+    export CLINE_MODEL SAFETY_MSG
+    script -q -e -c 'cline -v --auto-approve true \
+        -P openai-compatible \
         -m "$CLINE_MODEL" \
         --timeout 1800 \
-        "$SAFETY_MSG" \
-        2>&1 | tee "/workspace/.cline_logs/safety_log_iter_${ITERATION}.txt"
+        "$SAFETY_MSG"' \
+        "/workspace/.cline_logs/safety_log_iter_${ITERATION}.txt"
     set -e
 
     # --- Check completion ---

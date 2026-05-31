@@ -1,0 +1,48 @@
+# Raspberry Pi Router Node - Docker Stack
+# Only runs Open WebUI + SearXNG (no GPU services, no cline-builder)
+# Open WebUI points to the router on port 8001 (not the desktop)
+
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    networks:
+      - ai-workspace-net
+    volumes:
+      - ./searxng:/etc/searxng
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8080/
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    networks:
+      - ai-workspace-net
+    ports:
+      - "3000:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - open-webui_data:/app/backend/data
+    environment:
+      # Points to the Router on the Pi (port 8001), NOT the desktop
+      - OLLAMA_BASE_URL=http://host.docker.internal:8001
+      - IMAGE_GENERATION_ENGINE=openai
+      - OPENAI_API_BASE_URL=http://host.docker.internal:8001/v1
+      - OPENAI_API_KEY=not-needed
+
+      # Web Search (SearXNG runs locally on the Pi)
+      - ENABLE_RAG_WEB_SEARCH=True
+      - RAG_WEB_SEARCH_ENGINE=searxng
+      - RAG_WEB_SEARCH_RESULT_COUNT=3
+      - RAG_WEB_SEARCH_CONCURRENT_REQUESTS=10
+      - SEARXNG_QUERY_URL=http://searxng:8080/search?q=<query>
+    depends_on:
+      - searxng
+
+networks:
+  ai-workspace-net:
+    driver: bridge
+
+volumes:
+  open-webui_data:
