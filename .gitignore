@@ -28,6 +28,9 @@ venv/
 comfy-env/
 gatekeeper-env/
 
+# Environment secrets
+.env
+
 # External Tools
 ComfyUI/
 searxng/

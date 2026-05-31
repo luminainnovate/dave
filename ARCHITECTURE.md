@@ -7,6 +7,14 @@
 **Accessibility:** The workspace must be accessible from the local area network (LAN), allowing phones, tablets, and other laptops to utilize the host's GPU resources via a unified web interface.
 **Key Constraint:** The system must use a **Tiered Orchestration** approach to provide instant responses for simple tasks while dynamically routing heavy tasks to expert models, managing VRAM aggressively to prevent OOM on a 24GB budget.
 
+### Distributed Two-Node Architecture
+The system supports a split deployment across two physical nodes:
+
+* **Router Node (Raspberry Pi 5, 8GB):** Always-on network entry point. Runs `router.py`, Open WebUI, SearXNG, and the local triage model (`qwen2.5:1.5b` via Ollama on CPU). Handles simple queries locally and forwards complex tasks to the Desktop.
+* **Desktop Node (RTX 4090, 24GB VRAM):** GPU powerhouse. Runs `orchestrator.py`, the Expert model (35B), ComfyUI, and the cline-builder pipeline. Can be asleep — the Pi wakes it via Wake-on-LAN when heavy tasks arrive.
+* **Communication:** The Pi adds an `X-Forwarded-By-Router: true` header when proxying requests to the Desktop. The Desktop detects this header and skips its own triage, routing directly to the Expert model.
+* **Standalone Mode:** The Desktop's `orchestrator.py` works independently without the Pi. The header check is simply ignored when not present.
+
 ---
 
 ## 2. Hardware Guardrails & VRAM Budget

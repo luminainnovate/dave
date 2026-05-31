@@ -39,7 +39,7 @@ ROUTER_MODEL = ROUTER_CONFIG["model"]
 DEFAULT_EXPERT_MODEL = "qwen3.5:27b" # Keep this as default, if you know what youre doing, you can change it with the PARAMS_GENERAL/PARAMS_CODING
 
 # llama.cpp managed process settings (only used when provider is "llamacpp")
-LLAMACPP_BINARY = "/usr/local/bin/llama-server"  # Path to llama-server binary
+LLAMACPP_BINARY = "/home/mv/llama.cpp/build/bin/llama-server"  # Path to llama-server binary
 LLAMACPP_DEFAULT_ARGS = ["--cache-type-k", "q8_0", "--cache-type-v", "q8_0"]  # Extra CLI args (KV Quant enabled)
 
 COMFYUI_URL = "http://localhost:8188"
@@ -513,7 +513,8 @@ async def free_comfyui():
 async def periodic_cleanup():
     """
     Background loop that periodically sweeps memory if the system is idle.
-    Runs every 5 minutes.
+    Runs every 5 minutes. Also auto-unloads llama-server when the expert
+    warm timer expires (mirrors Ollama's native keep_alive behavior).
     """
     while True:
         try:
@@ -521,6 +522,15 @@ async def periodic_cleanup():
             if not await is_comfy_active() and not gpu_lock.locked():
                 logger.info("Periodic idle cleanup triggered.")
                 await free_comfyui()
+
+                # Auto-unload llama-server when expert warm period expires
+                if not vram_locked and time.time() > expert_warm_until:
+                    expert_config = _resolve_config(EXPERT_MODEL)
+                    if expert_config.get("provider") == "llamacpp" and EXPERT_MODEL in _managed_processes:
+                        proc = _managed_processes[EXPERT_MODEL]
+                        if proc.poll() is None:
+                            logger.info(f"Expert warm period expired. Auto-stopping llama-server for {EXPERT_MODEL}.")
+                            await _stop_llamacpp_server(expert_config)
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -1158,11 +1168,24 @@ async def proxy_ollama(request: Request):
         keep_alive = 0
         is_cold_expert = False
 
+        # --- Router-Forwarded Request (from Raspberry Pi) ---
+        # If the Pi router already triaged this request and decided it needs
+        # the Expert, skip all local triage and go straight to the Expert model.
+        is_router_forwarded = request.headers.get("X-Forwarded-By-Router", "").lower() == "true"
+
+        if is_router_forwarded:
+            target_model = EXPERT_MODEL
+            keep_alive = "10m" if not vram_locked else "-1"
+            # Only treat as cold if the expert isn't already warm and running
+            is_cold_expert = not is_expert_warm
+            if not vram_locked:
+                expert_warm_until = current_time + 600
+            logger.info(f"Router-forwarded request: Skipping triage, routing directly to Expert model (cold={is_cold_expert}).")
+
         # --- Context-Aware Triage Override ---
-        project_dir = _get_bound_project_dir(messages)
-        has_at_mention = "@" in prompt_lower
-        
-        if project_dir or has_at_mention:
+        elif _get_bound_project_dir(messages) or "@" in prompt_lower:
+            project_dir = _get_bound_project_dir(messages)
+            has_at_mention = "@" in prompt_lower
             target_model = EXPERT_MODEL
             keep_alive = "10m" if not vram_locked else "-1"
             is_cold_expert = not is_expert_warm
