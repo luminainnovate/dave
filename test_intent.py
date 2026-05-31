@@ -1,6 +1,5 @@
 import asyncio
 import httpx
-import json
 
 ROUTER_MODEL = "qwen2.5:1.5b"
 OLLAMA_URL = "http://localhost:11434"

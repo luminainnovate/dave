@@ -1,6 +1,4 @@
-from mover import extract_snippets, handle_move
-import os
-import shutil
+from mover import extract_snippets
 
 def test_tree_parsing_and_mapping():
     messages = [

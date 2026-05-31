@@ -1187,7 +1187,6 @@ async def proxy_ollama(request: Request):
         # --- Context-Aware Triage Override ---
         elif _get_bound_project_dir(messages) or "@" in prompt_lower:
             project_dir = _get_bound_project_dir(messages)
-            has_at_mention = "@" in prompt_lower
             target_model = EXPERT_MODEL
             keep_alive = "10m" if not vram_locked else "-1"
             is_cold_expert = not is_expert_warm
