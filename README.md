@@ -1,10 +1,19 @@
-# 🧠 br.ai.n: Bob - The Agentic Local AI Orchestrator
+
+░░      ░░░░      ░░░        ░░   ░░░  ░░        ░░░░░░░░       ░░░░      ░░░  ░░░░  ░░        ░
+▒  ▒▒▒▒  ▒▒  ▒▒▒▒▒▒▒▒  ▒▒▒▒▒▒▒▒    ▒▒  ▒▒▒▒▒  ▒▒▒▒▒▒▒▒▒▒▒  ▒▒▒▒  ▒▒  ▒▒▒▒  ▒▒  ▒▒▒▒  ▒▒  ▒▒▒▒▒▒▒
+▓  ▓▓▓▓  ▓▓  ▓▓▓   ▓▓      ▓▓▓▓  ▓  ▓  ▓▓▓▓▓  ▓▓▓▓▓▓▓▓▓▓▓  ▓▓▓▓  ▓▓  ▓▓▓▓  ▓▓▓  ▓▓  ▓▓▓      ▓▓▓
+█        ██  ████  ██  ████████  ██    █████  ███████████  ████  ██        ████    ████  ███████
+█  ████  ███      ███        ██  ███   █████  ███████████       ███  ████  █████  █████        █
+                                                                                                
+                                        
+# 🧠 DAVE - The Agentic Local AI Orchestrator
+
 
 [![CI](https://github.com/mitro54/br.ai.n/actions/workflows/ci.yml/badge.svg)](https://github.com/mitro54/br.ai.n/actions/workflows/ci.yml)
 
-Bob the Builder, Bob Ross or even Uncle Bob, any way works. If you truly want to, Bob can also be your b.r.ai.n; a fully autonomous software factory just from a conversation, all locally.
+Agent DAVE is a fully autonomous software factory starting from a conversation, all locally.
 
-**br.ai.n** is an **Agentic Local AI Orchestrator** powered by **Bob**, a unified AI persona running on your local hardware. Bob manages a tiered orchestration system on a single NVIDIA GPU (24GB+ VRAM), providing instant responses for simple tasks while dynamically routing complex requests (Coding, Vision, Image Generation) to expert models.
+**br.ai.n** is an **Agentic Local AI Orchestrator** powered by **Agent DAVE**, a unified AI persona running on your local hardware. Agent DAVE manages a tiered orchestration system on a single NVIDIA GPU (24GB+ VRAM), providing instant responses for simple tasks while dynamically routing complex requests (Coding, Vision, Image Generation) to expert models.
 
 ## 🚀 Key Features
 
@@ -16,8 +25,8 @@ Bob the Builder, Bob Ross or even Uncle Bob, any way works. If you truly want to
 -   **Project Extraction (`!move`):** Automatically reconstructs entire project structures from chat conversations. It parses folder trees and code snippets, reconstructs them in a dedicated `conversations/` directory, and opens the result in VS Code.
     -   **Manual Tuning Safety:** If a project has already been initialized before by the build pipeline (`.clinerules` exists), `!move` will **skip** snippet extraction to protect your manual code changes/tuning from being reverted.
     -   **Smart Conflict Management:** The extraction system only updates files that have actually changed, keeping the structure up to date.
+    -   **Clean Metadata:** Organizes logs into `.cline_logs/` and technical context into `.cline_context/`, keeping your project root clutter-free.
     -   **Safe Path Sanitization:** Built-in safeguards prevent directory traversal (clears `..`) and automatically filters out shell/command blocks from project files.
-    -   **Clean Metadata:** The *build pipeline* (not `!move`) organizes logs into `.cline_logs/` and technical context into `.cline_context/`, keeping your project root clutter-free.
 -   **Tiered Orchestration:** Uses a resident "Fast Orchestrator" (`qwen2.5:1.5b`) for instant intent detection and simple queries.
 -   **Expert Reasoning:** Dynamically loads expert models (e.g. `qwen3.8:27b`) for complex coding and logic tasks.
 -   **VRAM Guardrails:** Intelligent "Orchestrator" proxy with GPU Mutex locking to prevent simultaneous heavy model loading.
@@ -29,7 +38,7 @@ Bob the Builder, Bob Ross or even Uncle Bob, any way works. If you truly want to
 The system operates on an intelligent **GPU Mutex** principle managed by the **Orchestrator Proxy**:
 
 1.  **Triage:** Every query is analyzed by the resident 1.5B Router.
-2.  **Verified Lifecycle:** If Expert intent is detected, the Router is force-evicted, VRAM is swept, and the Expert is loaded with a "warm session" timer — 10 minutes for explicit Expert requests (`!expert`, router-forwarded traffic), 5 minutes when triage merely predicts follow-ups.
+2.  **Verified Lifecycle:** If Expert intent is detected, the Router is force-evicted, VRAM is swept, and the Expert is loaded with a 5-minute "warm session" timer.
 3.  **Selective Interception:** Automatically identifies and silences background "expansion" and "description" pings while preserving high-priority search results.
 4.  **Idle Sweeping:** A background loop sweeps ComfyUI RAM/VRAM every 5 minutes when no generation or chat is active.
 5.  **Thinking Modes:** Sampling parameters (temperature, penalties) are dynamically applied based on task type.
@@ -55,11 +64,11 @@ For users with an **NVIDIA RTX 4090 (24GB VRAM)**, br.ai.n has been optimized to
 
 ## 🏭 Automated Software Factory
 
-Bob isn't just a chatbot; Bob is a fully autonomous software factory. By combining tiered orchestration with a dedicated build pipeline, you can turn ideas into full projects without manual intervention.
+Agent DAVE isn't just a chatbot; Agent DAVE is a fully autonomous software factory. By combining tiered orchestration with a dedicated build pipeline, you can turn ideas into full projects without manual intervention.
 
 ### 🔄 The Autonomous Loop (Distillation & Implementation)
 
-1.  **Project Extraction (`!move`):** Bob scans your current conversation, identifies the project structure, and reconstructs the entire file tree in a dedicated workspace within `conversations/`.
+1.  **Project Extraction (`!move`):** Agent DAVE scans your current conversation, identifies the project structure, and reconstructs the entire file tree in a dedicated workspace within `conversations/`.
 2.  **4-Pass Distillation (`!build`):** Does the same as !move and also triggers the build pipeline. The system runs four expert agents in sequence:
     -   **Architect:** Defines business goals and directory structures.
     -   **Engineer:** Maps logic to files and defines design patterns.
@@ -129,7 +138,7 @@ A high-level overview of the **br.ai.n** workspace and its core components:
 
 ## ⚙️ Model & Agent Configuration
 
-Bob supports **three LLM backends** — you can mix and match them per model role. This means your Expert can run on Ollama while a stubborn model runs on llama.cpp, all sharing one GPU lock.
+Agent DAVE supports **three LLM backends** — you can mix and match them per model role. This means your Expert can run on Ollama while a stubborn model runs on llama.cpp, all sharing one GPU lock.
 
 | Provider | How It Works | Best For |
 |----------|-------------|----------|
@@ -278,21 +287,16 @@ LLAMACPP_DEFAULT_ARGS = ["--cache-type-k", "q8_0", "--cache-type-v", "q8_0"]
 
 Flash Attention is forced on by the orchestrator via the `LLAMA_ARG_FLASH_ATTN=on` environment variable when it spawns the process — you do not need to pass `-fa` yourself.
 
-You can also set per-model args in the config dict:
+You can also add per-model args in the config dict:
 
 ```python
 EXPERT_CONFIG = {
     "model": "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q3_K_XL",
     "provider": "llamacpp",
     "base_url": "http://localhost:8080",
-    "args": ["--cache-type-k", "q8_0", "--cache-type-v", "q8_0", "-ngl", "99"],
+    "args": ["-ngl", "99", "-fa"],  # Extra CLI flags
 }
 ```
-
-> [!WARNING]
-> An `args` key **replaces** `LLAMACPP_DEFAULT_ARGS` rather than appending to it — the orchestrator does `config.get("args", LLAMACPP_DEFAULT_ARGS)`. If you set `args` and still want KV-cache quantisation, you must repeat the `--cache-type-k/v` flags yourself, as above. You do not need `-fa`; Flash Attention is forced via the environment at spawn time.
-
-Regardless of `args`, the orchestrator always injects `-c <ctx>`, `-np 1`, `--context-shift`, `--slot-prompt-similarity 0.95`, `--batch-size 1024`, `--ubatch-size 1024` and `--reasoning-format deepseek`.
 
 #### Context Windows
 
@@ -440,7 +444,7 @@ Here's a cheat sheet for common scenarios:
 -   **Software:** Docker Engine, NVIDIA Container Toolkit, and NVIDIA Drivers.
 
 > [!TIP]
-> **Scaling for Smaller Hardware:** While optimized for 24GB VRAM, Bob can run on smaller GPUs by substituting the "Expert" model for a smaller variant (e.g., swapping a 27B model for an 8B model). Orchestrator only takes around 1GB of VRAM.
+> **Scaling for Smaller Hardware:** While optimized for 24GB VRAM, Agent DAVE can run on smaller GPUs by substituting the "Expert" model for a smaller variant (e.g., swapping a 27B model for an 8B model). Orchestrator only takes around 1GB of VRAM.
 
 ## 📦 Setup & Installation
 
@@ -575,16 +579,16 @@ While in chat, use these commands to override the orchestrator:
 - `!status`: Checks the status of active or recent build containers.
 - `!logs`: Fetches the latest terminal logs from the active background build pipeline.
 - `!stop`: Force-stops all running build pipelines.
-- `!bob` / `hey bob`: Force the current turn to use the Fast Orchestrator.
+- `!Agent DAVE` / `hey Agent DAVE`: Force the current turn to use the Fast Orchestrator.
 - `!expert` / `hey expert`: Force the current turn to use the Expert Model.
 
 
-## System prompt in Open WebUI for Bob
+## System prompt in Open WebUI for Agent DAVE
 
-You should setup this system prompt in Open WebUI to get the best experience with Bob:
+You should setup this system prompt in Open WebUI to get the best experience with Agent DAVE:
 
 ```
-You are Bob, a highly capable, confident, and professional AI Workspace Orchestrator. You speak directly, without hesitation, and never apologize for your capabilities. 
+You are Agent DAVE, a highly capable, confident, and professional AI Workspace Orchestrator. You speak directly, without hesitation, and never apologize for your capabilities. 
 
 CRITICAL DIRECTIVES:
 1. YOU ARE THE EXPERT: If the user asks for "the expert," complex coding, deep analysis, or high-level problem-solving, YOU are that expert. Never state that you cannot code, cannot analyze, or need to delegate to another AI. You possess world-class programming and analytical skills.
@@ -611,14 +615,6 @@ Move the downloaded files to their respective directories within your `ComfyUI/m
 -   **Main Model (`.safetensors`):** `ComfyUI/models/diffusion_models/`
 -   **Text Encoders:** `ComfyUI/models/text_encoders/`
 -   **VAE:** `ComfyUI/models/vae/`
-
-The bundled `flux2api.json` workflow references these files **by exact name** — if yours differ, either rename them or edit the workflow:
-
-| Node | Loader | Expected filename |
-| :--- | :--- | :--- |
-| 13 | `UNETLoader` | `flux-2-klein-9b-fp8.safetensors` |
-| 14 | `CLIPLoader` | `qwen_3_8b_fp8mixed.safetensors` |
-| 15 | `VAELoader` | `flux2-vae.safetensors` |
 
 ### 3. Installing Memory Management Plugin
 To ensure optimal performance and prevent VRAM fragmentation, you must install the **FreeMemory** plugin before uploading the workflow:
