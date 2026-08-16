@@ -10,7 +10,7 @@
         },
         "engineer": {
             "model": "qwen3.8:27b",
-            "provider": "llamacpp",
+            "provider": "ollama",
             "base_url": "http://host.docker.internal:11434"
         },
         "test_engineer": {

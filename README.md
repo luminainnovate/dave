@@ -1,10 +1,19 @@
-# 🧠 br.ai.n: Bob - The Agentic Local AI Orchestrator
+
+░░      ░░░░      ░░░        ░░   ░░░  ░░        ░░░░░░░░       ░░░░      ░░░  ░░░░  ░░        ░
+▒  ▒▒▒▒  ▒▒  ▒▒▒▒▒▒▒▒  ▒▒▒▒▒▒▒▒    ▒▒  ▒▒▒▒▒  ▒▒▒▒▒▒▒▒▒▒▒  ▒▒▒▒  ▒▒  ▒▒▒▒  ▒▒  ▒▒▒▒  ▒▒  ▒▒▒▒▒▒▒
+▓  ▓▓▓▓  ▓▓  ▓▓▓   ▓▓      ▓▓▓▓  ▓  ▓  ▓▓▓▓▓  ▓▓▓▓▓▓▓▓▓▓▓  ▓▓▓▓  ▓▓  ▓▓▓▓  ▓▓▓  ▓▓  ▓▓▓      ▓▓▓
+█        ██  ████  ██  ████████  ██    █████  ███████████  ████  ██        ████    ████  ███████
+█  ████  ███      ███        ██  ███   █████  ███████████       ███  ████  █████  █████        █
+                                                                                                
+                                        
+# 🧠 DAVE - The Agentic Local AI Orchestrator
+
 
 [![CI](https://github.com/mitro54/br.ai.n/actions/workflows/ci.yml/badge.svg)](https://github.com/mitro54/br.ai.n/actions/workflows/ci.yml)
 
-Bob the Builder, Bob Ross or even Uncle Bob, any way works. If you truly want to, Bob can also be your b.r.ai.n; a fully autonomous software factory just from a conversation, all locally.
+Agent DAVE is a fully autonomous software factory starting from a conversation, all locally.
 
-**br.ai.n** is an **Agentic Local AI Orchestrator** powered by **Bob**, a unified AI persona running on your local hardware. Bob manages a tiered orchestration system on a single NVIDIA GPU (24GB+ VRAM), providing instant responses for simple tasks while dynamically routing complex requests (Coding, Vision, Image Generation) to expert models.
+**br.ai.n** is an **Agentic Local AI Orchestrator** powered by **Agent DAVE**, a unified AI persona running on your local hardware. Agent DAVE manages a tiered orchestration system on a single NVIDIA GPU (24GB+ VRAM), providing instant responses for simple tasks while dynamically routing complex requests (Coding, Vision, Image Generation) to expert models.
 
 ## 🚀 Key Features
 
@@ -48,15 +57,18 @@ For users with an **NVIDIA RTX 4090 (24GB VRAM)**, br.ai.n has been optimized to
 
 **Result:** You can fit a **fully offloaded 35B model** with a **256,144 token context window** in ~21.1GB of VRAM, leaving room for the resident router and OS overhead.
 
+> [!NOTE]
+> **This is not the shipped default.** Out of the box `EXPERT_CTX` is `131072` (128k) with `qwen3.8:27b` on Ollama. To reach the figures above you need to switch `EXPERT_CONFIG` to the `llamacpp` provider with a MoE GGUF and raise `EXPERT_CTX` yourself. KV quantisation (`--cache-type-k/v q8_0`) is already on by default via `LLAMACPP_DEFAULT_ARGS`, and Flash Attention is forced on at spawn.
+
 ---
 
 ## 🏭 Automated Software Factory
 
-Bob isn't just a chatbot; Bob is a fully autonomous software factory. By combining tiered orchestration with a dedicated build pipeline, you can turn ideas into full projects without manual intervention.
+Agent DAVE isn't just a chatbot; Agent DAVE is a fully autonomous software factory. By combining tiered orchestration with a dedicated build pipeline, you can turn ideas into full projects without manual intervention.
 
 ### 🔄 The Autonomous Loop (Distillation & Implementation)
 
-1.  **Project Extraction (`!move`):** Bob scans your current conversation, identifies the project structure, and reconstructs the entire file tree in a dedicated workspace within `conversations/`.
+1.  **Project Extraction (`!move`):** Agent DAVE scans your current conversation, identifies the project structure, and reconstructs the entire file tree in a dedicated workspace within `conversations/`.
 2.  **4-Pass Distillation (`!build`):** Does the same as !move and also triggers the build pipeline. The system runs four expert agents in sequence:
     -   **Architect:** Defines business goals and directory structures.
     -   **Engineer:** Maps logic to files and defines design patterns.
@@ -68,9 +80,16 @@ Bob isn't just a chatbot; Bob is a fully autonomous software factory. By combini
 
 -   `!move`: Extract project files from the current chat.
 -   `!build`: Kick off the 4-pass autonomous build pipeline.
+-   `!architect`: Run **only** Pass 1 (Architect) and stop at a review gate, so you can read the proposed architecture before any code is written.
+-   `!review`: Re-display the architecture document produced by `!architect`.
+-   `!approve`: Accept the reviewed architecture and resume the remaining passes plus implementation. Requires a prior `!architect`.
+-   `!clone`: Clone a Git repository into the conversation's workspace, e.g. `!clone https://github.com/user/repo`. Add `--kb <url>` to attach a second repo as a knowledge base.
 -   `!status`: Check the status of active and recent build containers.
 -   `!logs`: Fetch and display the latest console logs from the active build pipeline.
 -   `!stop`: Force-stop all running build pipelines and clear VRAM.
+
+> [!TIP]
+> **Review-then-build workflow:** `!architect` → read the output → `!approve`. This is usually preferable to a bare `!build`, which commits to all four passes and implementation in one shot.
 
 ---
 
@@ -81,21 +100,27 @@ A high-level overview of the **br.ai.n** workspace and its core components:
 ```text
 .
 ├── orchestrator.py          # 🧠 Central FastAPI Proxy (VRAM Manager & Router)
+├── router.py                # 🛡️ Pi Router Node (2-Device: triage + Wake-on-LAN)
 ├── mover.py                 # 📂 Project Extractor (Parses chat to files)
 ├── setup_workspace.sh       # 🚀 Automated Installer (Standalone/Desktop)
 ├── setup_pi.sh              # 🍓 Automated Installer for Raspberry Pi
 ├── start_standalone.sh      # 🚥 Launch Script (1-Device: Full Stack)
+├── start_workspace.sh       # 🚥 Launch Script (1-Device: full stack incl. ComfyUI)
 ├── start_desktop.sh         # 🚥 Launch Script (2-Device: Desktop Worker Node)
 ├── start_router.sh          # 🚥 Launch Script (2-Device: Pi Router Node)
 ├── docker-compose.yml       # 🐳 Multi-Container Stack (1-Device)
 ├── docker-compose.pi.yml    # 🐳 Lightweight Container Stack (2-Device Pi)
+├── flux2api.json            # 🎨 ComfyUI workflow for Flux.2 image generation
+├── test_intent.py           # 🧪 Intent/routing tests
+├── test_advanced_mover.py   # 🧪 Project-extraction tests
 ├── cline-builder/           # 🔨 Autonomous Build Pipeline (The "Factory")
 │   ├── distill.py           #   - 4-Pass Thinking Engine (Architect -> Engineer -> etc.)
 │   ├── agent_config.json    #   - Factory Configuration (Models, Prompts, Limits)
+│   ├── prompts/             #   - Agent system prompts (architect/engineer/test/safety .md)
 │   ├── Dockerfile           #   - Pipeline Environment
 │   └── entrypoint.sh        #   - Autonomous Build Execution Flow
-├── searxng/                 # 🔍 Search Engine Configuration
-├── conversations/           # 🏗️ Workspace Root (Autonomous projects live here)
+├── searxng/                 # 🔍 Search Engine Configuration (git-ignored)
+├── conversations/           # 🏗️ Workspace Root (Autonomous projects live here, git-ignored)
 ├── ARCHITECTURE.md          # 📜 Deep Technical documentation
 ├── SETUP.md                 # 🛠️ Manual step-by-step setup guide
 └── README.md                # 📖 Main entry point & Quick Start
@@ -113,7 +138,7 @@ A high-level overview of the **br.ai.n** workspace and its core components:
 
 ## ⚙️ Model & Agent Configuration
 
-Bob supports **three LLM backends** — you can mix and match them per model role. This means your Expert can run on Ollama while a stubborn model runs on llama.cpp, all sharing one GPU lock.
+Agent DAVE supports **three LLM backends** — you can mix and match them per model role. This means your Expert can run on Ollama while a stubborn model runs on llama.cpp, all sharing one GPU lock.
 
 | Provider | How It Works | Best For |
 |----------|-------------|----------|
@@ -203,7 +228,7 @@ At the top of `orchestrator.py`, configure which model and provider to use for t
 ```python
 # --- STRICT MODEL CONFIG ---
 EXPERT_CONFIG = {
-    "model": "gemma4:26b",        # Model name (Ollama tag, LMS identifier, or HF repo)
+    "model": "qwen3.8:27b",       # Model name (Ollama tag, LMS identifier, or HF repo)
     "provider": "ollama",          # "ollama", "lmstudio", or "llamacpp"
     "base_url": "http://localhost:11434",  # API endpoint
 }
@@ -213,6 +238,8 @@ ROUTER_CONFIG = {
     "base_url": "http://localhost:11434",
 }
 ```
+
+These are the shipped defaults. `DEFAULT_EXPERT_MODEL` is also set to `qwen3.8:27b` and is what the custom sampling parameters are tuned for — point `EXPERT_CONFIG` at anything else and the orchestrator falls back to that model's native defaults.
 
 #### Example: Expert on llama.cpp with a HuggingFace model
 
@@ -245,12 +272,20 @@ The orchestrator will call `lms load <model>` before inference and `lms unload` 
 #### llama.cpp Advanced Settings
 
 ```python
-# Path to llama-server binary (if not in /usr/local/bin/)
-LLAMACPP_BINARY = "/usr/local/bin/llama-server"
+# Path to the llama.cpp binary. This is the unified `llama` binary, which the
+# orchestrator invokes via its `serve` subcommand — not a bare `llama-server`.
+# Change this to wherever your binary actually lives.
+LLAMACPP_BINARY = "/home/jonathan/.local/bin/llama"
 
-# Default GPU layer count (99 = offload all layers to GPU)
-LLAMACPP_DEFAULT_ARGS = ["-ngl", "99"]
+# Extra CLI args appended to every spawn. KV-cache quantisation is on by
+# default, which roughly halves the memory cost of the context window.
+LLAMACPP_DEFAULT_ARGS = ["--cache-type-k", "q8_0", "--cache-type-v", "q8_0"]
 ```
+
+> [!IMPORTANT]
+> `LLAMACPP_BINARY` ships with an absolute path from the author's machine. Set it to your own path before using the `llamacpp` provider.
+
+Flash Attention is forced on by the orchestrator via the `LLAMA_ARG_FLASH_ATTN=on` environment variable when it spawns the process — you do not need to pass `-fa` yourself.
 
 You can also add per-model args in the config dict:
 
@@ -266,9 +301,9 @@ EXPERT_CONFIG = {
 #### Context Windows
 
 ```python
-EXPERT_CTX = 24576   # Context window for expert chat tasks
-DISTILL_CTX = 32768  # Context for the distillation engine (Thinking)
-CLINE_CTX = 32768    # Context for the Cline agent (Building)
+EXPERT_CTX = 131072   # Context for the expert model (128k)
+DISTILL_CTX = 131072  # Context for the distillation engine (128k)
+CLINE_CTX = 131072    # Context for the Cline agent (128k)
 ```
 
 ---
@@ -315,6 +350,8 @@ The autonomous factory supports the same multi-provider system. Each agent in th
 > [!IMPORTANT]
 > The build pipeline runs inside Docker. Use `host.docker.internal` instead of `localhost` for all `base_url` values so the container can reach the host machine's LLM backends.
 
+The example above shows a deliberately mixed setup. **The shipped `agent_config.json` is simpler** — all five roles (`architect`, `engineer`, `test_engineer`, `safety`, `cline`) point at `qwen3.8:27b` on `http://host.docker.internal:11434`.
+
 #### Legacy String Format (Still Works)
 
 For backward compatibility, simple strings still work and default to Ollama:
@@ -327,20 +364,43 @@ For backward compatibility, simple strings still work and default to Ollama:
 ```
 
 #### System Prompts & Logic
-Tune the behavior of each agent by editing the prompts in the `cline-builder/distill.py`. This allows you to define strict rules, output formats, and operational constraints for the Architect, Engineer, and other expert roles. From `cline-builder/entrypoint.sh` you can configure the Cline's part of the pipeline like the task prompts etc.
+
+Each distillation agent's system prompt lives in its own Markdown file under `cline-builder/prompts/`, referenced from `agent_config.json` by a path relative to the config file:
+
+```json
+"prompts": {
+    "architect":     "prompts/architect.md",
+    "engineer":      "prompts/engineer.md",
+    "test_engineer": "prompts/test_engineer.md",
+    "safety":        "prompts/safety.md"
+}
+```
+
+Edit those `.md` files to define strict rules, output formats, and operational constraints for each expert role. An inline prompt string is still accepted in place of a path for backwards compatibility.
+
+The Cline agent's opening instructions are the `cline_startup_message` key in `agent_config.json` — `cline-builder/entrypoint.sh` only reads that value, so edit the config rather than the shell script.
+
+> [!NOTE]
+> The prompt files are mounted read-only into the container at `/app/prompts`. If you add a new prompt file, make sure the volume mount in `docker-compose.yml` still covers it.
 
 #### Rounds & Limits
 Control the depth of the build process and safety guardrails:
 -   **max_build_iterations**: The number of **rounds** (4-pass cycles) the pipeline will attempt to complete the project.
--   **cline_max_turns**: The maximum number of tool calls the Cline agent can make per round.
--   **context_window**: Manage the total token capacity for the pipeline.
+-   **cline_max_retries**: The consecutive-mistake budget passed to the Cline CLI's `--retries` flag.
+-   **max_project_size_mb**: Upper bound on the workspace size the pipeline will operate on.
 
 ```json
 "limits": {
-    "max_project_size_mb": 4096,
+    "max_project_size_mb": 8192,
     "max_build_iterations": 5,
-    "cline_max_turns": 30
+    "cline_max_retries": 6
 }
+```
+
+`context_window` is a **top-level** key in `agent_config.json`, not part of `limits`:
+
+```json
+"context_window": 131072
 ```
 
 ---
@@ -384,7 +444,7 @@ Here's a cheat sheet for common scenarios:
 -   **Software:** Docker Engine, NVIDIA Container Toolkit, and NVIDIA Drivers.
 
 > [!TIP]
-> **Scaling for Smaller Hardware:** While optimized for 24GB VRAM, Bob can run on smaller GPUs by substituting the "Expert" model for a smaller variant (e.g., swapping a 27B model for an 8B model). Orchestrator only takes around 1GB of VRAM.
+> **Scaling for Smaller Hardware:** While optimized for 24GB VRAM, Agent DAVE can run on smaller GPUs by substituting the "Expert" model for a smaller variant (e.g., swapping a 27B model for an 8B model). Orchestrator only takes around 1GB of VRAM.
 
 ## 📦 Setup & Installation
 
@@ -478,16 +538,29 @@ To access your workspace from other devices on your LAN:
     ```
 ## 🔧 Portability & Customization
 
-Swap models without touching the code using environment variables:
+**Orchestrator models are configured in code, not via environment variables.** Edit `EXPERT_CONFIG` and `ROUTER_CONFIG` at the top of `orchestrator.py` — see [Orchestrator Models](#-orchestrator-models-orchestratorpy) above. `EXPERT_MODEL` and `ROUTER_MODEL` are derived from those dicts:
 
-| Variable | Description | Default |
-| :--- | :--- | :--- |
-| `ROUTER_MODEL` | The resident triage model | `qwen2.5:1.5b` |
-| `EXPERT_MODEL` | The heavy-lifting reasoning model | `qwen3.8:27b` |
-| `OLLAMA_URL` | Your Ollama API endpoint | `http://localhost:11434` |
+```python
+EXPERT_MODEL = EXPERT_CONFIG["model"]
+ROUTER_MODEL = ROUTER_CONFIG["model"]
+```
+
+The environment variables the stack does honour:
+
+| Variable | Read by | Description | Default |
+| :--- | :--- | :--- | :--- |
+| `AGENT_CONFIG_PATH` | `orchestrator.py`, `distill.py` | Path to the build pipeline config | `cline-builder/agent_config.json` |
+| `EXPERT_CTX` | `distill.py` | Context window for distillation passes | set to `8192` in `docker-compose.yml` |
+| `OLLAMA_HOST` | `distill.py` | Ollama endpoint used inside the build container | `http://host.docker.internal:11434` |
+| `ROUTER_MODEL` | `router.py` (2-device Pi node only) | Triage model on the Pi | `qwen2.5:1.5b` |
+| `ROUTER_OLLAMA_URL` | `router.py` (Pi node only) | Ollama endpoint on the Pi | `http://localhost:11434` |
+| `ROUTER_PORT` | `router.py` (Pi node only) | Port the Pi router listens on | `8001` |
+| `DESKTOP_IP` / `DESKTOP_PORT` | `router.py` (Pi node only) | Where the Pi forwards heavy requests | — |
+
+`router.py` reads several more for Wake-on-LAN and SSH control of the desktop node (`WAKER_URL`, `WOL_BOOT_WAIT`, `DESKTOP_SSH_HOST`, …); see the top of that file for the full set.
 
 > [!NOTE]
-> **Hot-Swapping Experts:** You can change `EXPERT_MODEL` at the top of `orchestrator.py` at any time. If you use a model other than the default (`qwen3.8:27b`), the system will automatically bypass custom sampling parameters (temperature, penalties) and use that model's native default settings.
+> **Hot-Swapping Experts:** You can change `EXPERT_CONFIG` at the top of `orchestrator.py` at any time. If you use a model other than the default (`qwen3.8:27b`), the system automatically bypasses the custom sampling parameters (`PARAMS_GENERAL` / `PARAMS_CODING`) and uses that model's native defaults.
 
 ---
 ## ⌨️ Full list of Manual Control Commands
@@ -499,19 +572,23 @@ While in chat, use these commands to override the orchestrator:
 - `!general`: Manually switches Expert to creative "General Mode".
 - `!move`: Scans the conversation, identifies project structure/code, and exports it to `conversations/`.
 - `!build`: Triggers the autonomous build pipeline for the currently moved project.
+- `!architect`: Runs Pass 1 only and stops at a review gate with the proposed architecture.
+- `!review`: Re-displays the architecture document from the last `!architect`.
+- `!approve`: Approves the reviewed architecture and resumes the full pipeline.
+- `!clone <url>`: Clones a Git repo into the conversation workspace. Optional `--kb <url>` attaches a knowledge-base repo.
 - `!status`: Checks the status of active or recent build containers.
 - `!logs`: Fetches the latest terminal logs from the active background build pipeline.
 - `!stop`: Force-stops all running build pipelines.
-- `!bob` / `hey bob`: Force the current turn to use the Fast Orchestrator.
+- `!Agent DAVE` / `hey Agent DAVE`: Force the current turn to use the Fast Orchestrator.
 - `!expert` / `hey expert`: Force the current turn to use the Expert Model.
 
 
-## System prompt in Open WebUI for Bob
+## System prompt in Open WebUI for Agent DAVE
 
-You should setup this system prompt in Open WebUI to get the best experience with Bob:
+You should setup this system prompt in Open WebUI to get the best experience with Agent DAVE:
 
 ```
-You are Bob, a highly capable, confident, and professional AI Workspace Orchestrator. You speak directly, without hesitation, and never apologize for your capabilities. 
+You are Agent DAVE, a highly capable, confident, and professional AI Workspace Orchestrator. You speak directly, without hesitation, and never apologize for your capabilities. 
 
 CRITICAL DIRECTIVES:
 1. YOU ARE THE EXPERT: If the user asks for "the expert," complex coding, deep analysis, or high-level problem-solving, YOU are that expert. Never state that you cannot code, cannot analyze, or need to delegate to another AI. You possess world-class programming and analytical skills.
