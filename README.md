@@ -19,7 +19,7 @@ Bob the Builder, Bob Ross or even Uncle Bob, any way works. If you truly want to
     -   **Clean Metadata:** Organizes logs into `.cline_logs/` and technical context into `.cline_context/`, keeping your project root clutter-free.
     -   **Safe Path Sanitization:** Built-in safeguards prevent directory traversal (clears `..`) and automatically filters out shell/command blocks from project files.
 -   **Tiered Orchestration:** Uses a resident "Fast Orchestrator" (`qwen2.5:1.5b`) for instant intent detection and simple queries.
--   **Expert Reasoning:** Dynamically loads expert models (e.g. `qwen3.5:27b`) for complex coding and logic tasks.
+-   **Expert Reasoning:** Dynamically loads expert models (e.g. `qwen3.8:27b`) for complex coding and logic tasks.
 -   **VRAM Guardrails:** Intelligent "Orchestrator" proxy with GPU Mutex locking to prevent simultaneous heavy model loading.
 -   **Flexible Expert Tuning:** High-level models can use customized "Thinking Mode" parameters, while alternative expert models automatically fall back to their native default settings for maximum compatibility.
 -   **LAN Accessible:** Bridged networking for access from phones, tablets, and other laptops.
@@ -359,7 +359,7 @@ Here's a cheat sheet for common scenarios:
 | Use a HuggingFace model directly | Any config | Set `model` to `org/repo:quantization` with `provider: "llamacpp"` |
 
 > [!NOTE]
-> **Hot-Swapping Experts:** You can change `EXPERT_CONFIG` at the top of `orchestrator.py` at any time. If you use a model other than the default (`qwen3.5:27b`), the system will automatically bypass custom sampling parameters (temperature, penalties) and use that model's native default settings.
+> **Hot-Swapping Experts:** You can change `EXPERT_CONFIG` at the top of `orchestrator.py` at any time. If you use a model other than the default (`qwen3.8:27b`), the system will automatically bypass custom sampling parameters (temperature, penalties) and use that model's native default settings.
 
 ---
 
@@ -400,7 +400,7 @@ The setup is automated. Ensure your NVIDIA drivers are up to date on Windows, th
 2.  **Run the Installer:**
     The `setup_workspace.sh` script automatically:
     -   Installs required Python virtual environments.
-    -   Pulls the correct Ollama models (`qwen2.5:1.5b`, `qwen3.5:27b`). (make sure to change your desired models in the script)
+    -   Pulls the correct Ollama models (`qwen2.5:1.5b`, `qwen3.8:27b`). (make sure to change your desired models in the script)
     -   Deploys the Docker stack (Open WebUI & SearXNG).
     -   Sets up and launches ComfyUI and the Orchestrator proxy.
 
@@ -483,11 +483,11 @@ Swap models without touching the code using environment variables:
 | Variable | Description | Default |
 | :--- | :--- | :--- |
 | `ROUTER_MODEL` | The resident triage model | `qwen2.5:1.5b` |
-| `EXPERT_MODEL` | The heavy-lifting reasoning model | `qwen3.5:27b` |
+| `EXPERT_MODEL` | The heavy-lifting reasoning model | `qwen3.8:27b` |
 | `OLLAMA_URL` | Your Ollama API endpoint | `http://localhost:11434` |
 
 > [!NOTE]
-> **Hot-Swapping Experts:** You can change `EXPERT_MODEL` at the top of `orchestrator.py` at any time. If you use a model other than the default (`qwen3.5:27b`), the system will automatically bypass custom sampling parameters (temperature, penalties) and use that model's native default settings.
+> **Hot-Swapping Experts:** You can change `EXPERT_MODEL` at the top of `orchestrator.py` at any time. If you use a model other than the default (`qwen3.8:27b`), the system will automatically bypass custom sampling parameters (temperature, penalties) and use that model's native default settings.
 
 ---
 ## ⌨️ Full list of Manual Control Commands

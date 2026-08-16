@@ -50,7 +50,7 @@ nvidia-smi
 2. **Pull models:** Ensure the resident router and expert models are present.
    ```bash
    ollama pull qwen2.5:1.5b
-   ollama pull qwen3.5:27b  # Or qwen2.5:7b for smaller GPUs
+   ollama pull qwen3.8:27b  # Or qwen2.5:7b for smaller GPUs
    ```
 
 3. **Apply VRAM Guardrail:** You must set the environment variable globally in the Ollama systemd service to ensure models drop from memory.
@@ -186,7 +186,7 @@ gpu_lock = asyncio.Lock()
 
 # Model Configs
 ROUTER_MODEL = "qwen2.5:1.5b"
-EXPERT_MODEL = "qwen3.5:27b"
+EXPERT_MODEL = "qwen3.8:27b"
 OLLAMA_URL = "http://localhost:11434"
 COMFYUI_URL = "http://localhost:8188"
 WORKFLOW_PATH = "workflow_api.json"

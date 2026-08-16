@@ -9,7 +9,7 @@ echo "🚀 Starting Unified Local AI Workspace Setup..."
 # 1. Ollama Models
 echo "📥 Pulling Ollama Models (Orchestrator & Expert)..."
 ollama pull qwen2.5:1.5b
-ollama pull qwen3.5:27b
+ollama pull qwen3.8:27b
 
 # 2. Docker Stack
 echo "🐳 Deploying Docker Stack (SearXNG & Open WebUI)..."
@@ -17,8 +17,9 @@ docker compose up -d
 
 # 3. Orchestrator Proxy Setup
 echo "🛡️ Clearing Port 8000 and Setting up Orchestrator Proxy..."
-sudo fuser -k 8000/tcp > /dev/null 2>&1
-if [ ! -d "orchestrator-env" ]; then
+sudo fuser -k 8000/tcp > /dev/null 2>&1 || true
+if [ ! -f "orchestrator-env/bin/activate" ]; then
+    rm -rf orchestrator-env
     python3 -m venv orchestrator-env
 fi
 source orchestrator-env/bin/activate
@@ -30,7 +31,8 @@ deactivate
 
 # 4. ComfyUI Setup
 echo "🎨 Setting up ComfyUI (This may take several minutes)..."
-if [ ! -d "comfy-env" ]; then
+if [ ! -f "comfy-env/bin/activate" ]; then
+    rm -rf comfy-env
     python3 -m venv comfy-env
 fi
 source comfy-env/bin/activate
