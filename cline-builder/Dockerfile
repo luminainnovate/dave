@@ -26,6 +26,9 @@ WORKDIR /app
 # Copy pipeline scripts
 COPY entrypoint.sh /app/entrypoint.sh
 COPY distill.py /app/distill.py
+# Baked in so the image works without the compose mount; the mount overrides
+# these at runtime so prompts can be edited without a rebuild.
+COPY prompts /app/prompts
 RUN chmod +x /app/entrypoint.sh
 
 # Workspace is mounted at runtime

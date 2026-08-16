@@ -13,6 +13,7 @@ Isolates context between passes using Markdown boundaries.
 
 import json
 import os
+import re
 import time
 import httpx
 import threading
@@ -36,11 +37,88 @@ CHUNK_OVERLAP_TOKENS = 200
 # Keep the chunk size small to prevent CPU ingestion stalls
 TARGET_CHUNK_SIZE = 2048
 
+# The tagged blocks the payload is assembled from. Chunking prefers these as split
+# points and labels every chunk with the ones it covers, so the extractor knows
+# whether it is reading a directory listing, a symbol map or chat history.
+PAYLOAD_SECTIONS = (
+    "SITUATIONAL_AWARENESS", "PROJECT_HISTORY", "BEST_PRACTICES_KNOWLEDGE_BASE",
+    "PROJECT_OVERVIEW", "KNOWN_BUILD_ISSUES", "DIRECTORY_STRUCTURE",
+    "SYMBOL_SKELETON", "TOOLCHAIN", "NEW_REQUEST", "FINAL_BUILD_COMMAND",
+)
+SECTION_OPEN_RE = re.compile(
+    r"^[ \t]*<(" + "|".join(PAYLOAD_SECTIONS) + r")>", re.MULTILINE
+)
+
+# The request is the pivot every conditional record type hangs off, and it lives
+# at the tail of the payload - so without this it reaches only the final chunk.
+# ITERATIVE_REBUILD and FRESH_BUILD name it differently.
+REQUEST_TAGS = ("NEW_REQUEST", "FINAL_BUILD_COMMAND")
+
+# Output caps. Without these the server generates against the full context window,
+# so a chunk-extraction prompt that falls into a repetition loop runs for minutes
+# and gets guillotined mid-sentence by the stability budget.
+EXTRACTION_MAX_TOKENS = 1024   # bullet-point extraction from one chunk
+ANSWER_MAX_TOKENS = 8192       # merge / single-pass, where the templated answer lives
+
+# Stability Protocol: how long a stream may go with NO new token before we give up.
+# This is an idle timer, not a wall-clock deadline - a healthy fast stream is never
+# killed for the crime of having a lot to say.
+STALL_TIMEOUT = 45.0
+
+# --- Review Gate ---
+# Which passes to run this invocation. Empty means the full 4-pass pipeline.
+# The review gate sets DISTILL_PASSES=architect to stop after pass 1.
+DISTILL_PASSES = os.environ.get("DISTILL_PASSES", "").strip()
+# Reuse a previously saved pass result instead of regenerating it. What is on
+# disk is authoritative, so a hand-edited architecture survives into the build.
+DISTILL_RESUME = os.environ.get("DISTILL_RESUME", "").strip().lower() in ("1", "true", "yes")
+INTERMEDIATE_DIR = os.environ.get("DISTILL_INTERMEDIATE_DIR", "/workspace/.cline_context")
+
 
 def load_config() -> dict:
     """Load the agent configuration file."""
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def resolve_prompt(value: str, pass_key: str) -> str:
+    """
+    Resolve a configured prompt to its text.
+
+    Prompt bodies live in Markdown files alongside agent_config.json, and the
+    config holds a path relative to that config file. An inline prompt string is
+    still honoured, so older configs keep working unchanged.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return value
+
+    candidate = value.strip()
+    # Anything with a newline or angle bracket is prompt text, not a path.
+    if "\n" in candidate or "<" in candidate:
+        return value
+
+    path = candidate
+    if not os.path.isabs(path):
+        path = os.path.join(os.path.dirname(os.path.abspath(CONFIG_PATH)), path)
+
+    if not os.path.exists(path):
+        print(f"  ⚠ Prompt file for '{pass_key}' not found at {path}; using the configured value as literal text.", flush=True)
+        return value
+
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            return f.read()
+    except Exception as e:
+        print(f"  ⚠ Could not read prompt file {path}: {e}", flush=True)
+        return value
+
+
+def load_prompts(config: dict) -> dict:
+    """Load every configured prompt, resolving file references to their contents."""
+    resolved = {}
+    for pass_key, value in config.get("prompts", {}).items():
+        resolved[pass_key] = resolve_prompt(value, pass_key)
+    return resolved
 
 
 def load_conversation() -> list:
@@ -77,39 +155,115 @@ def _resolve_model_config(model_entry, default_host: str = None) -> dict:
     }
 
 
-def chunk_text(text: str, max_tokens: int) -> list[str]:
+def extract_request(text: str) -> str:
+    """
+    Pull the build request out of an assembled payload, or "" if it has none.
+
+    Returns the request body only. An empty result is normal for callers that pass
+    something other than a full payload, and the chunk prompt simply omits the
+    section rather than asserting a request that isn't there.
+    """
+    for tag in REQUEST_TAGS:
+        match = re.search(rf"<{tag}>(.*?)</{tag}>", text, re.DOTALL)
+        if match and match.group(1).strip():
+            return match.group(1).strip()
+    return ""
+
+
+def _section_boundaries(text: str) -> list[tuple[int, str]]:
+    """
+    Locate the payload's top-level section openings, in order.
+
+    The distillation payload is a sequence of tagged blocks (PROJECT_HISTORY,
+    DIRECTORY_STRUCTURE, SYMBOL_SKELETON, NEW_REQUEST, ...). Nothing else in the
+    text starts a line with one of these tags, so a line match is a reliable
+    boundary without paying for a real parse.
+    """
+    return [(m.start(), m.group(1)) for m in SECTION_OPEN_RE.finditer(text)]
+
+
+def _sections_covered(boundaries: list[tuple[int, str]], start: int, end: int) -> str:
+    """Name the payload sections a [start, end) slice touches."""
+    if not boundaries:
+        return "UNLABELLED"
+
+    covered = []
+    current = "PREAMBLE"
+    for offset, tag in boundaries:
+        if offset <= start:
+            current = tag
+        elif offset < end:
+            covered.append(tag)
+    covered.insert(0, current)
+
+    seen = []
+    for tag in covered:
+        if tag not in seen:
+            seen.append(tag)
+    return " → ".join(seen)
+
+
+def chunk_text(text: str, max_tokens: int) -> list[tuple[str, str]]:
     """
     Split text into chunks that fit within the token budget.
+
+    Returns (chunk, section_label) pairs. The label matters as much as the split:
+    a slice taken blindly out of the middle of the payload is an unlabelled slab
+    of text, and the extractor cannot tell a directory listing from a symbol map
+    from chat history - which is exactly the distinction its record types encode.
+
+    Section openings are therefore preferred over blank lines as break points, and
+    a chunk that starts on a section boundary carries no overlap, so the model
+    sees the block from its first line instead of mid-way through the previous one.
     """
     max_chars = max_tokens * CHARS_PER_TOKEN
     overlap_chars = CHUNK_OVERLAP_TOKENS * CHARS_PER_TOKEN
+    boundaries = _section_boundaries(text)
 
     if len(text) <= max_chars:
-        return [text]
+        return [(text, _sections_covered(boundaries, 0, len(text)))]
 
     chunks = []
     start = 0
     while start < len(text):
         end = start + max_chars
-        
-        if end >= len(text):
-            chunks.append(text[start:])
-            break
-            
-        break_point = text.rfind("\n\n", start + max_chars // 2, end)
-        if break_point == -1:
-            break_point = text.rfind("\n", start + max_chars // 2, end)
-        if break_point == -1:
-            break_point = text.rfind(". ", start + max_chars // 2, end)
-        if break_point != -1:
-            end = break_point + 1
 
-        chunks.append(text[start:end])
-        
-        new_start = end - overlap_chars
-        if new_start <= start:
-            new_start = start + 1
-        start = new_start
+        if end >= len(text):
+            chunks.append((text[start:], _sections_covered(boundaries, start, len(text))))
+            break
+
+        floor = start + max_chars // 2
+        # A section opening beats any prose break: it keeps whole blocks together
+        # and starts the next chunk on a labelled line.
+        section_break = max(
+            (offset for offset, _ in boundaries if floor <= offset < end),
+            default=-1,
+        )
+
+        if section_break != -1:
+            end = section_break
+            next_start = end          # no overlap - the boundary is the context
+        else:
+            break_point = text.rfind("\n\n", floor, end)
+            if break_point == -1:
+                break_point = text.rfind("\n", floor, end)
+            if break_point == -1:
+                break_point = text.rfind(". ", floor, end)
+            if break_point != -1:
+                end = break_point + 1
+            # Rewinding a fixed number of characters lands mid-word, so the next
+            # chunk opens on a fragment. Snap forward to the following line start;
+            # a partial identifier is worse than slightly less overlap.
+            next_start = end - overlap_chars
+            newline = text.find("\n", next_start)
+            if newline != -1 and newline < end:
+                next_start = newline + 1
+
+        chunks.append((text[start:end], _sections_covered(boundaries, start, end)))
+
+        if next_start <= start:
+            next_start = start + 1
+        start = next_start
 
     return chunks
 
@@ -144,6 +298,158 @@ def unload_model(client: httpx.Client, model_config: dict):
         print(f"  ⚠ Failed to unload {model_name}: {e}")
 
 
+def _intermediate_path(pass_key: str) -> str:
+    """Where a single pass's result is written between runs."""
+    return os.path.join(INTERMEDIATE_DIR, f"distill_{pass_key}.md")
+
+
+def load_saved_pass(pass_key: str):
+    """
+    Load a previously saved pass result, or None if there isn't a usable one.
+
+    Strips the header line the writer prepends. The file may have been edited by
+    hand between the review gate and the approve run, so its contents are treated
+    as authoritative rather than as a cache of what the model said.
+    """
+    path = _intermediate_path(pass_key)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception as e:
+        print(f"  ⚠ Could not read {path}: {e}", flush=True)
+        return None
+
+    lines = content.split("\n")
+    if lines and lines[0].startswith("# Distillation Intermediate:"):
+        content = "\n".join(lines[1:])
+    content = content.strip()
+    return content or None
+
+
+def _select_passes(all_passes: list) -> list:
+    """
+    Narrow the pipeline to the passes named in DISTILL_PASSES.
+
+    Ordering always comes from the canonical list, never from the env var, so a
+    caller cannot accidentally run the engineer before the architect.
+    """
+    if not DISTILL_PASSES:
+        return all_passes
+
+    wanted = {p.strip() for p in DISTILL_PASSES.split(",") if p.strip()}
+    known = {key for key, _ in all_passes}
+    unknown = wanted - known
+    if unknown:
+        print(f"  ⚠ Ignoring unknown pass name(s): {', '.join(sorted(unknown))}", flush=True)
+
+    selected = [(key, label) for key, label in all_passes if key in wanted]
+    if not selected:
+        print(f"  ⚠ DISTILL_PASSES='{DISTILL_PASSES}' matched no passes; running the full pipeline.", flush=True)
+        return all_passes
+    return selected
+
+
+def _name_matches(name: str, loaded_names) -> bool:
+    """
+    Match a configured model name against reported residency.
+
+    Ollama reports an untagged model as 'name:latest', so accept that form too.
+    Deliberately does NOT strip tags - 'gemma4:26b' must never match 'gemma4:31b'.
+    """
+    return name in loaded_names or f"{name}:latest" in loaded_names
+
+
+def get_loaded_models(client: httpx.Client, models: dict) -> dict:
+    """
+    Report which models are currently holding VRAM, as {name: unload_config}.
+
+    Ollama hosts are queried directly because distill knows its own base_urls.
+    llama.cpp residency lives in the orchestrator's managed-process table, which
+    it already exposes on /health.
+    """
+    loaded = {}
+
+    ollama_urls = set()
+    for entry in models.values():
+        cfg = _resolve_model_config(entry)
+        if cfg.get("provider", "ollama") == "ollama":
+            ollama_urls.add(cfg.get("base_url", OLLAMA_HOST))
+    ollama_urls.add(OLLAMA_HOST)
+
+    for url in ollama_urls:
+        try:
+            resp = client.get(f"{url}/api/ps", timeout=5.0)
+            if resp.status_code == 200:
+                for entry in resp.json().get("models", []):
+                    name = entry.get("name", "")
+                    if name:
+                        loaded[name] = {"model": name, "provider": "ollama", "base_url": url}
+        except Exception as e:
+            print(f"  ⚠ Could not query {url}/api/ps: {e}", flush=True)
+
+    # Non-Ollama residents (managed llama.cpp servers) come from the orchestrator.
+    # Describe them using the configured entry so we know how to unload them.
+    by_name = {}
+    for entry in models.values():
+        cfg = _resolve_model_config(entry)
+        if cfg.get("model"):
+            by_name[cfg["model"]] = cfg
+    try:
+        resp = client.get(f"{ORCHESTRATOR_URL}/health", timeout=5.0)
+        if resp.status_code == 200:
+            for name in resp.json().get("loaded_models", []):
+                if not name or name in loaded:
+                    continue
+                if name in by_name:
+                    loaded[name] = by_name[name]
+                else:
+                    print(f"  ⚠ {name} is resident but not in agent_config; cannot unload it safely.", flush=True)
+    except Exception as e:
+        print(f"  ⚠ Could not query orchestrator /health: {e}", flush=True)
+
+    return loaded
+
+
+def evict_stale_models(client: httpx.Client, models: dict, keep_config: dict):
+    """
+    Free the GPU before the FIRST pass, but only where it actually buys something.
+
+    The per-pass swap in the main loop only fires when the model name changes
+    between passes, so pass 1 - which has no predecessor - never evicted anything.
+    Whatever the orchestrator left resident (typically a llama.cpp server holding
+    ~20GB) stayed put, and the first pass got pushed onto CPU or off the GPU
+    entirely. That is what starved the architect pass.
+
+    Residency is checked first so we never pay to unload and reload the model the
+    first pass is about to use, and never issue unloads for models that are not
+    holding VRAM in the first place.
+    """
+    keep_name = keep_config.get("model", "")
+    loaded = get_loaded_models(client, models)
+
+    if not loaded:
+        print("  ↳ GPU already clear - nothing to evict.", flush=True)
+        return
+
+    print(f"  ↳ Currently resident: {', '.join(sorted(loaded))}", flush=True)
+
+    if _name_matches(keep_name, loaded):
+        print(f"  ↳ {keep_name} is already loaded and needed next - keeping it.", flush=True)
+
+    evicted = 0
+    for name, cfg in loaded.items():
+        if _name_matches(keep_name, {name}):
+            continue
+        print(f"  ↳ Freeing GPU: unloading {name} ({cfg.get('provider', 'ollama')})", flush=True)
+        unload_model(client, cfg)
+        evicted += 1
+
+    if not evicted:
+        print("  ↳ Nothing to evict - GPU already holds only what pass 1 needs.", flush=True)
+
+
 def call_llm(client: httpx.Client, model_config, system_prompt: str, user_content: str, prior_context: str = "") -> str:
     """
     Send a synchronous chat completion request to the configured provider.
@@ -175,29 +481,81 @@ def call_llm(client: httpx.Client, model_config, system_prompt: str, user_conten
 
     # [FIX] A relaxed, generic system prompt for the chunks so it doesn't deadlock trying to fill out a template it doesn't have data for.
     relaxed_chunk_system_prompt = (
-        "You are acting as an information extractor. Your final formatting goal will be defined later. "
-        "For now, review the provided text chunk and extract ANY raw technical details, facts, or logical "
-        "requirements that stand out. Output simple bullet points. Do not attempt to use formal templates."
+        "Fact extractor in a map-reduce pipeline. Records are merged verbatim and consumed by "
+        "an Architect, Engineer, Test Engineer and Auditor. Extract only: never summarise, "
+        "infer, judge or design.\n"
+        "\n"
+        "Output newline-separated records only — no preamble, headings, fences or blank lines. "
+        "Max 20, in order of appearance, no repeats. Every line:\n"
+        "  TYPE | <path>:<line> | <verbatim payload> | <note, max 10 words>\n"
+        "Use `-` when no line number. Omit a type entirely if absent — never write 'none'.\n"
+        "\n"
+        "PAYLOAD SECTIONS IN THIS PART names the blocks this part covers "
+        "(PROJECT_HISTORY, DIRECTORY_STRUCTURE, SYMBOL_SKELETON, ...). Use it to pick the "
+        "record TYPE — the same string means different things in a symbol map and in chat history.\n"
+        "\n"
+        "ALWAYS capture:\n"
+        "  DEP    declared dependency/runtime/framework + version\n"
+        "  CMD    runnable script or command from a manifest\n"
+        "  TEST   test path, runner, assertion library, or fixture location\n"
+        "  CONFIG env var, feature flag, or config key the code reads\n"
+        "Capture when present, listing anything NEW_REQUEST references, calls or imports first. "
+        "You see one part of a larger payload, so you cannot trace what NEW_REQUEST reaches "
+        "through code you cannot see: when unsure, include it. A later step filters:\n"
+        "  PATH   existing source file + one-sentence responsibility\n"
+        "  SYM    exported function/class/type/constant, full signature\n"
+        "  DATA   persisted or returned field name + declared type\n"
+        "  AUTH   authority decision point, or untrusted input entry\n"
+        "  RULE   requirement, constraint or invariant stated in the text\n"
+        "  GAP    symbol/path/config referenced here but not defined here\n"
+        "\n"
+        "1. VERBATIM: copy signatures, names, types, versions, commands, paths "
+        "character-for-character. Never normalise or correct.\n"
+        "2. OBSERVED ONLY: no purpose, quality, intent, risk, or 'appears to'. Not written "
+        "in the chunk means it does not exist. No findings or recommendations.\n"
+        "3. One fact per record. Never merge two symbols, paths or commands.\n"
+        "4. Cut off at the chunk boundary: copy what is present, append ` ~TRUNCATED`.\n"
+        "\n"
+        "SYM | src/http/routes/search.ts:22 | export async function search(q: string, key: string): Promise<Result[]> | public entrypoint\n"
+        "CMD | package.json:8 | npm run test:unit | vitest, unit suite\n"
+        "AUTH | src/http/routes/search.ts:19 | req.headers['x-api-key'] | untrusted, keys the lookup\n"
+        "GAP | src/http/routes/search.ts:31 | resolveTenant | imported from ../auth, not in chunk\n"
     )
 
-    for i, chunk in enumerate(chunks):
+    # Every conditional record type is scoped to the request, but the request sits
+    # at the tail of the payload and would otherwise reach only the final chunk.
+    new_request = extract_request(user_content)
+    if not new_request:
+        print("  ⚠ No NEW_REQUEST/FINAL_BUILD_COMMAND found in the payload; "
+              "chunks will be extracted without one.", flush=True)
+
+    for i, (chunk, section_label) in enumerate(chunks):
         part_label = f"Part {i + 1}/{len(chunks)}"
-        
+
         chunk_prompt = ""
         if prior_context:
             chunk_prompt += f"### PREVIOUS ANALYSES\n{prior_context}\n\n---\n\n"
-            
+
+        if new_request:
+            chunk_prompt += (
+                f"### NEW_REQUEST\n"
+                f"The change being planned. Repeated in every part; do not extract records from it.\n\n"
+                f"{new_request}\n\n---\n\n"
+            )
+
         chunk_prompt += (
             f"### CURRENT TASK\n"
-            f"Extract key technical information from the following text chunk.\n\n"
+            f"Extract records from this part of the payload.\n"
+            f"PAYLOAD SECTIONS IN THIS PART: {section_label}\n\n"
             f"{chunk}\n\n"
             f"---\n"
             f"CHUNK IDENTIFIER: PART {i + 1} OF {len(chunks)}"
         )
-        
+
         print(f"    ↳ Preparing {part_label} (Payload: {len(chunk_prompt)} chars)...", flush=True)
         # Use the relaxed prompt for the chunks
-        result = _single_llm_call(client, model_config, relaxed_chunk_system_prompt, chunk_prompt, part_label)
+        result = _single_llm_call(client, model_config, relaxed_chunk_system_prompt, chunk_prompt,
+                                  part_label, max_output_tokens=EXTRACTION_MAX_TOKENS)
         partial_results.append(result)
 
     print("    ↳ All parts finished. Starting Merge Pass...", flush=True)
@@ -216,7 +574,8 @@ def call_llm(client: httpx.Client, model_config, system_prompt: str, user_conten
             )
             result = _single_llm_call(client, model_config,
                 "You are a technical summarizer. Output concise bullet points only.",
-                consolidation_prompt, f"Consolidation {bi+1}/{len(buckets)}")
+                consolidation_prompt, f"Consolidation {bi+1}/{len(buckets)}",
+                max_output_tokens=EXTRACTION_MAX_TOKENS)
             consolidated.append(result)
         partial_results = consolidated
         print(f"    ↳ Consolidated {len(buckets)} buckets into {len(consolidated)} summaries.", flush=True)
@@ -235,13 +594,73 @@ def call_llm(client: httpx.Client, model_config, system_prompt: str, user_conten
     return _single_llm_call(client, model_config, system_prompt, merge_prompt, "Merging Parts")
 
 
-def _single_llm_call(client: httpx.Client, model_config, system_prompt: str, user_content: str, label: str = "Inference") -> str:
+def _extract_delta(line: str, is_ollama: bool):
+    """
+    Pull (answer_token, reasoning_token, done) out of one streamed line.
+
+    Thinking models split their output across two channels. Ollama returns
+    reasoning in message.thinking; llama.cpp returns it in delta.reasoning_content
+    (or delta.reasoning on some builds). Reading only the answer channel makes a
+    healthy stream look completely dead, which is why a working generation could
+    report "Salvaging 0 tokens".
+
+    Returns (None, None, False) for lines that carry no delta at all.
+    """
+    if is_ollama:
+        try:
+            chunk_data = json.loads(line)
+        except Exception:
+            return None, None, False
+        message = chunk_data.get("message", {})
+        return (
+            message.get("content", ""),
+            message.get("thinking", ""),
+            chunk_data.get("done", False),
+        )
+
+    if not line.startswith("data: "):
+        # Orchestrator heartbeats and non-data SSE events
+        return None, None, False
+    if line == "data: [DONE]":
+        return None, None, True
+    try:
+        chunk_data = json.loads(line[6:])
+        choices = chunk_data.get("choices", [{}])
+        if not choices:
+            return "", "", False
+        delta = choices[0].get("delta", {})
+        return (
+            delta.get("content", ""),
+            delta.get("reasoning_content", "") or delta.get("reasoning", ""),
+            choices[0].get("finish_reason") is not None,
+        )
+    except Exception:
+        # Malformed chunk or internal proxy metadata
+        return None, None, False
+
+
+def _salvage_note(answer_tokens: list, reasoning_tokens: list) -> str:
+    """Describe what we actually managed to keep, so failures are not silent."""
+    if answer_tokens:
+        return f"Salvaging {len(answer_tokens)} answer tokens."
+    if reasoning_tokens:
+        return (
+            f"Got {len(reasoning_tokens)} reasoning tokens but ZERO answer tokens - "
+            "the server ignored the thinking-disable request. Salvaging nothing."
+        )
+    return "No tokens of any kind received. Salvaging nothing."
+
+
+def _single_llm_call(client: httpx.Client, model_config, system_prompt: str, user_content: str,
+                     label: str = "Inference", max_output_tokens: int = ANSWER_MAX_TOKENS) -> str:
     """
     Execute a single LLM API call with streaming for live feedback.
     Supports both Ollama native and OpenAI-compatible streaming formats.
 
     Args:
         model_config: Either a string (model name, Ollama) or a dict with provider info.
+        max_output_tokens: Hard cap on generated tokens. Extraction passes want a
+            tight cap; the merge pass needs room for the full templated answer.
     """
     # Normalize config
     if isinstance(model_config, str):
@@ -254,6 +673,9 @@ def _single_llm_call(client: httpx.Client, model_config, system_prompt: str, use
     base_url = cfg.get("base_url", OLLAMA_HOST)
     is_ollama = provider == "ollama"
 
+    # Distillation passes want the templated answer, not the reasoning trace.
+    # Thinking models spend their entire per-part budget in the reasoning channel
+    # before emitting a single answer token, so we turn it off at the source.
     if is_ollama:
         payload = {
             "model": model_name,
@@ -262,9 +684,11 @@ def _single_llm_call(client: httpx.Client, model_config, system_prompt: str, use
                 {"role": "user", "content": user_content}
             ],
             "stream": True,
+            "think": False,
             "options": {
                 "num_ctx": CONTEXT_WINDOW,
                 "temperature": 0.3,
+                "num_predict": max_output_tokens,
             },
             "keep_alive": "3m"
         }
@@ -278,6 +702,9 @@ def _single_llm_call(client: httpx.Client, model_config, system_prompt: str, use
             ],
             "stream": True,
             "temperature": 0.3,
+            "max_tokens": max_output_tokens,
+            # llama.cpp honours template kwargs; ignored harmlessly by servers that don't.
+            "chat_template_kwargs": {"enable_thinking": False},
         }
         url = f"{base_url}/v1/chat/completions"
 
@@ -298,15 +725,19 @@ def _single_llm_call(client: httpx.Client, model_config, system_prompt: str, use
 
         try:
             full_response = []
+            reasoning_response = []
             print(f"    {label:15} [Generating...]\n    ↳ ", end="", flush=True)
             start_time = time.time()
             
             with httpx.Client() as stream_client:
                 # Disable orchestrator scrubbing for distillation passes
                 headers = {"X-No-Scrub": "true"}
-                # Stability Protocol: 60s budget per part.
+                # Stability Protocol: the budget is idle time, not total time. Connect
+                # fast, then allow STALL_TIMEOUT between tokens; max_output_tokens is
+                # what stops a runaway generation, not the clock.
+                stream_timeout = httpx.Timeout(STALL_TIMEOUT, connect=15.0)
                 try:
-                    with stream_client.stream("POST", url, json=payload, headers=headers, timeout=60.0) as resp:
+                    with stream_client.stream("POST", url, json=payload, headers=headers, timeout=stream_timeout) as resp:
                         if resp.status_code == 503:
                             first_token_received.set()
                             print(f"\n  ⚠ Orchestrator is busy (503). Retrying in 10s... (Attempt {attempt+1}/{max_retries})")
@@ -325,50 +756,46 @@ def _single_llm_call(client: httpx.Client, model_config, system_prompt: str, use
                             return f"[ERROR: LLM returned status {resp.status_code}]"
                         
                         dot_count = 0
+                        last_progress = time.time()
                         for line in resp.iter_lines():
-                            # Stability Protocol: 60s hard budget per part (wall-clock time)
-                            # This must run REGARDLESS of whether we received a token or a heartbeat.
-                            if time.time() - start_time > 60:
-                                if attempt < max_retries - 1:
-                                    print(f"\n      ⚠ [STABILITY PROTOCOL] Analytical capacity exceeded (60s). Retrying part ({attempt+2}/{max_retries})...")
-                                    first_token_received.set()
-                                    raise httpx.ReadTimeout("Analytical capacity exceeded")
-                                else:
-                                    print(f"\n      ✗ [STABILITY PROTOCOL] Analytical capacity exceeded on FINAL ATTEMPT. Salvaging {len(full_response)} tokens.")
-                                    first_token_received.set()
-                                    return "".join(full_response)
+                            # Stability Protocol: only a STALLED stream is a failure.
+                            # A stream that is producing tokens is doing its job however
+                            # long it takes; max_output_tokens bounds the total.
+                            if time.time() - last_progress > STALL_TIMEOUT:
+                                # Reported by the ReadTimeout handler below, which sees
+                                # transport-level stalls too. Printing here as well is
+                                # what produced the duplicated warnings in the logs.
+                                first_token_received.set()
+                                raise httpx.ReadTimeout("Stream stalled")
 
                             if not line:
                                 continue
-                            
+
                             if not first_token_received.is_set():
                                 first_token_received.set()
 
-                            if is_ollama:
-                                chunk_data = json.loads(line)
-                                token = chunk_data.get("message", {}).get("content", "")
-                                done = chunk_data.get("done", False)
-                            else:
-                                if not line.startswith("data: "):
-                                    # Handle orchestrator heartbeats and non-data SSE events
-                                    continue
-                                if line == "data: [DONE]":
+                            token, reasoning, done = _extract_delta(line, is_ollama)
+                            if token is None and reasoning is None:
+                                if done:
                                     break
-                                try:
-                                    chunk_data = json.loads(line[6:])
-                                    choices = chunk_data.get("choices", [{}])
-                                    token = choices[0].get("delta", {}).get("content", "") if choices else ""
-                                    done = choices[0].get("finish_reason") is not None if choices else False
-                                except Exception:
-                                    # Skip malformed chunks or internal proxy metadata
-                                    continue
+                                continue
+
+                            if reasoning:
+                                # Kept out of the result, but tracked so a reasoning-only
+                                # stream is visibly distinct from a stalled one.
+                                reasoning_response.append(reasoning)
+                                last_progress = time.time()
+                                dot_count += 1
+                                if dot_count % 20 == 0:
+                                    print("~", end="", flush=True)
 
                             if token:
                                 full_response.append(token)
+                                last_progress = time.time()
                                 dot_count += 1
                                 if dot_count % 20 == 0:
                                     print(".", end="", flush=True)
-                            
+
                             if done:
                                 break
                     
@@ -378,12 +805,19 @@ def _single_llm_call(client: httpx.Client, model_config, system_prompt: str, use
 
                 except httpx.ReadTimeout:
                     first_token_received.set()
+                    salvaged = "".join(full_response)
+                    if salvaged:
+                        # The prompt and sampler settings are unchanged, so a retry
+                        # reproduces the same stall and throws away this partial on
+                        # the way. Keep what the model actually produced.
+                        print(f"\n      ✗ [Stability Protocol] Stream stalled ({STALL_TIMEOUT:.0f}s idle). "
+                              f"{_salvage_note(full_response, reasoning_response)} Not retrying - identical prompt.")
+                        return salvaged
                     if attempt < max_retries - 1:
-                        print(f"\n      ⚠ [Stability Protocol] Analytical capacity exceeded (timeout). Retrying part ({attempt+2}/{max_retries})...")
+                        print(f"\n      ⚠ [Stability Protocol] Stalled with no output. Retrying part ({attempt+2}/{max_retries})...")
                         continue
-                    else:
-                        print(f"\n      ✗ [Stability Protocol] Analytical capacity exceeded on FINAL ATTEMPT. Salvaging {len(full_response)} tokens.")
-                        return "".join(full_response) if full_response else "[ERROR: ReadTimeout]"
+                    print(f"\n      ✗ [Stability Protocol] Stalled on FINAL ATTEMPT. {_salvage_note(full_response, reasoning_response)}")
+                    return "[ERROR: ReadTimeout]"
 
         except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as e:
             first_token_received.set()
@@ -607,7 +1041,7 @@ def run_distillation():
 
     config = load_config()
     models = config.get("models", {})
-    prompts = config.get("prompts", {})
+    prompts = load_prompts(config)
     messages = load_conversation()
 
     def read_workspace_file(rel_path: str) -> str:
@@ -748,21 +1182,53 @@ def run_distillation():
         
     print(f"📄 Context size: {len(conversation_text)} chars", flush=True)
 
-    passes = [
+    all_passes = [
         ("architect",     "🏗️  Pass 1/4: System Architect"),
         ("engineer",      "⚙️  Pass 2/4: Engineer"),
         ("test_engineer", "🧪  Pass 3/4: Test Engineer"),
         ("safety",        "🛡️  Pass 4/4: Safety Inspector"),
     ]
+    passes = _select_passes(all_passes)
+    if len(passes) < len(all_passes):
+        print(f"⏸️  Review gate: running only {', '.join(k for k, _ in passes)}", flush=True)
+    if DISTILL_RESUME:
+        print("♻️  Resume enabled: saved pass results will be reused instead of regenerated.", flush=True)
 
     results = {}
     previous_model_config = None
 
     with httpx.Client() as client:
+        # Two of the four passes are Ollama models, so the pipeline must be able to
+        # evict a resident llama.cpp server mid-run regardless of which model the
+        # architect uses. Do it once up front so the first pass starts on a clear GPU.
+        # Pick the keeper from the first pass that will actually call an LLM - a
+        # resumed pass reads from disk and needs no model at all.
+        keep_key = None
+        for pass_key, _ in passes:
+            if DISTILL_RESUME and load_saved_pass(pass_key):
+                continue
+            keep_key = pass_key
+            break
+        if keep_key:
+            evict_stale_models(
+                client, models,
+                _resolve_model_config(models.get(keep_key, models.get("architect")))
+            )
+        else:
+            print("  ↳ Every pass is resuming from disk; no model needed.", flush=True)
+
         for pass_key, pass_label in passes:
             print(f"\n{pass_label}", flush=True)
             print("-" * 40, flush=True)
             update_status(f"Distilling: {pass_label}")
+
+            # Resume before any model swap or preload, so a reused pass costs nothing.
+            if DISTILL_RESUME:
+                saved = load_saved_pass(pass_key)
+                if saved:
+                    print(f"  ♻️  Reusing reviewed result from {_intermediate_path(pass_key)} ({len(saved)} chars)", flush=True)
+                    results[pass_key] = saved
+                    continue
 
             model_entry = models.get(pass_key, models.get("architect"))
             model_config = _resolve_model_config(model_entry)
@@ -816,7 +1282,7 @@ def run_distillation():
             previous_model_config = model_config
             print(f"  ✓ Complete ({len(result)} chars)")
 
-            intermediate_path = f"/workspace/.cline_context/distill_{pass_key}.md"
+            intermediate_path = _intermediate_path(pass_key)
             try:
                 # Ensure context directory exists inside workspace in case running raw
                 os.makedirs(os.path.dirname(intermediate_path), exist_ok=True)
@@ -830,6 +1296,18 @@ def run_distillation():
         # This keeps it 'warm' for Phase 2 (the Cline Build cycle).
         # if previous_model_config:
         #     unload_model(client, previous_model_config)
+
+    # A partial run (the review gate) must not overwrite .clinerules with an
+    # incomplete ruleset - the approve run assembles the real one.
+    missing = [key for key, _ in all_passes if key not in results]
+    if missing:
+        update_status("Awaiting review.")
+        print(f"\n⏸️  Partial distillation complete. Skipped: {', '.join(missing)}", flush=True)
+        print(f"  ↳ .clinerules NOT written; review {_intermediate_path(passes[0][0])} then approve.", flush=True)
+        print("=" * 60, flush=True)
+        print("✅ Review gate reached", flush=True)
+        print("=" * 60, flush=True)
+        return
 
     print(f"\n📝 Writing {OUTPUT_PATH}", flush=True)
     update_status("Assembling .clinerules...")

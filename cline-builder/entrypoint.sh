@@ -40,6 +40,9 @@ CONVERSATION_FILE="${CONVERSATION_FILE:-/workspace/.cline_context/conversation.j
 CLINERULES_PATH="${CLINERULES_PATH:-/workspace/.clinerules}"
 OLLAMA_HOST="${OLLAMA_HOST:-http://host.docker.internal:11434}"
 CLINE_CTX="${CLINE_CTX:-131072}"
+# 'full' runs distillation then the Cline build cycle.
+# 'distill_only' stops at the review gate. Defaulted because set -u is active.
+PIPELINE_MODE="${PIPELINE_MODE:-full}"
 
 echo "========================================"
 echo "🔨 Cline Builder Pipeline"
@@ -180,18 +183,34 @@ fi
 # --- Read Config ---
 MAX_SIZE_MB=$(jq -r '.limits.max_project_size_mb // 2048' "$CONFIG_PATH")
 MAX_ITERATIONS=$(jq -r '.limits.max_build_iterations // 5' "$CONFIG_PATH")
-CLINE_MAX_TURNS=$(jq -r '.limits.cline_max_turns // 100' "$CONFIG_PATH")
+# Consecutive-mistake budget passed to the Cline CLI's --retries flag.
+# Default matches the CLI's own default so an absent config changes nothing.
+CLINE_MAX_RETRIES=$(jq -r '.limits.cline_max_retries // 6' "$CONFIG_PATH")
 # Extract cline model: handle both string ("model_name") and object ({"model": "..."}) formats
-CLINE_MODEL=$(jq -r 'if (.models.cline | type) == "object" then .models.cline.model else (.models.cline // "qwen3.5:27b") end' "$CONFIG_PATH")
+CLINE_MODEL=$(jq -r 'if (.models.cline | type) == "object" then .models.cline.model else (.models.cline // "qwen3.8:27b") end' "$CONFIG_PATH")
 CLINE_PROVIDER=$(jq -r 'if (.models.cline | type) == "object" then (.models.cline.provider // "ollama") else "ollama" end' "$CONFIG_PATH")
 CLINE_BASE_URL=$(jq -r --arg dh "$DEFAULT_HOST" 'if (.models.cline | type) == "object" then (.models.cline.base_url // $dh) else $dh end' "$CONFIG_PATH")
 CLINE_STARTUP=$(jq -r '.cline_startup_message // "Read .clinerules and execute all tasks."' "$CONFIG_PATH")
 
 # --- Project Size Check ---
+# Mirrors the noise-suppression list above: VCS metadata and regenerable
+# artifacts are never parsed by the agent, so they shouldn't count toward the cap.
+DU_EXCLUDES=(
+    --exclude=.git
+    --exclude=node_modules
+    --exclude=.venv
+    --exclude=venv
+    --exclude=__pycache__
+    --exclude=.pytest_cache
+    --exclude=.knowledge_base
+    --exclude=.cline_logs
+    --exclude=.cline_context
+)
+
 check_project_size() {
     local dir_size_mb
-    dir_size_mb=$(du -sm /workspace 2>/dev/null | cut -f1)
-    echo "  📦 Workspace size: ${dir_size_mb} MB / ${MAX_SIZE_MB} MB limit"
+    dir_size_mb=$(du -sm "${DU_EXCLUDES[@]}" /workspace 2>/dev/null | cut -f1)
+    echo "  📦 Workspace size: ${dir_size_mb} MB / ${MAX_SIZE_MB} MB limit (source only)"
     if [ "$dir_size_mb" -gt "$MAX_SIZE_MB" ]; then
         echo "✗ FATAL: Workspace exceeds size limit (${dir_size_mb} MB > ${MAX_SIZE_MB} MB)"
         return 1
@@ -215,6 +234,18 @@ DISTILL_EXIT=$?
 if [ $DISTILL_EXIT -ne 0 ]; then
     echo "✗ FATAL: Distillation failed (exit code ${DISTILL_EXIT})"
     exit 1
+fi
+
+# Review gate: stop here so the architecture can be inspected (and edited) before
+# any code is written. The approve run re-enters with DISTILL_RESUME=1.
+if [ "$PIPELINE_MODE" = "distill_only" ]; then
+    echo ""
+    echo "========================================="
+    echo "⏸️  Review gate: stopping before Phase 2"
+    echo "   Review: /workspace/.cline_context/distill_architect.md"
+    echo "   Approve in chat with: !approve"
+    echo "========================================="
+    exit 0
 fi
 
 if [ ! -f "$CLINERULES_PATH" ]; then
@@ -328,7 +359,7 @@ echo "   Output: /workspace"
 echo "========================================="
 echo "  Model:          ${CLINE_MODEL}"
 echo "  Max iterations: ${MAX_ITERATIONS}"
-echo "  Max turns/iter: ${CLINE_MAX_TURNS}"
+echo "  Max retries:    ${CLINE_MAX_RETRIES}"
 echo ""
 
 # --- Phase 2 Setup: Auto-Auth for CLI ---
@@ -376,11 +407,12 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     fi
 
     set +e
-    export CLINE_MODEL CURRENT_TIMEOUT BUILD_MSG
+    export CLINE_MODEL CURRENT_TIMEOUT BUILD_MSG CLINE_MAX_RETRIES
     script -q -e -c 'cline -v --auto-approve true \
         -P openai-compatible \
         -m "$CLINE_MODEL" \
         --timeout "$CURRENT_TIMEOUT" \
+        --retries "$CLINE_MAX_RETRIES" \
         "$BUILD_MSG"' \
         "/workspace/.cline_logs/build_log_iter_${ITERATION}.txt"
     CLINE_EXIT=$?
@@ -408,11 +440,12 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     6) CONTINUITY: Watch for '[STABILITY MONITOR]' markers in history. If a turn was cut off, do not re-read from the beginning; pick up exactly where you left off.
     7) Before testing, if a port is in use, YOU MUST ONLY use 'npx kill-port <portnumber>' to free it."
     set +e
-    export CLINE_MODEL VERIFY_MSG
+    export CLINE_MODEL VERIFY_MSG CLINE_MAX_RETRIES
     script -q -e -c 'cline -v --auto-approve true \
         -P openai-compatible \
         -m "$CLINE_MODEL" \
         --timeout 1800 \
+        --retries "$CLINE_MAX_RETRIES" \
         "$VERIFY_MSG"' \
         "/workspace/.cline_logs/verify_log_iter_${ITERATION}.txt"
     set -e
@@ -429,11 +462,12 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     4) CONTINUITY: Watch for '[STABILITY MONITOR]' markers in history. If a turn was cut off, do not re-read from the beginning; pick up exactly where you left off.
     5) Before testing, if a port is in use, YOU MUST ONLY use 'npx kill-port <portnumber>' to free it."
     set +e
-    export CLINE_MODEL SAFETY_MSG
+    export CLINE_MODEL SAFETY_MSG CLINE_MAX_RETRIES
     script -q -e -c 'cline -v --auto-approve true \
         -P openai-compatible \
         -m "$CLINE_MODEL" \
         --timeout 1800 \
+        --retries "$CLINE_MAX_RETRIES" \
         "$SAFETY_MSG"' \
         "/workspace/.cline_logs/safety_log_iter_${ITERATION}.txt"
     set -e
@@ -469,6 +503,6 @@ else
 fi
 
 # Final size report
-FINAL_SIZE=$(du -sm /workspace 2>/dev/null | cut -f1)
-echo "   Final workspace size: ${FINAL_SIZE} MB"
+FINAL_SIZE=$(du -sm "${DU_EXCLUDES[@]}" /workspace 2>/dev/null | cut -f1)
+echo "   Final workspace size: ${FINAL_SIZE} MB (source only)"
 echo "========================================"

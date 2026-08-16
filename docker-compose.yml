@@ -50,6 +50,9 @@ services:
     volumes:
       - ./conversations:/workspace
       - ./cline-builder/agent_config.json:/app/agent_config.json:ro
+      # Prompt bodies are referenced by relative path from agent_config.json,
+      # so they must be present next to it inside the container.
+      - ./cline-builder/prompts:/app/prompts:ro
     environment:
       - OLLAMA_HOST=http://host.docker.internal:11434
       - AGENT_CONFIG_PATH=/app/agent_config.json

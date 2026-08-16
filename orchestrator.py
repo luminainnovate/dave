@@ -22,10 +22,20 @@ logger = logging.getLogger("Bob-Orchestrator")
 # --- STRICT MODEL CONFIG ---
 # Each model role is a dict: model name, provider type, and API base URL.
 # Supported providers: "ollama", "lmstudio", "llamacpp"
+# EXPERT_CONFIG = {
+#    "model": "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q3_K_XL",
+#     "provider": "llamacpp",
+#     "base_url": "http://localhost:8081",
+# }
+# EXPERT_CONFIG = {
+#    "model": "unsloth/Qwen3.6-35B-A3B-GGUF:UD-IQ4_NL",
+#     "provider": "llamacpp",
+#     "base_url": "http://localhost:8081",
+# }
 EXPERT_CONFIG = {
-   "model": "unsloth/Qwen3.6-35B-A3B-GGUF:UD-IQ4_NL",
-    "provider": "llamacpp",
-    "base_url": "http://localhost:8081",
+   "model": "qwen3.8:27b",
+    "provider": "ollama",
+    "base_url": "http://localhost:11434",
 }
 ROUTER_CONFIG = {
     "model": "qwen2.5:1.5b",
@@ -36,10 +46,10 @@ ROUTER_CONFIG = {
 # Shorthand names (derived from config, used in routing logic throughout)
 EXPERT_MODEL = EXPERT_CONFIG["model"]
 ROUTER_MODEL = ROUTER_CONFIG["model"]
-DEFAULT_EXPERT_MODEL = "qwen3.5:27b" # Keep this as default, if you know what youre doing, you can change it with the PARAMS_GENERAL/PARAMS_CODING
+DEFAULT_EXPERT_MODEL = "qwen3.8:27b" # Keep this as default, if you know what youre doing, you can change it with the PARAMS_GENERAL/PARAMS_CODING
 
 # llama.cpp managed process settings (only used when provider is "llamacpp")
-LLAMACPP_BINARY = "/home/mv/llama.cpp/build/bin/llama-server"  # Path to llama-server binary
+LLAMACPP_BINARY = "/home/jonathan/.local/bin/llama"  # llama.app unified binary (serves via the `serve` subcommand)
 LLAMACPP_DEFAULT_ARGS = ["--cache-type-k", "q8_0", "--cache-type-v", "q8_0"]  # Extra CLI args (KV Quant enabled)
 
 COMFYUI_URL = "http://localhost:8188"
@@ -269,19 +279,32 @@ async def _start_llamacpp_server(config: dict):
         # Context rotation: llama-server natively supports sliding window truncation
         # Set to 0.7 to give massive breathing room and reduce rotation frequency.
         # Disable similarity matching to force linear slot persistence.
+        # truncate_args = [
+        #     "--chat-truncate", 
+        #     "--chat-truncate-max-keep", "0.7",
+        #     "--slot-prompt-similarity", "0.95",
+        #     "--batch-size", "1024",
+        #     "--ubatch-size", "1024"
+        # ]
+        # Reasoning channel: pin to 'deepseek' instead of leaving it on 'auto'.
+        # 'auto' lets the template decide where thoughts land, so a client reading
+        # delta.content can silently receive nothing while the model generates
+        # normally. 'deepseek' guarantees thoughts arrive in delta.reasoning_content.
+        # (Note: --reasoning-preserve is unrelated - it keeps traces in full history,
+        #  which only inflates context for the multi-turn agent.)
         truncate_args = [
-            "--chat-truncate", 
-            "--chat-truncate-max-keep", "0.7",
+            "--context-shift",
             "--slot-prompt-similarity", "0.95",
             "--batch-size", "1024",
-            "--ubatch-size", "1024"
+            "--ubatch-size", "1024",
+            "--reasoning-format", "deepseek"
         ]
 
         # Build command: detect HuggingFace repo vs local path
         if "/" in model and not os.path.exists(model):
-            cmd = [binary, "-hf", model, "--host", host, "--port", port, "-c", ctx_size, "-np", "1"] + truncate_args + extra_args
+            cmd = [binary, "serve", "-hf", model, "--host", host, "--port", port, "-c", ctx_size, "-np", "1"] + truncate_args + extra_args
         else:
-            cmd = [binary, "-m", model, "--host", host, "--port", port, "-c", ctx_size, "-np", "1"] + truncate_args + extra_args
+            cmd = [binary, "serve", "-m", model, "--host", host, "--port", port, "-c", ctx_size, "-np", "1"] + truncate_args + extra_args
 
         if model not in _managed_processes:
             logger.info(f"llama.cpp: Starting: {' '.join(cmd)}")
@@ -373,6 +396,28 @@ app = FastAPI(title="Bob: AI Workspace Orchestrator", lifespan=lifespan)
 # =============================================================================
 # VRAM MANAGEMENT
 # =============================================================================
+
+def _get_first_pass_model() -> Optional[str]:
+    """
+    Which model the build pipeline's first distillation pass will ask for.
+
+    Read fresh each time rather than cached, so editing agent_config.json does not
+    require an orchestrator restart. Returns None if the config cannot be read, in
+    which case callers should fall back to their previous unload behaviour.
+    """
+    path = os.environ.get("AGENT_CONFIG_PATH", "cline-builder/agent_config.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            models = json.load(f).get("models", {})
+        entry = models.get("architect")
+        if isinstance(entry, str):
+            return entry
+        if isinstance(entry, dict):
+            return entry.get("model")
+    except Exception as e:
+        logger.warning(f"Could not read first-pass model from {path}: {e}")
+    return None
+
 
 async def get_loaded_models() -> list[str]:
     """Queries all configured providers to identify models currently in VRAM."""
@@ -979,12 +1024,24 @@ async def shutdown_expert():
         if model_name in _llamacpp_ready_events:
             _llamacpp_ready_events[model_name].clear()
             
-    try:
-        # Use killall as a universal sweep for any binary name match
-        subprocess.run(["killall", "-9", "llama-server"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        logger.info("VRAM Cleanup: Executed killall -9 llama-server sweep.")
-    except Exception:
-        pass
+    # Sweep by actual process name. killall matches the exact command name, so a
+    # hardcoded "llama-server" misses the unified `llama serve` binary entirely
+    # (its process is named after LLAMACPP_BINARY) while still matching Ollama's
+    # own internal runner at /usr/local/lib/ollama/llama-server. Derive the name
+    # from the configured binary so the sweep tracks whatever is actually managed.
+    sweep_names = []
+    managed_name = os.path.basename(LLAMACPP_BINARY)
+    if managed_name:
+        sweep_names.append(managed_name)
+    if "llama-server" not in sweep_names:
+        sweep_names.append("llama-server")
+
+    for name in sweep_names:
+        try:
+            subprocess.run(["killall", "-9", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            logger.info(f"VRAM Cleanup: Executed killall -9 {name} sweep.")
+        except Exception:
+            pass
 
     logger.info(f"VRAM Cleanup: Terminated {killed_count} tracked expert processes.")
     return JSONResponse(content={"status": "ok", "processes_killed": killed_count})
@@ -1132,6 +1189,28 @@ async def proxy_ollama(request: Request):
             success = mover.handle_move(messages)
             msg = "Files moved!" if "Moved" in success else "Files failed to move!"
             return _command_response(msg, is_streaming, is_native)
+        elif "!architect" in prompt_lower:
+            logger.info("Command: Architect review gate triggered.")
+            review_msg = await _run_architect_review(messages)
+            return _command_response(review_msg, is_streaming, is_native)
+        elif "!approve" in prompt_lower:
+            logger.info("Command: Architecture approved; resuming full build.")
+            path = _architect_review_path(messages)
+            if not path or not os.path.exists(path):
+                return _command_response(
+                    "⚠️ **Nothing to approve.** Run `!architect` first to generate an architecture.",
+                    is_streaming, is_native
+                )
+            approve_msg = await _trigger_build_pipeline_safe(
+                messages,
+                extra_env={"DISTILL_RESUME": "1"},
+                mode_label="Approved (resuming from reviewed architecture)",
+                skip_cooldown=True,
+            )
+            return _command_response(approve_msg, is_streaming, is_native)
+        elif "!review" in prompt_lower:
+            logger.info("Command: Architecture review requested.")
+            return _command_response(_read_architect_review(messages), is_streaming, is_native)
         elif "!build" in prompt_lower:
             logger.info("Command: Build pipeline triggered.")
             build_msg = await _trigger_build_pipeline_safe(messages)
@@ -1461,16 +1540,23 @@ def _command_response(text: str, is_streaming: bool = False, is_native: bool = F
     return StreamingResponse(_generator(), media_type="application/x-ndjson" if is_native else "text/event-stream")
 
 
+PATH_TOOLS = ("orchestrator_read_file", "orchestrator_expand_dir")
+
+
 def _execute_tool(name: str, args: dict, project_dir: str) -> str:
     """Executes a native orchestrator tool."""
-    path = args.get("path", "")
-    if not path or not project_dir:
-        return "Error: Missing path or project directory."
-        
-    # Sanitize path
-    safe_rel_path = mover.sanitize_path(path)
-    abs_path = os.path.join(project_dir, safe_rel_path)
-    
+    # Only the path-based tools resolve a `path` argument. orchestrator_build_logs
+    # is declared with no parameters, so gating every tool on `path` made it
+    # permanently unreachable and burned hops on retries.
+    safe_rel_path = ""
+    abs_path = ""
+    if name in PATH_TOOLS:
+        path = args.get("path", "")
+        if not path or not project_dir:
+            return "Error: Missing path or project directory."
+        safe_rel_path = mover.sanitize_path(path)
+        abs_path = os.path.join(project_dir, safe_rel_path)
+
     if name == "orchestrator_read_file":
         try:
             if not os.path.exists(abs_path):
@@ -1532,6 +1618,23 @@ def _execute_tool(name: str, args: dict, project_dir: str) -> str:
     return f"Error: Unknown tool `{name}`"
 
 
+def _finalize_agentic_response(data: dict, backend_is_ollama: bool, is_native: bool) -> dict:
+    """Normalises a completed inference response into the shape the client expects."""
+    if not backend_is_ollama and is_native:
+        # Translate OpenAI response to Ollama native
+        choice = data.get("choices", [{}])[0]
+        return {
+            "model": "Bob",
+            "message": choice.get("message", {"role": "assistant", "content": ""}),
+            "done": True
+        }
+
+    data["model"] = "Bob"
+    if "id" in data:
+        data["id"] = "chatcmpl-Bob"
+    return data
+
+
 async def _handle_agentic_request(body: dict, project_dir: str, target_url: str,
                                   is_native: bool, lock: asyncio.Lock, backend_is_ollama: bool = True):
     """
@@ -1564,19 +1667,7 @@ async def _handle_agentic_request(body: dict, project_dir: str, target_url: str,
             tool_calls = message.get("tool_calls", [])
             if not tool_calls:
                 # No more tools, this is the final answer
-                if not backend_is_ollama and is_native:
-                    # Translate OpenAI response to Ollama native
-                    choice = data.get("choices", [{}])[0]
-                    data = {
-                        "model": "Bob",
-                        "message": choice.get("message", {"role": "assistant", "content": ""}),
-                        "done": True
-                    }
-                else:
-                    data["model"] = "Bob"
-                    if "id" in data:
-                        data["id"] = "chatcmpl-Bob"
-                return JSONResponse(content=data)
+                return JSONResponse(content=_finalize_agentic_response(data, backend_is_ollama, is_native))
             
             # Execute tools and append results
             original_messages.append(message)
@@ -1610,7 +1701,37 @@ async def _handle_agentic_request(body: dict, project_dir: str, target_url: str,
         except Exception as e:
             logger.error(f"Agentic Loop Error: {e}")
             break
-            
+
+    # The hop budget is spent (or an error broke the loop). Previously this fell
+    # straight through to a 500, discarding the last hop's tool results and
+    # failing the turn even though nothing had gone wrong. Instead, make one
+    # final tool-free call so the model answers with what it already gathered.
+    logger.info("Agentic Loop: Budget spent — requesting final answer without tools.")
+
+    final_body = body.copy()
+    final_body["stream"] = False
+    final_body.pop("tools", None)
+    final_body.pop("tool_choice", None)
+    # Sent as `user` rather than `system`: it lands immediately before generation
+    # and every chat template renders it, whereas a trailing system message is
+    # dropped by some. It is never persisted to the conversation.
+    final_body["messages"] = list(body.get("messages", [])) + [{
+        "role": "user",
+        "content": (
+            "You have reached the tool-call limit for this turn. Answer now using "
+            "the information already gathered, and do not request more tools. If "
+            "something remains unknown, say so briefly and answer with what you have."
+        )
+    }]
+
+    try:
+        resp = await http_client.post(target_url, json=final_body, timeout=600.0)
+        if resp.status_code == 200:
+            return JSONResponse(content=_finalize_agentic_response(resp.json(), backend_is_ollama, is_native))
+        logger.error(f"Agentic Loop: Final answer call returned {resp.status_code}.")
+    except Exception as e:
+        logger.error(f"Agentic Loop: Final answer call failed: {e}")
+
     return JSONResponse(status_code=500, content={"error": "Agentic loop exceeded max hops or failed."})
 
 
@@ -1848,7 +1969,7 @@ def _handle_clone_command(messages: list) -> str:
         return f"❌ **Error during clone:** {e}"
 
 
-async def _trigger_build_pipeline(messages: list) -> str:
+async def _trigger_build_pipeline(messages: list, extra_env: Optional[dict] = None, mode_label: str = "Autonomous") -> str:
     """
     Orchestrates the build pipeline:
     1. Extracts conversation files to a unique project folder.
@@ -1911,20 +2032,26 @@ async def _trigger_build_pipeline(messages: list) -> str:
             "-e", f"EXPERT_CTX={DISTILL_CTX}",
             "-e", f"CLINE_CTX={CLINE_CTX}",
             "-e", "ORCHESTRATOR_URL=http://host.docker.internal:8000",
-            "cline-builder"
         ]
-        
+        for key, value in (extra_env or {}).items():
+            cmd += ["-e", f"{key}={value}"]
+        cmd.append("cline-builder")
+
         logger.info(f"Launching pipeline command: {' '.join(cmd)}")
         subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         # Launch the Safety Monitor to ensure VRAM is released when container stops/deleted
         asyncio.create_task(_docker_safety_monitor(container_name))
 
+        if extra_env and extra_env.get("PIPELINE_MODE") == "distill_only":
+            # The caller polls for the architect output and reports to chat itself.
+            return container_name
+
         return (
             f"🔨 **Build pipeline triggered.**\n\n"
             f"- **Workspace:** `conversations/{os.path.basename(target_dir)}`\n"
             f"- **Container:** `{container_name}`\n"
-            f"- **Mode:** `Autonomous`\n"
+            f"- **Mode:** `{mode_label}`\n"
             f"- **Status:** *Distillation started... Cline will follow.*\n\n"
             f"Check logs with: `docker logs -f {container_name}`\n"
             f"Tip: You can also type `!logs` to view them in chat, or ask me for build insights!"
@@ -2035,7 +2162,12 @@ async def _docker_safety_monitor(container_name: str):
         logger.error(f"[Watchdog] Error monitoring {container_name}: {e}")
 
 
-async def _trigger_build_pipeline_safe(messages: list) -> str:
+async def _trigger_build_pipeline_safe(
+    messages: list,
+    extra_env: Optional[dict] = None,
+    mode_label: str = "Autonomous",
+    skip_cooldown: bool = False,
+) -> str:
     """
     Triggers the build pipeline while ensuring VRAM is cleared and
     waiting for any active LLM tasks to finish.
@@ -2043,10 +2175,12 @@ async def _trigger_build_pipeline_safe(messages: list) -> str:
     """
     global _last_build_trigger_time, vram_locked
     current_time = time.time()
-    if current_time - _last_build_trigger_time < 10:
+    # The cooldown guards against client retries firing the same build twice.
+    # An approve following a review gate is a deliberate second trigger, so it opts out.
+    if not skip_cooldown and current_time - _last_build_trigger_time < 10:
         logger.warning("Duplicate build trigger ignored (cooldown).")
         return "⚠️ **Build already starting.** Please wait a few seconds for the status update."
-    
+
     _last_build_trigger_time = current_time
 
     async with gpu_lock:
@@ -2058,14 +2192,106 @@ async def _trigger_build_pipeline_safe(messages: list) -> str:
         # This prevents the 'Network unreachable' error when the container starts
         expert_cfg = _resolve_config(EXPERT_MODEL)
         if expert_cfg.get("provider") != "llamacpp":
-            await verified_unload(EXPERT_MODEL)
+            # If the build's first pass wants this same model, evicting it here just
+            # forces the pipeline to reload ~17GB it already had. Leave it resident.
+            first_pass_model = _get_first_pass_model()
+            if first_pass_model and first_pass_model == EXPERT_MODEL:
+                logger.info(f"Keeping {EXPERT_MODEL} resident; the build's first pass uses it.")
+            else:
+                await verified_unload(EXPERT_MODEL)
             
         # Router and ComfyUI should always be cleared as they are small/fast to reload
         await verified_unload(ROUTER_MODEL)
         await free_comfyui()
         
         # Now trigger the actual command
-        return await _trigger_build_pipeline(messages)
+        return await _trigger_build_pipeline(messages, extra_env=extra_env, mode_label=mode_label)
+
+
+ARCHITECT_REVIEW_TIMEOUT = 180
+
+
+def _architect_review_path(messages: list) -> Optional[str]:
+    """Path to the architect pass output for the conversation's bound project."""
+    project_dir = _get_bound_project_dir(messages)
+    if not project_dir:
+        return None
+    return os.path.join(os.path.abspath(project_dir), ".cline_context", "distill_architect.md")
+
+
+def _read_architect_review(messages: list) -> str:
+    """Return the saved architecture document for review in chat."""
+    path = _architect_review_path(messages)
+    if not path:
+        return "⚠️ **No project bound to this conversation.** Run `!architect` first."
+    if not os.path.exists(path):
+        return (
+            "📭 **No architecture to review yet.**\n\n"
+            "Run `!architect` to generate one. If you just started it, give it a few "
+            "seconds and try `!review` again."
+        )
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+    except Exception as e:
+        return f"❌ **Could not read the architecture document:** {e}"
+
+    if not content:
+        return "⚠️ **The architecture document is empty.** Re-run `!architect`."
+
+    return (
+        f"🏗️ **Proposed Architecture** — *review before building*\n\n"
+        f"---\n\n{content}\n\n---\n\n"
+        f"- **Accept and build:** `!approve`\n"
+        f"- **Regenerate:** `!architect`\n"
+        f"- **Edit by hand:** `{path}` — your edits are used as-is by `!approve`."
+    )
+
+
+async def _run_architect_review(messages: list) -> str:
+    """
+    Run distillation pass 1 only, then return the architecture for review.
+
+    Launches detached and polls for the output rather than blocking on the
+    container, so a slow cold-start cannot hang the chat turn indefinitely.
+    """
+    path = _architect_review_path(messages)
+    # Clear any previous document so we never present a stale one as new.
+    if path and os.path.exists(path):
+        try:
+            os.remove(path)
+        except Exception as e:
+            logger.warning(f"Could not clear previous architecture document: {e}")
+
+    result = await _trigger_build_pipeline_safe(
+        messages,
+        extra_env={"PIPELINE_MODE": "distill_only", "DISTILL_PASSES": "architect"},
+        mode_label="Review Gate",
+        skip_cooldown=True,
+    )
+
+    # A non-container-name result means the trigger failed or was aborted.
+    if not result.startswith("cline-builder-"):
+        return result
+
+    container_name = result
+    path = path or _architect_review_path(messages)
+    if not path:
+        return f"⚠️ **Architect pass started** (`{container_name}`) but no project directory is bound to this conversation."
+
+    deadline = time.time() + ARCHITECT_REVIEW_TIMEOUT
+    while time.time() < deadline:
+        await asyncio.sleep(2)
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            # Let the writer finish flushing before reading.
+            await asyncio.sleep(1)
+            return _read_architect_review(messages)
+
+    return (
+        f"⏳ **Architect pass is still running** (`{container_name}`).\n\n"
+        f"It exceeded the {ARCHITECT_REVIEW_TIMEOUT}s wait — usually a cold model load.\n"
+        f"Type `!review` in a moment to see the result, or `!logs` to watch progress."
+    )
 
 
 def _stop_build_pipeline() -> str:
