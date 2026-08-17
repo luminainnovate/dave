@@ -13,6 +13,8 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from typing import Optional
 
 import mover
+import repo_tools
+import tracer
 
 
 # Configure logging
@@ -56,6 +58,13 @@ COMFYUI_URL = "http://localhost:8188"
 EXPERT_CTX = 131072   # Context for the expert model (128k)
 DISTILL_CTX = 131072  # Context for the distillation engine (128k)
 CLINE_CTX = 131072    # Context for the Cline agent (128k)
+
+# Tool-calling budget for one turn. Each hop is a full Expert inference over the
+# whole conversation, so this is the main lever on how long a tool-using turn
+# takes. Write turns need more: read -> edit -> verify is three hops for a single
+# file, before any correction.
+AGENT_MAX_HOPS = 8        # read-only turns
+AGENT_MAX_HOPS_WRITE = 12  # write-enabled turns
 
 # --- STATE MANAGEMENT ---
 gpu_lock = asyncio.Lock()
@@ -658,6 +667,7 @@ async def analyze_request(messages: list) -> dict:
         }
         url = f"{_get_base_url(router_config)}/v1/chat/completions"
 
+    started = time.monotonic()
     try:
         await _provider_load(router_config)
         resp = await http_client.post(url, json=payload, timeout=10.0)
@@ -667,6 +677,7 @@ async def analyze_request(messages: list) -> dict:
                 content = resp_data.get("message", {}).get("content", "{}")
             else:
                 content = resp_data.get("choices", [{}])[0].get("message", {}).get("content", "{}")
+            tracer.triage(context_text[:1000], content.strip(), time.monotonic() - started)
             data = json.loads(content)
             return {
                 "complexity": int(data.get("complexity", 1)),
@@ -676,6 +687,7 @@ async def analyze_request(messages: list) -> dict:
             }
     except Exception as e:
         logger.warning(f"Router network/parsing error: {e}")
+        tracer.error(f"triage failed ({e}) — defaulting to complexity 1")
 
     return {"complexity": 1, "followups": False, "requires_tool": False, "is_coding": False}
 
@@ -685,18 +697,26 @@ async def analyze_request(messages: list) -> dict:
 
 async def stream_proxy(url: str, body: dict, lock: asyncio.Lock,
                        is_native: bool = False, backend_is_ollama: bool = True,
-                       request_headers: dict = {}):
+                       request_headers: dict = {}, turn_id: str = ""):
     """
     Proxies a streaming response from the backend AI model while managing VRAM locks.
     Handles format translation between Ollama and OpenAI-compatible backends/clients.
-    
+
     Args:
         is_native: True if the CLIENT expects Ollama-native format.
         backend_is_ollama: True if the BACKEND sends Ollama-native format.
         request_headers: Headers from the initial request (for X-No-Scrub).
+        turn_id: Trace id captured in the request handler, rebound here because the
+                 generator body may run outside the handler's context.
     """
     lock_released = False
     turn_throughput = 0  # Character counter to detect infinite reasoning loops
+
+    tracer.bind_turn(turn_id)
+    stream_started = time.monotonic()
+    traced_text = []      # Raw model output, captured pre-scrub
+    traced_thinking = []
+    first_token_at = None
 
     def _release():
         nonlocal lock_released
@@ -777,6 +797,13 @@ async def stream_proxy(url: str, body: dict, lock: asyncio.Lock,
                     try:
                         data = json.loads(line)
                         data["model"] = "Bob"
+                        _m = data.get("message", {})
+                        if _m.get("content"):
+                            first_token_at = first_token_at or time.monotonic()
+                            traced_text.append(_m["content"])
+                        if _m.get("thinking"):
+                            first_token_at = first_token_at or time.monotonic()
+                            traced_thinking.append(_m["thinking"])
                         yield f"{json.dumps(data)}\n".encode('utf-8')
                     except Exception:
                         yield f"{line}\n".encode('utf-8')
@@ -807,7 +834,16 @@ async def stream_proxy(url: str, body: dict, lock: asyncio.Lock,
                         if choices:
                             delta = choices[0].get("delta", {})
                             content = delta.get("content", "")
-                            
+
+                            # Trace capture happens before the scrubber runs, so the
+                            # transcript shows what the model actually emitted.
+                            if content:
+                                first_token_at = first_token_at or time.monotonic()
+                                traced_text.append(content)
+                            for _k in ("reasoning_content", "thinking", "thought"):
+                                if delta.get(_k):
+                                    traced_thinking.append(str(delta[_k]))
+
                             # Safety Monitor: 100k capacity for complex systems engineering.
                             # We track this REGARDLESS of scrubbing status to protect Distillation passes.
                             if content and not in_tool_tag:
@@ -954,9 +990,10 @@ async def stream_proxy(url: str, body: dict, lock: asyncio.Lock,
                     yield b"data: [DONE]\n\n"
 
     except (GeneratorExit, asyncio.CancelledError):
-        pass
+        tracer.note("STREAM CANCELLED by client")
     except Exception as e:
         logger.error(f"Stream proxy error: {e}")
+        tracer.error(f"stream proxy: {e}")
         if is_native:
             yield f'{json.dumps({"model": "Bob", "message": {"role": "assistant", "content": f"⚠️ Error: {str(e)}"}, "done": True})}\n'.encode('utf-8')
         else:
@@ -966,6 +1003,12 @@ async def stream_proxy(url: str, body: dict, lock: asyncio.Lock,
             yield b"data: [DONE]\n\n"
     finally:
         _release()
+        tracer.stream_done(
+            "".join(traced_text),
+            "".join(traced_thinking),
+            first_token=(first_token_at - stream_started) if first_token_at else None,
+            total=time.monotonic() - stream_started,
+        )
 
 # =============================================================================
 # API ENDPOINTS
@@ -1143,7 +1186,8 @@ async def proxy_ollama(request: Request):
                 asyncio.create_task(free_comfyui())
 
         # Rule E: Suppress background tasks following maintenance commands
-        maintenance_commands = ["!status", "!stop", "!move", "!build", "!lock", "!unlock"]
+        maintenance_commands = ["!status", "!stop", "!move", "!build", "!lock", "!unlock",
+                                "!write", "!readonly", "!undo", "!diff", "!pr"]
         is_maintenance_followup = False
         if is_background_task and len(messages) >= 3:
             prev_user_msg = messages[-3].get("content", "").lower() if messages[-3].get("role") == "user" else ""
@@ -1161,8 +1205,21 @@ async def proxy_ollama(request: Request):
 
     # =============================================================================
 
+    # Open the trace transcript for this turn. Everything the orchestrator says
+    # to a model from here on is recorded in trace.log (see tracer.py).
+    _last = messages[-1] if messages else {}
+    tracer.start_turn(
+        prompt=str(_last.get("content", "")),
+        conv_id=mover.get_conversation_id(messages),
+        streaming=is_streaming,
+        native=is_native,
+        kind="background ping" if is_background_task else "chat",
+        role=_last.get("role", "user"),
+    )
+
     # 2. Fast Exit for Background Traffic
     if not is_streaming and (time.time() < expert_warm_until or vram_locked):
+        tracer.note("SILENCED: expert warm / VRAM locked — returning 'Analyzing...'")
         return _silent_response(is_native, "Analyzing...")
 
     # 3. Early Command Handling (Before Lock)
@@ -1219,6 +1276,47 @@ async def proxy_ollama(request: Request):
             logger.info("Command: Clone triggered.")
             clone_msg = await asyncio.to_thread(_handle_clone_command, messages)
             return _command_response(clone_msg, is_streaming, is_native)
+        elif "!write" in prompt_lower or "!readonly" in prompt_lower:
+            enable = "!write" in prompt_lower
+            conv_id = mover.get_conversation_id(messages)
+            if enable and not _get_bound_project_dir(messages):
+                return _command_response(
+                    "⚠️ **No project bound.** Run `!clone <repo-url>` first, or bind an existing "
+                    "checkout by symlinking it into `conversations/`.",
+                    is_streaming, is_native
+                )
+            logger.info(f"Command: Write mode {'enabled' if enable else 'disabled'}.")
+            return _command_response(repo_tools.set_write_mode(conv_id, enable), is_streaming, is_native)
+        elif "!undo" in prompt_lower:
+            project_dir = _get_bound_project_dir(messages)
+            if not project_dir:
+                return _command_response("⚠️ **No project bound.**", is_streaming, is_native)
+            logger.info("Command: Undo session changes.")
+            undo_msg = await asyncio.to_thread(
+                repo_tools.undo_changes, project_dir, mover.get_conversation_id(messages)
+            )
+            return _command_response(undo_msg, is_streaming, is_native)
+        elif "!diff" in prompt_lower:
+            project_dir = _get_bound_project_dir(messages)
+            if not project_dir:
+                return _command_response("⚠️ **No project bound.**", is_streaming, is_native)
+            logger.info("Command: Diff session changes.")
+            diff_msg = await asyncio.to_thread(
+                repo_tools.diff_changes, project_dir, mover.get_conversation_id(messages)
+            )
+            return _command_response(diff_msg, is_streaming, is_native)
+        elif prompt_lower.startswith("!pr"):
+            project_dir = _get_bound_project_dir(messages)
+            if not project_dir:
+                return _command_response("⚠️ **No project bound.**", is_streaming, is_native)
+            # Title is the remainder of the line, preserving the user's casing.
+            title = messages[-1].get("content", "").strip()[len("!pr"):].strip()
+            logger.info("Command: Pull request requested.")
+            pr_msg = await asyncio.to_thread(
+                repo_tools.create_pull_request, project_dir,
+                mover.get_conversation_id(messages), title
+            )
+            return _command_response(pr_msg, is_streaming, is_native)
         elif "!stop" in prompt_lower:
             logger.info("Command: Stop pipeline triggered.")
             stop_msg = _stop_build_pipeline()
@@ -1262,6 +1360,7 @@ async def proxy_ollama(request: Request):
             if not vram_locked:
                 expert_warm_until = current_time + 600
             logger.info(f"Router-forwarded request: Skipping triage, routing directly to Expert model (cold={is_cold_expert}).")
+            tracer.route(target_model, "pre-triaged by Pi router", f"cold={is_cold_expert}")
 
         # --- Context-Aware Triage Override ---
         elif _get_bound_project_dir(messages) or "@" in prompt_lower:
@@ -1273,30 +1372,52 @@ async def proxy_ollama(request: Request):
                 expert_warm_until = current_time + 600
             expert_mode = "coding"
             logger.info(f"Project context detected ({'bound' if project_dir else '@mention'}): Routing to Expert model.")
+            tracer.route(target_model, f"project context ({'bound' if project_dir else '@mention'})",
+                         f"cold={is_cold_expert}, mode=coding")
+
+            # Deciding this is project work outranks the keyword heuristics that
+            # set is_background_task upstream, so the flag must not survive the
+            # decision. Those heuristics match "describe"/"summarize"/"analyze"
+            # as substrings in any message under 400 chars, which is an ordinary
+            # question about the project as often as it is an Open WebUI title or
+            # description ping. Left set, the flag reaches the payload block below
+            # and clamps num_ctx to 2048 on a turn already routed to the Expert -
+            # truncating the tool schemas and history out of a 128k prompt, so the
+            # model answers with no context and invents unregistered tool names.
+            if is_background_task:
+                is_background_task = False
+                logger.info("Reclassified background ping as project chat: keeping full Expert context.")
+                tracer.note("RECLASSIFIED: background ping → project chat (full Expert context retained)")
         elif is_background_task or is_image_query or is_search_query or is_search_tool or has_search_history:
             target_model = ROUTER_MODEL
             if is_image_query:
                 logger.info("Image generation intent detected: Routing to Router model.")
+                tracer.route(target_model, "image generation intent")
             elif is_search_query or is_search_tool or has_search_history:
                 source = "intent" if is_search_query else "result" if is_search_tool else "history"
                 logger.info(f"Search {source} detected: Routing to Router model.")
+                tracer.route(target_model, f"search {source}")
             else:
                 logger.info("Routing background task to Router model.")
-        elif any(kw in prompt_lower for kw in ["!bob", "hey bob"]):
+                tracer.route(target_model, "background task")
+        elif any(kw in prompt_lower for kw in ["!dave", "hey dave"]):
             target_model = ROUTER_MODEL
             expert_warm_until = 0
             logger.info("Direct request for Router model.")
+            tracer.route(target_model, "explicitly requested")
         elif any(kw in prompt_lower for kw in ["!expert", "hey expert", "!code", "!general"]):
             target_model = EXPERT_MODEL
             keep_alive = "10m"
             expert_warm_until = current_time + 600
             is_cold_expert = not is_expert_warm
             logger.info(f"Direct request for Expert model ({expert_mode}).")
+            tracer.route(target_model, "explicitly requested", f"mode={expert_mode}")
         elif is_expert_warm or vram_locked:
             target_model = EXPERT_MODEL
             keep_alive = "10m" if not vram_locked else "-1"
             if not vram_locked:
                 expert_warm_until = current_time + 600
+            tracer.route(target_model, "already warm" if is_expert_warm else "VRAM locked")
         else:
             # Complexity Triage
             await sweep_vram_for_expert()
@@ -1310,7 +1431,11 @@ async def proxy_ollama(request: Request):
                     expert_warm_until = current_time + 300
                 is_cold_expert = True
                 expert_mode = "coding" if analysis.get("is_coding") else "general"
+                logger.info(f"Triage: Escalating to Expert model ({expert_mode}).")
+                tracer.route(target_model, "triage escalated", f"mode={expert_mode}")
+            else:
                 logger.info("Triage: Router model sufficient.")
+                tracer.route(target_model, "triage: router sufficient")
 
         # --- Agent Detection ---
         # Detect if this is an automated agent (Cline or Distillation pass)
@@ -1324,6 +1449,10 @@ async def proxy_ollama(request: Request):
 
         # --- Context Binding & Tool Injection ---
         project_dir = _get_bound_project_dir(messages)
+        # Resolved before pruning: _prune_messages can drop the first user
+        # message, which is what the conversation id is derived from.
+        conv_id = mover.get_conversation_id(messages)
+        write_enabled = bool(project_dir) and repo_tools.is_write_enabled(conv_id)
         project_context = ""
         
         # Only inject if it's a bound project AND it's a direct user interaction (not an agent)
@@ -1342,6 +1471,8 @@ async def proxy_ollama(request: Request):
             if mentions:
                 project_context += mentions
             project_context += "\n</PROJECT_CONTEXT>\n"
+            if write_enabled:
+                project_context += repo_tools.WRITE_MODE_GUIDANCE
             
             # Inject into the system message (or first available message)
             injected = False
@@ -1352,6 +1483,10 @@ async def proxy_ollama(request: Request):
                     break
             if not injected:
                 messages.insert(0, {"role": "system", "content": f"Project Awareness Active.{project_context}"})
+
+            tracer.system_prompt(project_context, source=project_dir)
+            if write_enabled:
+                tracer.note("WRITE MODE enabled for this conversation")
 
         # Define native tools
         tools = [
@@ -1397,6 +1532,10 @@ async def proxy_ollama(request: Request):
             }
         ] if project_dir and target_model == EXPERT_MODEL and not is_agent_request else None
 
+        # Write tools are additionally gated on the user having run !write.
+        if tools and write_enabled:
+            tools.extend(repo_tools.write_tool_schemas())
+
         if target_model == EXPERT_MODEL and is_cold_expert:
             await sweep_vram_for_expert()
 
@@ -1437,6 +1576,11 @@ async def proxy_ollama(request: Request):
         if tools:
             body["tools"] = tools
         logger.info(f"Executing {target_model} (ctx: {options['num_ctx']}, warm: {not is_cold_expert}, tools: {bool(tools)}, provider: {target_config.get('provider', 'ollama')})")
+        tracer.note(
+            f"DISPATCH {target_model} · ctx {options['num_ctx']} · "
+            f"{'warm' if not is_cold_expert else 'cold load'} · "
+            f"{len(tools) if tools else 0} tools · {target_config.get('provider', 'ollama')}"
+        )
 
         # --- Compute Target URL ---
         if target_is_ollama:
@@ -1451,7 +1595,11 @@ async def proxy_ollama(request: Request):
             # Shift to the Agentic Loop handler
             # This will release the lock internally when finished
             try:
-                return await _handle_agentic_request(dispatch_body, project_dir, target_url, is_native, gpu_lock, target_is_ollama)
+                return await _handle_agentic_request(
+                    dispatch_body, project_dir, target_url, is_native, gpu_lock,
+                    target_is_ollama, conv_id=conv_id,
+                    max_hops=AGENT_MAX_HOPS_WRITE if write_enabled else AGENT_MAX_HOPS,
+                )
             finally:
                 if lock_held:
                     gpu_lock.release()
@@ -1483,6 +1631,10 @@ async def proxy_ollama(request: Request):
                     data["model"] = "Bob"
                     if "id" in data:
                         data["id"] = "chatcmpl-Bob"
+
+                _msg = (data.get("message", {}) if is_native
+                        else data.get("choices", [{}])[0].get("message", {}))
+                tracer.final(_msg.get("content", ""), label="REPLY (one-shot)")
                 return JSONResponse(content=data)
             finally:
                 if lock_held:
@@ -1493,7 +1645,8 @@ async def proxy_ollama(request: Request):
         return StreamingResponse(
             stream_proxy(target_url, dispatch_body, gpu_lock,
                          is_native=is_native, backend_is_ollama=target_is_ollama,
-                         request_headers=dict(request.headers)),
+                         request_headers=dict(request.headers),
+                         turn_id=tracer.current_turn()),
             media_type="application/x-ndjson" if is_native else "text/event-stream"
         )
     except Exception as e:
@@ -1516,6 +1669,7 @@ def _silent_response(is_native: bool, text: str = ""):
 
 def _command_response(text: str, is_streaming: bool = False, is_native: bool = False):
     """Returns a JSON response (streaming or one-shot) for internal orchestrator commands."""
+    tracer.final(text, label="COMMAND (handled by the orchestrator, no model call)")
     if not is_streaming:
         if is_native:
             return JSONResponse(content={"model": "Bob", "message": {"role": "assistant", "content": text}, "done": True})
@@ -1543,8 +1697,14 @@ def _command_response(text: str, is_streaming: bool = False, is_native: bool = F
 PATH_TOOLS = ("orchestrator_read_file", "orchestrator_expand_dir")
 
 
-def _execute_tool(name: str, args: dict, project_dir: str) -> str:
+def _execute_tool(name: str, args: dict, project_dir: str, conv_id: str = "") -> str:
     """Executes a native orchestrator tool."""
+    # Write tools live in repo_tools and are self-gating; execute() returns None
+    # for anything it does not own, so the read-only handlers below still run.
+    write_result = repo_tools.execute(name, args, project_dir, conv_id)
+    if write_result is not None:
+        return write_result
+
     # Only the path-based tools resolve a `path` argument. orchestrator_build_logs
     # is declared with no parameters, so gating every tool on `path` made it
     # permanently unreachable and burned hops on retries.
@@ -1563,6 +1723,8 @@ def _execute_tool(name: str, args: dict, project_dir: str) -> str:
                 return f"Error: File `{safe_rel_path}` not found."
             with open(abs_path, "r", encoding="utf-8") as f:
                 content = f.read()
+                # Satisfies the read-before-write rule enforced by repo_tools.
+                repo_tools.mark_read(conv_id, abs_path)
                 return content
         except Exception as e:
             return f"Error reading file: {e}"
@@ -1636,12 +1798,13 @@ def _finalize_agentic_response(data: dict, backend_is_ollama: bool, is_native: b
 
 
 async def _handle_agentic_request(body: dict, project_dir: str, target_url: str,
-                                  is_native: bool, lock: asyncio.Lock, backend_is_ollama: bool = True):
+                                  is_native: bool, lock: asyncio.Lock, backend_is_ollama: bool = True,
+                                  conv_id: str = "", max_hops: int = AGENT_MAX_HOPS):
     """
     Handles a tool-enabled request by recursively executing tools and re-running the LLM.
     Returns the final response (one-shot or stream).
     """
-    MAX_HOPS = 4
+    MAX_HOPS = max_hops
     current_hops = 0
     
     original_messages = body.get("messages", [])
@@ -1651,27 +1814,42 @@ async def _handle_agentic_request(body: dict, project_dir: str, target_url: str,
     while current_hops < MAX_HOPS:
         current_hops += 1
         logger.info(f"Agentic Loop: Hop {current_hops}/{MAX_HOPS}")
-        
+        tracer.hop_start(current_hops, MAX_HOPS, body.get("messages", []),
+                         body.get("tools"), body.get("model", ""))
+
         # We always do a NON-STREAMING call for tools
         temp_body = body.copy()
         temp_body["stream"] = False
-        
+
+        hop_started = time.monotonic()
         try:
             resp = await http_client.post(target_url, json=temp_body, timeout=600.0)
             if resp.status_code != 200:
+                tracer.error(f"hop {current_hops} returned HTTP {resp.status_code}")
                 return JSONResponse(status_code=resp.status_code, content={"error": "Agentic inference failed."})
-                
+
             data = resp.json()
             message = data.get("message", {}) if response_is_native else data.get("choices", [{}])[0].get("message", {})
-            
+
             tool_calls = message.get("tool_calls", [])
             if not tool_calls:
                 # No more tools, this is the final answer
+                tracer.final(message.get("content", ""),
+                             thinking=message.get("thinking"),
+                             elapsed=time.monotonic() - hop_started,
+                             label=f"FINAL (answered on hop {current_hops})")
                 return JSONResponse(content=_finalize_agentic_response(data, backend_is_ollama, is_native))
-            
+
+            tracer.model_reply(
+                content=message.get("content", ""),
+                thinking=message.get("thinking"),
+                tool_calls=tool_calls,
+                elapsed=time.monotonic() - hop_started,
+            )
+
             # Execute tools and append results
             original_messages.append(message)
-            
+
             for tc in tool_calls:
                 func = tc.get("function", {})
                 name = func.get("name")
@@ -1681,10 +1859,13 @@ async def _handle_agentic_request(body: dict, project_dir: str, target_url: str,
                         args = json.loads(args)
                     except Exception:
                         args = {}
-                
+
                 logger.info(f"Executing Tool: {name}({args})")
-                result = _execute_tool(name, args, project_dir)
-                
+                tracer.tool_call(name, args)
+                tool_started = time.monotonic()
+                result = await asyncio.to_thread(_execute_tool, name, args, project_dir, conv_id)
+                tracer.tool_result(name, result, time.monotonic() - tool_started)
+
                 tool_msg = {
                     "role": "tool",
                     "name": name,
@@ -1700,6 +1881,7 @@ async def _handle_agentic_request(body: dict, project_dir: str, target_url: str,
             
         except Exception as e:
             logger.error(f"Agentic Loop Error: {e}")
+            tracer.error(f"agentic loop broke on hop {current_hops}: {e}")
             break
 
     # The hop budget is spent (or an error broke the loop). Previously this fell
@@ -1707,6 +1889,7 @@ async def _handle_agentic_request(body: dict, project_dir: str, target_url: str,
     # failing the turn even though nothing had gone wrong. Instead, make one
     # final tool-free call so the model answers with what it already gathered.
     logger.info("Agentic Loop: Budget spent — requesting final answer without tools.")
+    tracer.note("HOP BUDGET SPENT — asking for a final answer with tools removed")
 
     final_body = body.copy()
     final_body["stream"] = False
@@ -1724,13 +1907,21 @@ async def _handle_agentic_request(body: dict, project_dir: str, target_url: str,
         )
     }]
 
+    final_started = time.monotonic()
     try:
         resp = await http_client.post(target_url, json=final_body, timeout=600.0)
         if resp.status_code == 200:
-            return JSONResponse(content=_finalize_agentic_response(resp.json(), backend_is_ollama, is_native))
+            payload = resp.json()
+            msg = (payload.get("message", {}) if response_is_native
+                   else payload.get("choices", [{}])[0].get("message", {}))
+            tracer.final(msg.get("content", ""), elapsed=time.monotonic() - final_started,
+                         label="FINAL (forced, budget spent)")
+            return JSONResponse(content=_finalize_agentic_response(payload, backend_is_ollama, is_native))
         logger.error(f"Agentic Loop: Final answer call returned {resp.status_code}.")
+        tracer.error(f"forced final answer returned HTTP {resp.status_code}")
     except Exception as e:
         logger.error(f"Agentic Loop: Final answer call failed: {e}")
+        tracer.error(f"forced final answer failed: {e}")
 
     return JSONResponse(status_code=500, content={"error": "Agentic loop exceeded max hops or failed."})
 
@@ -2208,7 +2399,9 @@ async def _trigger_build_pipeline_safe(
         return await _trigger_build_pipeline(messages, extra_env=extra_env, mode_label=mode_label)
 
 
-ARCHITECT_REVIEW_TIMEOUT = 180
+# Observed architect passes run 5-6 min. Kept under the router's 600s forward
+# timeout (router.py) so a slow pass reports back in chat instead of 502-ing.
+ARCHITECT_REVIEW_TIMEOUT = 540
 
 
 def _architect_review_path(messages: list) -> Optional[str]:

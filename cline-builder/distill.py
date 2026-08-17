@@ -34,8 +34,13 @@ CHARS_PER_TOKEN = 4
 RESERVED_TOKENS = 2048
 CHUNK_OVERLAP_TOKENS = 200
 
-# Keep the chunk size small to prevent CPU ingestion stalls
-TARGET_CHUNK_SIZE = 2048
+# Chunk size sets the extraction bill: the payload is split into ceil(len/chunk)
+# sequential LLM calls, so it is the dominant term in how long a pass takes. 2048
+# was sized for CPU ingestion against a 16k window; on a real project it forced
+# ~20 calls and made the architect pass run 5-6 minutes. Ingestion is no longer
+# the binding constraint, and chunk_limit is still clamped to what the configured
+# window can actually hold, so a chunk never outgrows the context.
+TARGET_CHUNK_SIZE = 8192
 
 # The tagged blocks the payload is assembled from. Chunking prefers these as split
 # points and labels every chunk with the ones it covers, so the extractor knows
@@ -57,7 +62,13 @@ REQUEST_TAGS = ("NEW_REQUEST", "FINAL_BUILD_COMMAND")
 # Output caps. Without these the server generates against the full context window,
 # so a chunk-extraction prompt that falls into a repetition loop runs for minutes
 # and gets guillotined mid-sentence by the stability budget.
-EXTRACTION_MAX_TOKENS = 1024   # bullet-point extraction from one chunk
+#
+# The extraction cap has to scale with TARGET_CHUNK_SIZE or a larger chunk just
+# loses whatever falls past the record limit - trading call count for silent fact
+# loss. Both are derived from the chunk at the density the original 2048/20/1024
+# triple was tuned to: ~100 input tokens per record, ~50 output tokens to write it.
+EXTRACTION_RECORD_CAP = TARGET_CHUNK_SIZE // 100   # max records one chunk may emit
+EXTRACTION_MAX_TOKENS = EXTRACTION_RECORD_CAP * 50 # bullet-point extraction from one chunk
 ANSWER_MAX_TOKENS = 8192       # merge / single-pass, where the templated answer lives
 
 # Stability Protocol: how long a stream may go with NO new token before we give up.
@@ -168,6 +179,19 @@ def extract_request(text: str) -> str:
         if match and match.group(1).strip():
             return match.group(1).strip()
     return ""
+
+
+def extract_mode(text: str) -> str:
+    """
+    Pull the build MODE out of an assembled payload, or "" if it has none.
+
+    The architect hangs R7 and R8 off MODE and the engineer gates scaffolding on
+    it, but it is stated once in the payload head and no extraction record type
+    carries it - so, like the request, the map-reduce has to forward it by hand.
+    Empty is normal for callers passing something other than a full payload.
+    """
+    match = re.search(r"<MODE>(.*?)</MODE>", text, re.DOTALL)
+    return match.group(1).strip() if match else ""
 
 
 def _section_boundaries(text: str) -> list[tuple[int, str]]:
@@ -486,7 +510,7 @@ def call_llm(client: httpx.Client, model_config, system_prompt: str, user_conten
         "infer, judge or design.\n"
         "\n"
         "Output newline-separated records only — no preamble, headings, fences or blank lines. "
-        "Max 20, in order of appearance, no repeats. Every line:\n"
+        f"Max {EXTRACTION_RECORD_CAP}, in order of appearance, no repeats. Every line:\n"
         "  TYPE | <path>:<line> | <verbatim payload> | <note, max 10 words>\n"
         "Use `-` when no line number. Omit a type entirely if absent — never write 'none'.\n"
         "\n"
@@ -528,6 +552,10 @@ def call_llm(client: httpx.Client, model_config, system_prompt: str, user_conten
     if not new_request:
         print("  ⚠ No NEW_REQUEST/FINAL_BUILD_COMMAND found in the payload; "
               "chunks will be extracted without one.", flush=True)
+
+    # Held for the merge pass below, which sees extracted records rather than the
+    # payload and so cannot recover either pivot on its own.
+    mode = extract_mode(user_content)
 
     for i, (chunk, section_label) in enumerate(chunks):
         part_label = f"Part {i + 1}/{len(chunks)}"
@@ -581,10 +609,34 @@ def call_llm(client: httpx.Client, model_config, system_prompt: str, user_conten
         print(f"    ↳ Consolidated {len(buckets)} buckets into {len(consolidated)} summaries.", flush=True)
     
     # [FIX] Now we apply your STRICT system prompt to the merged bullets
-    merge_prompt = (
+    #
+    # MODE and NEW_REQUEST have to be re-stated here. Neither survives extraction
+    # by design: the chunk loop shows the request to every part but forbids
+    # emitting records from it, and MODE is never shown to the extractor at all.
+    # So the records describe the codebase and say nothing about what to do with
+    # it, and a merge pass given only records has no goal to design against -
+    # architect.md R10 then fires and the pass returns "# BLOCKED" instead of a
+    # design. Mirrors the framing the chunk loop uses so the two agree.
+    merge_prompt = ""
+    if mode:
+        merge_prompt += f"### MODE\n{mode}\n\n---\n\n"
+    if new_request:
+        merge_prompt += (
+            f"### NEW_REQUEST\n"
+            f"The change being planned. The extracted facts below describe the "
+            f"codebase it lands in.\n\n"
+            f"{new_request}\n\n---\n\n"
+        )
+
+    pivots = [name for name, value in (("MODE", mode), ("NEW_REQUEST", new_request)) if value]
+    sources = "these details"
+    if pivots:
+        sources += f" and the {' and '.join(pivots)} above"
+
+    merge_prompt += (
         "You previously extracted technical details from a larger conversation in parts. "
         "Below are the raw extracted bullet points.\n\n"
-        "Using ONLY these details (and the PREVIOUS ANALYSES if provided), write your final response. "
+        f"Using ONLY {sources}, write your final response. "
         "You MUST strictly adhere to your system prompt instructions and template formatting.\n\n"
     )
     for i, part in enumerate(partial_results):
