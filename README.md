@@ -16,6 +16,53 @@ Agent DAVE is a fully autonomous software factory starting from a conversation, 
 
 **br.ai.n** is an **Agentic Local AI Orchestrator** powered by **Agent DAVE**, a unified AI persona running on your local hardware. Agent DAVE manages a tiered orchestration system on a single NVIDIA GPU (24GB+ VRAM), providing instant responses for simple tasks while dynamically routing complex requests (Coding, Vision, Image Generation) to expert models.
 
+## Chat Commands:
+
+### 🧠 VRAM & Model Control
+
+| Command | Effect | Notes |
+|---|---|---|
+| `!lock` | Pins the Expert in VRAM indefinitely (`keep_alive: -1`). | Returns immediately. Persists until `!unlock`. |
+| `!unlock` | Releases the lock, unloads Expert + Router, frees ComfyUI. | Returns immediately. |
+| `!code` | Switches the Expert to Coding Mode parameters (temp 0.6, repeat_penalty 1.15). | **Falls through** — the rest of your message is still answered. Also forces routing to the Expert. |
+| `!general` | Switches the Expert to General Mode parameters (temp 1.0, presence_penalty 1.5). | **Falls through**, same as above. |
+| `!dave` / `hey dave` | Forces the turn onto the small Router model and clears the Expert warm timer. | The "stay fast, stay local" escape hatch. Note that `hey dave` fires on any message containing that phrase. |
+| `!expert` / `hey expert` | Forces the turn onto the Expert model, warm for 10 minutes. | |
+
+### 🏭 Project Binding & Build Pipeline
+
+| Command | Effect | Notes |
+|---|---|---|
+| `!move` | Scans the conversation for code blocks and file trees and reconstructs them into `conversations/<name>_<conv_id>/`. | Binds the project to the conversation. Skips extraction if `.clinerules` already exists, to protect manual edits. |
+| `!clone <url>` | Clones a Git repo into the conversation's workspace and binds it. Add `--kb <url>` to attach a second repo as `.knowledge_base/`. | **Must be at the start of the message.** Re-running on a bound project just reports the existing binding. |
+| `!build` | Kicks off the full 4-pass autonomous pipeline (Architect → Engineer → Test → Safety) plus implementation, in the `cline-builder` container. | Extra text in the same message steers it, e.g. *"Lets !build, we must add authentication."* |
+| `!architect` | Runs **Pass 1 only** and stops at a review gate. | The safe way in — no code is written. |
+| `!review` | Re-displays the architecture document from the last `!architect`. | Read-only. |
+| `!approve` | Accepts the reviewed architecture and resumes the remaining passes plus implementation. | Requires a prior `!architect`, otherwise it refuses. |
+| `!status` | Reports the status of active and recent build containers. | |
+| `!logs` | Fetches the last 200 lines from the active `cline-builder` container. | Also exposed to the Expert as a tool. |
+| `!stop` | Force-stops all running build pipelines and clears VRAM. | |
+
+### ✏️ Repository Editing & Pull Requests
+
+| Command | Effect | Notes |
+|---|---|---|
+| `!write` | Enables write mode for this conversation, granting the Expert edit / write / delete / list-changes tools. | Requires a bound project. Off by default and resets to off when the orchestrator restarts. |
+| `!readonly` | Revokes write mode. | Changes already on disk are left untouched. |
+| `!diff` | Shows the full diff of everything the Expert has changed in this conversation. | Review this before `!pr`. |
+| `!undo` | Restores every touched file to its exact pre-session bytes. | Untracked files restore correctly; your pre-existing uncommitted work is unaffected. |
+| `!pr <title>` | Commits the session's changes to `brain/<conv_id>`, pushes, and opens a pull request against the bound repo's `origin`. | **Must be at the start of the message.** Only files this conversation touched are staged. |
+
+### ⚙️ How Command Matching Works
+
+| Rule | Detail |
+|---|---|
+| **Substring match, first wins** | Every command except `!clone` and `!pr` matches anywhere in the message, in a single `if/elif` chain. *"Should I run !build or !status?"* triggers `!build`. |
+| **Order is fixed** | `!lock` → `!unlock` → `!code` → `!general` → `!move` → `!architect` → `!approve` → `!review` → `!build` → `!clone` → `!write` / `!readonly` → `!undo` → `!diff` → `!pr` → `!stop` → `!status` → `!logs`. Because `!code` sits third, *"!code let's !build this"* runs `!code` only. |
+| **Two don't return** | `!code` and `!general` set a mode and let your message continue to inference. Every other command replies and stops the turn. |
+| **Position-sensitive pair** | `!clone` and `!pr` use prefix matching, so they must open the message. The rest can appear anywhere. |
+| **Background turns are exempt** | Title/tag/summary pings from Open WebUI never trigger commands. |
+
 ## 🚀 Key Features
 
 -   **Autonomous Build Pipeline (`!build`):** Trigger a multi-agent distillation and implementation process for any project extracted from the conversation.
@@ -91,6 +138,25 @@ Agent DAVE isn't just a chatbot; Agent DAVE is a fully autonomous software facto
 
 > [!TIP]
 > **Review-then-build workflow:** `!architect` → read the output → `!approve`. This is usually preferable to a bare `!build`, which commits to all four passes and implementation in one shot.
+
+---
+
+### ✏️ Repository Editing & Pull Requests
+
+Once a project is bound to a conversation (via `!clone`, or by symlinking an existing checkout into `conversations/`), the Expert can read it. Run `!write` and it can change it too.
+
+-   `!write`: Enable write mode for this conversation. Grants the Expert `orchestrator_edit_file`, `orchestrator_write_file`, `orchestrator_delete_file` and `orchestrator_list_changes`.
+-   `!readonly`: Revoke write mode. Existing changes are left on disk.
+-   `!diff`: Show the full diff of everything the Expert has changed in this conversation.
+-   `!undo`: Revert every file the Expert touched back to its exact pre-session bytes.
+-   `!pr <title>`: Commit this conversation's changes to a `brain/<conversation-id>` branch and open a pull request against the bound repo's own `origin`.
+
+**How it stays safe.** Write mode is off by default, so ordinary discussion turns cannot modify anything. The Expert must read a file before it can edit or delete it — it cannot act on files it has only seen in the symbol skeleton. Edits are anchor-based and must match exactly once, so a wrong anchor fails loudly instead of corrupting code. Paths are realpath-resolved and containment-checked, which blocks both `../` traversal and symlinks inside the project pointing out of it. `.git/`, `.env*`, keys and certificates are never writable.
+
+**How your existing work stays safe.** Like Claude Code, the Expert edits files in place rather than branching first — so a repo that is already dirty stays usable. The first time any file is touched, its exact bytes are snapshotted outside the repo, which is what `!undo` restores from. Because those snapshots are byte copies rather than a git stash, untracked files are restored correctly instead of being deleted. Branching happens only at `!pr`, and only the files this conversation actually changed are staged — anything else you had uncommitted is deliberately left alone.
+
+> [!IMPORTANT]
+> The Expert has no tool for committing or opening pull requests. That is deliberate: raising a PR is an outward-facing action against a real remote, so it happens only when *you* run `!pr`. Review with `!diff` first.
 
 ---
 
@@ -577,10 +643,15 @@ While in chat, use these commands to override the orchestrator:
 - `!review`: Re-displays the architecture document from the last `!architect`.
 - `!approve`: Approves the reviewed architecture and resumes the full pipeline.
 - `!clone <url>`: Clones a Git repo into the conversation workspace. Optional `--kb <url>` attaches a knowledge-base repo.
+- `!write`: Enables repository write mode, letting the Expert create, edit and delete files in the bound project.
+- `!readonly`: Revokes write mode.
+- `!diff`: Shows the full diff of this conversation's changes.
+- `!undo`: Reverts every file the Expert touched to its pre-session state.
+- `!pr <title>`: Commits this conversation's changes to a `brain/<conversation-id>` branch and opens a pull request on the bound repo's `origin`.
 - `!status`: Checks the status of active or recent build containers.
 - `!logs`: Fetches the latest terminal logs from the active background build pipeline.
 - `!stop`: Force-stops all running build pipelines.
-- `!Agent DAVE` / `hey Agent DAVE`: Force the current turn to use the Fast Orchestrator.
+- `!dave` / `hey dave`: Force the current turn to use the Fast Orchestrator.
 - `!expert` / `hey expert`: Force the current turn to use the Expert Model.
 
 

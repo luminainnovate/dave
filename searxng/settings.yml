@@ -6,4 +6,11 @@ server:
 search:
   formats:
     - json
-
+engines:
+  # Wikidata's output is an infobox, and the only consumer of this instance
+  # (open-webui RAG web search) reads the "results" array only -- infoboxes are
+  # discarded. Its init also does a SPARQL call to query.wikidata.org that now
+  # 403s on Wikimedia's user-agent policy. Nothing here needs it, so skip it.
+  # NB: "inactive" (not "disabled") -- disabled engines still run their init.
+  - name: wikidata
+    inactive: true

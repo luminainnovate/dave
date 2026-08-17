@@ -37,6 +37,7 @@ searxng/
 
 # Logs
 *.log
+*.log.1
 gatekeeper.log
 comfyui.log
 
