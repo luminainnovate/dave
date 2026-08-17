@@ -385,7 +385,7 @@ async def _stop_llamacpp_server(config: dict):
 async def lifespan(app: FastAPI):
     """Manages the application lifecycle, initializing and closing the HTTP client."""
     global http_client, last_comfy_history_count
-    http_client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0))
+    http_client = httpx.AsyncClient(timeout=httpx.Timeout(700.0, connect=10.0))
     logger.info("HTTP client initialized.")
 
     # Synchronize initial ComfyUI history state
@@ -732,7 +732,7 @@ async def stream_proxy(url: str, body: dict, lock: asyncio.Lock,
     backend_sends_native = backend_is_ollama and is_native
 
     try:
-        async with http_client.stream("POST", url, json=body, timeout=600.0) as resp:
+        async with http_client.stream("POST", url, json=body, timeout=700.0) as resp:
             if resp.status_code != 200:
                 error_body = ""
                 async for chunk in resp.aiter_bytes():
@@ -1358,7 +1358,7 @@ async def proxy_ollama(request: Request):
             # Only treat as cold if the expert isn't already warm and running
             is_cold_expert = not is_expert_warm
             if not vram_locked:
-                expert_warm_until = current_time + 600
+                expert_warm_until = current_time + 700
             logger.info(f"Router-forwarded request: Skipping triage, routing directly to Expert model (cold={is_cold_expert}).")
             tracer.route(target_model, "pre-triaged by Pi router", f"cold={is_cold_expert}")
 
@@ -1369,7 +1369,7 @@ async def proxy_ollama(request: Request):
             keep_alive = "10m" if not vram_locked else "-1"
             is_cold_expert = not is_expert_warm
             if not vram_locked:
-                expert_warm_until = current_time + 600
+                expert_warm_until = current_time + 700
             expert_mode = "coding"
             logger.info(f"Project context detected ({'bound' if project_dir else '@mention'}): Routing to Expert model.")
             tracer.route(target_model, f"project context ({'bound' if project_dir else '@mention'})",
@@ -1408,7 +1408,7 @@ async def proxy_ollama(request: Request):
         elif any(kw in prompt_lower for kw in ["!expert", "hey expert", "!code", "!general"]):
             target_model = EXPERT_MODEL
             keep_alive = "10m"
-            expert_warm_until = current_time + 600
+            expert_warm_until = current_time + 700
             is_cold_expert = not is_expert_warm
             logger.info(f"Direct request for Expert model ({expert_mode}).")
             tracer.route(target_model, "explicitly requested", f"mode={expert_mode}")
@@ -1416,7 +1416,7 @@ async def proxy_ollama(request: Request):
             target_model = EXPERT_MODEL
             keep_alive = "10m" if not vram_locked else "-1"
             if not vram_locked:
-                expert_warm_until = current_time + 600
+                expert_warm_until = current_time + 700
             tracer.route(target_model, "already warm" if is_expert_warm else "VRAM locked")
         else:
             # Complexity Triage
@@ -1607,7 +1607,7 @@ async def proxy_ollama(request: Request):
 
         if not is_streaming:
             try:
-                resp = await http_client.post(target_url, json=dispatch_body, timeout=600.0)
+                resp = await http_client.post(target_url, json=dispatch_body, timeout=700.0)
                 if resp.status_code != 200:
                     error_text = ""
                     try:
@@ -1823,7 +1823,7 @@ async def _handle_agentic_request(body: dict, project_dir: str, target_url: str,
 
         hop_started = time.monotonic()
         try:
-            resp = await http_client.post(target_url, json=temp_body, timeout=600.0)
+            resp = await http_client.post(target_url, json=temp_body, timeout=700.0)
             if resp.status_code != 200:
                 tracer.error(f"hop {current_hops} returned HTTP {resp.status_code}")
                 return JSONResponse(status_code=resp.status_code, content={"error": "Agentic inference failed."})
@@ -1909,7 +1909,7 @@ async def _handle_agentic_request(body: dict, project_dir: str, target_url: str,
 
     final_started = time.monotonic()
     try:
-        resp = await http_client.post(target_url, json=final_body, timeout=600.0)
+        resp = await http_client.post(target_url, json=final_body, timeout=700.0)
         if resp.status_code == 200:
             payload = resp.json()
             msg = (payload.get("message", {}) if response_is_native
@@ -2399,9 +2399,9 @@ async def _trigger_build_pipeline_safe(
         return await _trigger_build_pipeline(messages, extra_env=extra_env, mode_label=mode_label)
 
 
-# Observed architect passes run 5-6 min. Kept under the router's 600s forward
+# Observed architect passes run 5-6 min. Kept under the router's 700s forward
 # timeout (router.py) so a slow pass reports back in chat instead of 502-ing.
-ARCHITECT_REVIEW_TIMEOUT = 540
+ARCHITECT_REVIEW_TIMEOUT = 680
 
 
 def _architect_review_path(messages: list) -> Optional[str]:

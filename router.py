@@ -73,7 +73,7 @@ _expert_warm_until: float = 0  # Mirrors desktop's expert_warm_until — skips t
 async def lifespan(app: FastAPI):
     """Manages the application lifecycle."""
     global http_client
-    http_client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0))
+    http_client = httpx.AsyncClient(timeout=httpx.Timeout(700.0, connect=10.0))
     logger.info("Router HTTP client initialized.")
 
     # Start background desktop health monitor
@@ -448,7 +448,7 @@ async def _proxy_stream_local(url: str, body: dict, is_native: bool):
     No syntax scrubbing needed (1.5B doesn't hallucinate nested XML tags).
     """
     try:
-        async with http_client.stream("POST", url, json=body, timeout=600.0) as resp:
+        async with http_client.stream("POST", url, json=body, timeout=700.0) as resp:
             if resp.status_code != 200:
                 error_body = ""
                 async for chunk in resp.aiter_bytes():
@@ -495,7 +495,7 @@ async def _proxy_stream_desktop(url: str, body: dict, is_native: bool, headers: 
     Zero processing — the desktop already handles model name rewriting and scrubbing.
     """
     try:
-        async with http_client.stream("POST", url, json=body, headers=headers, timeout=600.0) as resp:
+        async with http_client.stream("POST", url, json=body, headers=headers, timeout=700.0) as resp:
             if resp.status_code != 200:
                 error_body = ""
                 async for chunk in resp.aiter_bytes():
@@ -665,7 +665,7 @@ def _is_expert_warm() -> bool:
     return time.time() < _expert_warm_until
 
 
-def _set_expert_warm(duration: int = 600):
+def _set_expert_warm(duration: int = 700):
     """Set the expert warm timer (default 10 minutes)."""
     global _expert_warm_until
     _expert_warm_until = time.time() + duration
@@ -703,7 +703,7 @@ async def _forward_to_desktop(body: dict, path: str, is_native: bool, is_streami
 
     if not is_streaming:
         try:
-            resp = await http_client.post(target_url, json=body, headers=headers, timeout=600.0)
+            resp = await http_client.post(target_url, json=body, headers=headers, timeout=700.0)
             return JSONResponse(content=resp.json(), status_code=resp.status_code)
         except httpx.ConnectError:
             return JSONResponse(status_code=502, content={
