@@ -263,22 +263,166 @@ def test_extraction_calls_get_the_derived_token_cap():
 
 
 def test_chunk_budget_still_fits_the_context_window():
-    """A chunk plus its output must leave the reserve intact."""
-    assert distill.TARGET_CHUNK_SIZE + distill.EXTRACTION_MAX_TOKENS < distill.CONTEXT_WINDOW
+    """A chunk plus its output must leave the margin intact, at the pinned window."""
+    chunk, cap, out = distill.solve_extraction_budget(distill.CONTEXT_WINDOW, 900)
+    assert 900 + chunk + out + distill.safety_margin(distill.CONTEXT_WINDOW) <= distill.CONTEXT_WINDOW
+    assert cap == chunk // distill.EXTRACTION_TOKENS_PER_RECORD
+
+
+# --- C2. The budget solver -----------------------------------------------------
+#
+# The invariant used to be asserted against whatever CONTEXT_WINDOW the suite had
+# pinned for itself (131072), so it could never fail - including at the 8192 that
+# docker-compose actually set. These exercise the solver at hostile windows.
+
+def _for_each_window(fn):
+    """Run a check across the windows this pipeline is realistically deployed at."""
+    for window in (4096, 8192, 16384, 32768, 131072):
+        fn(window)
+
+
+def test_solved_extraction_never_exceeds_any_window():
+    def check(window):
+        for fixed in (400, 900, 1800):
+            chunk, _, out = distill.solve_extraction_budget(window, fixed)
+            total = fixed + chunk + out + distill.safety_margin(window)
+            assert total <= window, f"window {window}, fixed {fixed}: committed {total}"
+    _for_each_window(check)
+
+
+def test_solved_merge_never_exceeds_any_window():
+    def check(window):
+        for fixed in (400, 1800):
+            facts, answer = distill.solve_merge_budget(window, fixed)
+            total = fixed + facts + answer + distill.safety_margin(window)
+            assert total <= window, f"window {window}, fixed {fixed}: committed {total}"
+            assert answer >= distill.ANSWER_FLOOR, "no room left for the template"
+            assert facts >= distill.MIN_FACTS_TOKENS, "no room left for evidence"
+    _for_each_window(check)
+
+
+def test_output_cap_tracks_the_clamped_chunk():
+    """
+    The regression. The output cap was derived from the TARGET_CHUNK_SIZE constant
+    while the input was derived from the window, so a clamped chunk still reserved
+    output sized for a chunk that was never sent.
+    """
+    tight, _, tight_out = distill.solve_extraction_budget(8192, 900)
+    wide, _, wide_out = distill.solve_extraction_budget(131072, 900)
+    assert tight < wide, "a small window must clamp the chunk"
+    assert tight_out < wide_out, "a clamped chunk must reserve less output, not the same"
+
+
+def test_target_chunk_size_is_a_ceiling_not_a_floor():
+    chunk, _, _ = distill.solve_extraction_budget(131072, 900)
+    assert chunk == distill.TARGET_CHUNK_SIZE
+    tight, _, _ = distill.solve_extraction_budget(8192, 900)
+    assert tight < distill.TARGET_CHUNK_SIZE
+
+
+def test_infeasible_window_raises_rather_than_clamping():
+    """
+    Clamping is what produced a silently truncated prompt. A window that cannot
+    hold a viable call must fail, and must name the window it needs.
+    """
+    try:
+        distill.solve_extraction_budget(2048, 1800)
+    except distill.BudgetInfeasible as e:
+        assert e.required > 2048, "the error must name a window that would work"
+    else:
+        raise AssertionError("an infeasible extraction budget was clamped, not raised")
+
+    try:
+        distill.solve_merge_budget(1024, 800)
+    except distill.BudgetInfeasible as e:
+        assert e.required > 1024
+    else:
+        raise AssertionError("an infeasible merge budget was clamped, not raised")
+
+
+def test_est_tokens_over_estimates():
+    """Budget errors must fail toward headroom, never toward a truncated prompt."""
+    text = "x" * 300
+    assert distill.est_tokens(text) >= len(text) // distill.CHARS_PER_TOKEN
+    assert distill.est_tokens("") == 0
+    assert distill.est_tokens("a") == 1, "must round up, not down"
+
+
+def test_truncate_to_tokens_respects_its_budget():
+    text = "\n".join(f"line {i} with some content" for i in range(500))
+    cut = distill.truncate_to_tokens(text, 100)
+    assert distill.est_tokens(cut) <= 100
+    assert distill.truncate_to_tokens("short", 100) == "short"
 
 
 def test_small_context_window_clamps_the_chunk():
-    """TARGET_CHUNK_SIZE is a ceiling, not a floor - a 16k window must win."""
+    """Every assembled chunk prompt must fit the window it was solved against."""
     original = distill.CONTEXT_WINDOW
     distill.CONTEXT_WINDOW = 8192
     try:
         fake = run_call_llm(iterative_payload())
-        budget = (8192 - distill.RESERVED_TOKENS) * distill.CHARS_PER_TOKEN
         for call in fake.chunks:
-            assert len(call["user"]) <= budget + len(REQUEST_BODY) + 1024, \
-                "chunk exceeded what the configured window can hold"
+            committed = (
+                distill.est_tokens(call["system"])
+                + distill.est_tokens(call["user"])
+                + call["max_output_tokens"]
+            )
+            assert committed <= 8192, \
+                f"chunk call committed {committed} tokens to an 8192 window"
     finally:
         distill.CONTEXT_WINDOW = original
+
+
+def test_merge_call_fits_the_window_too():
+    """The merge was the one call with no budget check at all."""
+    original = distill.CONTEXT_WINDOW
+    distill.CONTEXT_WINDOW = 8192
+    try:
+        merge = run_call_llm(iterative_payload()).merge
+        committed = (
+            distill.est_tokens(merge["system"])
+            + distill.est_tokens(merge["user"])
+            + merge["max_output_tokens"]
+        )
+        assert committed <= 8192, f"merge call committed {committed} tokens to an 8192 window"
+    finally:
+        distill.CONTEXT_WINDOW = original
+
+
+def test_merge_answer_budget_can_hold_the_template():
+    """architect.md's seven capped sections need room whatever the window."""
+    original = distill.CONTEXT_WINDOW
+    distill.CONTEXT_WINDOW = 8192
+    try:
+        merge = run_call_llm(iterative_payload()).merge
+        assert merge["max_output_tokens"] >= distill.ANSWER_FLOOR
+    finally:
+        distill.CONTEXT_WINDOW = original
+
+
+def test_context_window_falls_back_to_agent_config():
+    """The config key existed but was read by nobody."""
+    original_window, original_env = distill.CONTEXT_WINDOW, distill._ENV_CONTEXT_WINDOW
+    distill._ENV_CONTEXT_WINDOW = ""
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            distill._resolve_context_window({"context_window": 65536})
+        assert distill.CONTEXT_WINDOW == 65536
+    finally:
+        distill.CONTEXT_WINDOW, distill._ENV_CONTEXT_WINDOW = original_window, original_env
+
+
+def test_environment_still_beats_agent_config():
+    """The orchestrator injects EXPERT_CTX per build; it has to keep winning."""
+    original_window, original_env = distill.CONTEXT_WINDOW, distill._ENV_CONTEXT_WINDOW
+    distill._ENV_CONTEXT_WINDOW = "131072"
+    distill.CONTEXT_WINDOW = 131072
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            distill._resolve_context_window({"context_window": 8192})
+        assert distill.CONTEXT_WINDOW == 131072
+    finally:
+        distill.CONTEXT_WINDOW, distill._ENV_CONTEXT_WINDOW = original_window, original_env
 
 
 # --- D. Chunking regressions -------------------------------------------------
@@ -326,6 +470,163 @@ def test_chunks_respect_the_char_budget():
 def test_chunk_text_is_stable_for_short_input():
     text = "one small payload"
     assert [c for c, _ in distill.chunk_text(text, distill.TARGET_CHUNK_SIZE)] == [text]
+
+
+# --- D2. Orientation blocks are never a source of records --------------------
+#
+# NEW_REQUEST carried "do not extract records from it"; PREVIOUS ANALYSES, sent
+# on every chunk, carried nothing. So a fact extractor was handed the architect's
+# finished document and emitted RULE/PATH records quoting its own design back
+# into the merge.
+
+ARCHITECT_ANALYSIS = (
+    "#### ARCHITECT ANALYSIS\n"
+    "# 1. Business Goal\n"
+    "- Stop one API key degrading search latency.\n"
+    "# 2. Directory Structure\n"
+    "src/\n"
+    "  http/\n"
+    "    middleware/\n"
+    "      rateLimit.ts [NEW]\n"
+    "# 3. Technology Stack\n"
+    "- EXISTING: Redis — reused as the counter store.\n"
+    "# 4. Contracts\n"
+    "- src/http/middleware/rateLimit.ts::rateLimit(key: string) -> Promise<Decision> [NEW]\n"
+    "# 5. Data Flows\n"
+    "- Request -> middleware -> Redis INCR -> allow or 429.\n"
+    "# 6. Risks\n"
+    "- RISK: Redis unreachable | MITIGATION: fail open.\n"
+    "# 7. Out of Scope\n"
+    "- Per-tenant quota dashboards.\n"
+)
+
+
+def test_extractor_prompt_states_the_source_boundary():
+    system = run_call_llm(iterative_payload()).chunks[0]["system"]
+    assert "SOURCE BOUNDARY" in system
+    for heading in distill.ORIENTATION_HEADINGS:
+        assert f"### {heading}" in system, f"{heading} not named as a non-source"
+
+
+def test_both_orientation_blocks_carry_the_exclusion():
+    """The asymmetry itself: one block was guarded and the other was not."""
+    chunk = run_call_llm(iterative_payload(), prior_context=ARCHITECT_ANALYSIS).chunks[0]["user"]
+    for heading in distill.ORIENTATION_HEADINGS:
+        assert f"### {heading}" in chunk, f"{heading} block missing"
+        block = chunk.split(f"### {heading}", 1)[1].split("---", 1)[0]
+        assert "never emit a record sourced from it" in block.lower(), \
+            f"{heading} block carries no exclusion"
+
+
+def test_chunks_get_steering_not_the_whole_prior_document():
+    """Re-sending the full architect document on all N chunks inflated every call."""
+    fake = run_call_llm(iterative_payload(), prior_context=ARCHITECT_ANALYSIS)
+    for call in fake.chunks:
+        assert "rateLimit.ts" in call["user"], "steering must keep the paths in play"
+        assert "Per-tenant quota dashboards" not in call["user"], \
+            "section 7 is not steering; the full document must not be re-sent"
+
+
+def test_merge_still_receives_the_full_prior_context():
+    """Chunks are steered, but synthesis needs the whole thing."""
+    merge = run_call_llm(iterative_payload(), prior_context=ARCHITECT_ANALYSIS).merge
+    assert "Per-tenant quota dashboards" in merge["user"]
+    assert "PREVIOUS ANALYSES" in merge["user"]
+
+
+def test_steering_extract_picks_paths_and_contracts():
+    steer = distill.steering_extract(ARCHITECT_ANALYSIS)
+    assert "rateLimit.ts" in steer
+    assert "Promise<Decision>" in steer
+    assert "Business Goal" not in steer
+    assert "Out of Scope" not in steer
+
+
+def test_steering_extract_stops_at_the_next_wrapper_heading():
+    """A following '#### ENGINEER ANALYSIS' must terminate the capture."""
+    combined = ARCHITECT_ANALYSIS + "\n#### ENGINEER ANALYSIS\n- build order: rateLimit first\n"
+    assert "build order" not in distill.steering_extract(combined)
+
+
+def test_steering_extract_respects_its_cap():
+    assert distill.est_tokens(distill.steering_extract("# 4. Contracts\n" + "- x\n" * 5000)) \
+        <= distill.PRIOR_STEER_MAX_TOKENS
+
+
+def test_steering_extract_falls_back_when_sections_are_absent():
+    """Engineer/safety output has no section 2 or 4; it must still steer something."""
+    steer = distill.steering_extract("free-form notes about the build order")
+    assert "free-form notes" in steer
+
+
+# --- D3. The consolidation ladder terminates ---------------------------------
+
+def test_consolidation_is_a_filter_not_a_summariser():
+    """A summariser paraphrases, which destroys the verbatim property."""
+    prompt = distill.CONSOLIDATION_SYSTEM_PROMPT.lower()
+    assert "never rewrite" in prompt and "verbatim" in prompt
+    assert "summarizer" not in prompt
+
+
+def test_facts_are_compressed_to_the_merge_budget():
+    """A ladder that never re-checks its own output is not a ladder."""
+    fake = FakeLLM(reply="SYM | a.ts:1 | x | note")
+    huge = ["RECORD | a.ts:1 | " + "y" * 400 for _ in range(200)]
+    real = distill._single_llm_call
+    distill._single_llm_call = fake
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            fitted = distill._fit_facts_to_budget(None, "m", huge, 300, 8192)
+    finally:
+        distill._single_llm_call = real
+    assert distill.est_tokens("\n\n".join(fitted)) <= 300
+
+
+def test_non_converging_consolidation_still_terminates_and_says_so():
+    """A filter that returns its input unchanged must not spin, and must mark the loss."""
+    class Stubborn(FakeLLM):
+        def __call__(self, client, model_config, system_prompt, user_content,
+                     label="Inference", max_output_tokens=None):
+            super().__call__(client, model_config, system_prompt, user_content,
+                             label, max_output_tokens)
+            return user_content        # refuses to shrink anything
+
+    fake = Stubborn()
+    parts = ["RECORD | a.ts:1 | " + "z" * 500 for _ in range(40)]
+    real = distill._single_llm_call
+    distill._single_llm_call = fake
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            fitted = distill._fit_facts_to_budget(None, "m", parts, 200, 8192)
+    finally:
+        distill._single_llm_call = real
+
+    rounds = [c for c in fake.calls if c["label"].startswith("Consolidation")]
+    assert rounds, "the ladder should have attempted at least one round"
+    assert distill.est_tokens("\n\n".join(fitted)) <= 200
+    assert "[TRUNCATED:" in fitted[-1], "dropped facts must be declared, not silent"
+    assert "CONTEXT IS INCOMPLETE" in fitted[-1]
+
+
+def test_facts_within_budget_are_left_alone():
+    fake = FakeLLM()
+    parts = ["SYM | a.ts:1 | export function a() | note"]
+    real = distill._single_llm_call
+    distill._single_llm_call = fake
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            fitted = distill._fit_facts_to_budget(None, "m", parts, 4096, 131072)
+    finally:
+        distill._single_llm_call = real
+    assert fitted == parts
+    assert not fake.calls, "no consolidation call should be made when facts already fit"
+
+
+def test_pack_buckets_never_exceeds_the_bucket_budget():
+    parts = [f"record {i} " + "q" * (i * 37 % 900) for i in range(60)]
+    for bucket in distill._pack_buckets(parts, 250):
+        assert distill.est_tokens("\n\n".join(bucket)) <= 250 * 2, \
+            "a bucket ran far past its budget"
 
 
 # --- E. The real conversation payload ---------------------------------------

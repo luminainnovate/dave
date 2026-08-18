@@ -25,20 +25,20 @@ logger = logging.getLogger("Bob-Orchestrator")
 # Each model role is a dict: model name, provider type, and API base URL.
 # Supported providers: "ollama", "lmstudio", "llamacpp"
 # EXPERT_CONFIG = {
-#    "model": "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q3_K_XL",
-#     "provider": "llamacpp",
-#     "base_url": "http://localhost:8081",
-# }
-# EXPERT_CONFIG = {
-#    "model": "unsloth/Qwen3.6-35B-A3B-GGUF:UD-IQ4_NL",
+#    "model": "unsloth/Qwen3.8-27B-GGUF:Q5_K_M",
 #     "provider": "llamacpp",
 #     "base_url": "http://localhost:8081",
 # }
 EXPERT_CONFIG = {
-   "model": "qwen3.8:27b",
-    "provider": "ollama",
-    "base_url": "http://localhost:11434",
+   "model": "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL",
+    "provider": "llamacpp",
+    "base_url": "http://localhost:8081",
 }
+# EXPERT_CONFIG = {
+#    "model": "qwen3.8:27b",
+#     "provider": "ollama",
+#     "base_url": "http://localhost:11434",
+# }
 ROUTER_CONFIG = {
     "model": "qwen2.5:1.5b",
     "provider": "ollama",
@@ -55,9 +55,10 @@ LLAMACPP_BINARY = "/home/jonathan/.local/bin/llama"  # llama.app unified binary 
 LLAMACPP_DEFAULT_ARGS = ["--cache-type-k", "q8_0", "--cache-type-v", "q8_0"]  # Extra CLI args (KV Quant enabled)
 
 COMFYUI_URL = "http://localhost:8188"
-EXPERT_CTX = 131072   # Context for the expert model (128k)
-DISTILL_CTX = 131072  # Context for the distillation engine (128k)
-CLINE_CTX = 131072    # Context for the Cline agent (128k)
+EXPERT_CTX = 65536    # Context for the expert model (64k) - 128k of KV crowds the
+                      # weights off the GPU on a 24GB card; halve it to fit -ngl all
+DISTILL_CTX = 65536   # Context for the distillation engine (64k) - see EXPERT_CTX
+CLINE_CTX = 65536     # Context for the Cline agent (64k) - see EXPERT_CTX
 
 # Tool-calling budget for one turn. Each hop is a full Expert inference over the
 # whole conversation, so this is the main lever on how long a tool-using turn
@@ -306,8 +307,16 @@ async def _start_llamacpp_server(config: dict):
             "--slot-prompt-similarity", "0.95",
             "--batch-size", "1024",
             "--ubatch-size", "1024",
-            "--reasoning-format", "deepseek"
+            "--reasoning-format", "deepseek",
+            # -ngl defaults to 'auto', which silently spills layers to system RAM
+            # when the KV cache leaves no room. That degrades generation to PCIe
+            # speed while prompt eval still looks fine. 'all' fails loudly instead.
+            "-ngl", "all",
+            # The vision projector (mmproj-BF16.gguf, 931 MB) is pulled in
+            # automatically by -hf. The Expert is text-only, so skip it.
+            "--no-mmproj"
         ]
+        # "--spec-type", "draft-mtp"
 
         # Build command: detect HuggingFace repo vs local path
         if "/" in model and not os.path.exists(model):
@@ -322,6 +331,8 @@ async def _start_llamacpp_server(config: dict):
             # Force Flash Attention ON to save VRAM and improve speed at 128k context
             env = os.environ.copy()
             env["LLAMA_ARG_FLASH_ATTN"] = "on"
+
+            env["HF_HUB_CACHE"] = "/data/llama"
             
             log_file = open("llama-server.log", "a")
             proc = subprocess.Popen(cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT)

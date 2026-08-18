@@ -26,12 +26,19 @@ CONVERSATION_PATH = os.environ.get("CONVERSATION_FILE", "/workspace/.cline_conte
 OUTPUT_PATH = os.environ.get("CLINERULES_PATH", "/workspace/.clinerules")
 STATUS_PATH = os.environ.get("DISTILL_STATUS_PATH", "/workspace/.cline_context/distill_status")
 PROJECT_NAME = os.environ.get("PROJECT_NAME", "unnamed_project")
-CONTEXT_WINDOW = int(os.environ.get("EXPERT_CTX", "16384"))
+# Settled against agent_config.json in _resolve_context_window() once the config
+# is loaded. The environment wins when set, because the orchestrator injects
+# EXPERT_CTX when it launches the build container.
+_ENV_CONTEXT_WINDOW = os.environ.get("EXPERT_CTX", "").strip()
+CONTEXT_WINDOW = int(_ENV_CONTEXT_WINDOW) if _ENV_CONTEXT_WINDOW else 16384
 
-# Rough approximation: 1 token ≈ 4 characters
-CHARS_PER_TOKEN = 4
-# Reserve tokens for system prompt + response
-RESERVED_TOKENS = 2048
+# Two token estimates on purpose, and the difference between them is the point.
+# chunk_text slices characters, where 4 chars/token is a fair prose average.
+# Budget accounting measures what a prompt will COST, and the payload is code,
+# paths, JSON and tree output that tokenize nearer 3 chars/token - so accounting
+# uses the smaller divisor, which rounds every estimation error toward headroom.
+CHARS_PER_TOKEN = 4          # slicing
+CHARS_PER_TOKEN_DENSE = 3    # accounting; deliberately conservative
 CHUNK_OVERLAP_TOKENS = 200
 
 # Chunk size sets the extraction bill: the payload is split into ceil(len/chunk)
@@ -63,13 +70,63 @@ REQUEST_TAGS = ("NEW_REQUEST", "FINAL_BUILD_COMMAND")
 # so a chunk-extraction prompt that falls into a repetition loop runs for minutes
 # and gets guillotined mid-sentence by the stability budget.
 #
-# The extraction cap has to scale with TARGET_CHUNK_SIZE or a larger chunk just
-# loses whatever falls past the record limit - trading call count for silent fact
-# loss. Both are derived from the chunk at the density the original 2048/20/1024
-# triple was tuned to: ~100 input tokens per record, ~50 output tokens to write it.
-EXTRACTION_RECORD_CAP = TARGET_CHUNK_SIZE // 100   # max records one chunk may emit
-EXTRACTION_MAX_TOKENS = EXTRACTION_RECORD_CAP * 50 # bullet-point extraction from one chunk
+# The extraction cap has to scale with the chunk or a larger chunk just loses
+# whatever falls past the record limit - trading call count for silent fact loss.
+# Both derive from the chunk at the density the original 2048/20/1024 triple was
+# tuned to: ~100 input tokens per record, ~50 output tokens to write it.
+#
+# That density is also what makes the budget solvable in closed form. Output is a
+# fixed fraction of the chunk, so the constraint
+#     fixed_overhead + chunk + output(chunk) + margin <= window
+# is linear in `chunk` and solve_extraction_budget() inverts it directly.
+EXTRACTION_TOKENS_PER_RECORD = 100
+EXTRACTION_OUTPUT_PER_RECORD = 50
+EXTRACTION_OUTPUT_RATIO = EXTRACTION_OUTPUT_PER_RECORD / EXTRACTION_TOKENS_PER_RECORD
+
+# Ceilings, reached when the window is generous. The per-call figures come from
+# the solver, which never exceeds these and clamps below them on a tight window.
+EXTRACTION_RECORD_CAP = TARGET_CHUNK_SIZE // EXTRACTION_TOKENS_PER_RECORD
+EXTRACTION_MAX_TOKENS = EXTRACTION_RECORD_CAP * EXTRACTION_OUTPUT_PER_RECORD
 ANSWER_MAX_TOKENS = 8192       # merge / single-pass, where the templated answer lives
+
+# --- Budget model ---
+# Every call must satisfy: prompt + output + margin <= CONTEXT_WINDOW, where the
+# prompt is MEASURED rather than approximated by a flat reserve. The previous
+# RESERVED_TOKENS=2048 stood in for four variable terms (system prompt, framing,
+# the per-chunk NEW_REQUEST, and an output cap of up to 8192), so at EXPERT_CTX
+# =8192 a call committed ~10.7k tokens to an 8192 window. Ollama does not error
+# on that; it truncates the prompt and answers from what is left.
+
+# Absorbs the gap between est_tokens() and the model's real tokenizer, plus the
+# chat-template scaffolding the server adds and we never see.
+SAFETY_FRACTION = 0.05
+SAFETY_FLOOR = 256
+
+# Below this a chunk carries too little surrounding context to extract from, so
+# an infeasible budget raises instead of clamping. The old code floored the
+# budget at 1000 tokens and carried on - which is how a prompt overflowed with
+# no log line and produced a confident, evidence-free document.
+MIN_VIABLE_CHUNK = 768
+
+# Merge allocation. The answer is the deliverable so it is reserved first; the
+# facts are the compressible term and take the remainder. 0.4 leaves the majority
+# of a tight window for evidence while still guaranteeing room for the template.
+MERGE_ANSWER_FRACTION = 0.4
+ANSWER_FLOOR = 1024            # architect.md's seven capped sections need ~800
+MIN_FACTS_TOKENS = 512         # below this there is nothing to synthesise from
+
+# Consolidation ladder. Three independent stops guarantee termination: the round
+# cap, the no-progress break, and the deterministic truncation that follows.
+MAX_CONSOLIDATION_ROUNDS = 4
+MIN_REDUCTION_RATIO = 0.9      # a round must remove >=10% or the ladder stops
+
+# Chunks get a capped steering extract of prior analyses; the merge gets it all.
+PRIOR_STEER_MAX_TOKENS = 400
+
+# A server-reported prompt above this fraction of the window means it truncated.
+BUDGET_BREACH_FRACTION = 0.95
+# Report an under-estimate only when it is material enough to warrant calibration.
+BUDGET_DRIFT_FRACTION = 0.15
 
 # Stability Protocol: how long a stream may go with NO new token before we give up.
 # This is an idle timer, not a wall-clock deadline - a healthy fast stream is never
@@ -84,6 +141,182 @@ DISTILL_PASSES = os.environ.get("DISTILL_PASSES", "").strip()
 # disk is authoritative, so a hand-edited architecture survives into the build.
 DISTILL_RESUME = os.environ.get("DISTILL_RESUME", "").strip().lower() in ("1", "true", "yes")
 INTERMEDIATE_DIR = os.environ.get("DISTILL_INTERMEDIATE_DIR", "/workspace/.cline_context")
+
+
+class BudgetInfeasible(RuntimeError):
+    """
+    The configured context window cannot hold a viable call.
+
+    Raised rather than clamped, deliberately. Clamping is what the old
+    `if available_tokens < 1000: available_tokens = 1000` did: it turned a
+    configuration error into a silently truncated prompt and a document that
+    looked finished but was written from partial evidence. A hard failure that
+    names the window you need is strictly more useful than a plausible lie.
+    """
+
+    def __init__(self, stage: str, window: int, fixed: int, margin: int, required: int):
+        self.stage = stage
+        self.window = window
+        self.fixed = fixed
+        self.margin = margin
+        self.required = required
+        super().__init__(
+            f"{stage}: context window {window} cannot hold this call "
+            f"(fixed overhead {fixed} + safety margin {margin} leaves no viable room). "
+            f"Set EXPERT_CTX, or agent_config.json context_window, to at least {required}."
+        )
+
+
+class ExtractionFailed(RuntimeError):
+    """
+    One or more LLM calls in a pass failed outright.
+
+    _single_llm_call returns "[ERROR: ...]" as a *string* when it gives up, so
+    without this the marker flows into the merge like any other extracted fact.
+    The merge then dutifully reports that CONTEXT contains no symbols to design
+    against, and the pass ends in "# BLOCKED" - a plausible-looking answer whose
+    real cause (an unreachable model) is two layers upstream and invisible.
+
+    Same reasoning as BudgetInfeasible: fail loudly, name the cause.
+    """
+
+    def __init__(self, stage: str, failures: list, total: int):
+        self.stage = stage
+        self.failures = failures          # list of (label, error_text)
+        self.total = total
+        labels = ", ".join(label for label, _ in failures)
+        errors = sorted({err for _, err in failures})
+        super().__init__(
+            f"{stage}: {len(failures)} of {total} LLM call(s) failed ({labels}). "
+            f"Error(s): {'; '.join(errors)}"
+        )
+
+
+def _check_llm_result(result: str, label: str):
+    """Return (label, error) if a call gave up, else None."""
+    if isinstance(result, str) and result.startswith("[ERROR:"):
+        return (label, result.strip()[1:-1].removeprefix("ERROR:").strip())
+    return None
+
+
+def est_tokens(text: str) -> int:
+    """
+    Over-estimate a string's token cost.
+
+    Used for every prompt-side measurement. Rounds up, and divides by the dense
+    figure rather than the prose one, so budget errors always fail toward
+    headroom instead of toward a truncated prompt.
+    """
+    if not text:
+        return 0
+    return -(-len(text) // CHARS_PER_TOKEN_DENSE)
+
+
+def truncate_to_tokens(text: str, max_tokens: int) -> str:
+    """Cut a string down to an estimated token budget, on a line boundary if one is near."""
+    if max_tokens <= 0:
+        return ""
+    if est_tokens(text) <= max_tokens:
+        return text
+    limit = max_tokens * CHARS_PER_TOKEN_DENSE
+    cut = text[:limit]
+    newline = cut.rfind("\n")
+    return cut[:newline] if newline > limit // 2 else cut
+
+
+def safety_margin(window: int) -> int:
+    """Headroom held back from every call, never spent."""
+    return max(SAFETY_FLOOR, int(window * SAFETY_FRACTION))
+
+
+def slice_tokens(budget_tokens: int) -> int:
+    """
+    Convert an accounting-token budget into chunk_text's prose-token unit.
+
+    chunk_text slices characters at CHARS_PER_TOKEN (4); the budget is measured
+    with the conservative CHARS_PER_TOKEN_DENSE (3). Without this conversion a
+    chunk solved at N tokens gets sliced to N*4 characters and then costs N*4/3
+    to send - a 33% overrun that lands straight back inside the window, which is
+    precisely the class of error the two divisors exist to prevent.
+    """
+    return max(1, budget_tokens * CHARS_PER_TOKEN_DENSE // CHARS_PER_TOKEN)
+
+
+def solve_extraction_budget(window: int, fixed_overhead: int) -> tuple[int, int, int]:
+    """
+    Solve `fixed + chunk + output(chunk) + margin <= window` for the chunk size.
+
+    Returns (chunk_tokens, record_cap, output_tokens).
+
+    output(chunk) is not a constant: the extractor emits one ~50-token record per
+    ~100 input tokens, so output tracks the chunk at EXTRACTION_OUTPUT_RATIO. The
+    old code derived the output cap from the TARGET_CHUNK_SIZE constant while
+    deriving the input from the window, so a chunk clamped to 6144 still reserved
+    output sized for 8192. Both now come from the same solved quantity.
+
+    Substituting output = ratio * chunk makes the constraint linear:
+
+        fixed + chunk * (1 + ratio) <= window - margin
+        chunk <= (window - margin - fixed) / (1 + ratio)
+
+    TARGET_CHUNK_SIZE then applies as a ceiling - a latency preference for fewer,
+    larger calls - and can never push the call past what the window holds.
+    """
+    margin = safety_margin(window)
+    spare = window - margin - fixed_overhead
+    chunk = min(TARGET_CHUNK_SIZE, int(spare / (1 + EXTRACTION_OUTPUT_RATIO)))
+
+    if chunk < MIN_VIABLE_CHUNK:
+        required = int(
+            fixed_overhead + margin + MIN_VIABLE_CHUNK * (1 + EXTRACTION_OUTPUT_RATIO)
+        ) + 1
+        raise BudgetInfeasible("extraction", window, fixed_overhead, margin, required)
+
+    record_cap = max(1, chunk // EXTRACTION_TOKENS_PER_RECORD)
+    return chunk, record_cap, record_cap * EXTRACTION_OUTPUT_PER_RECORD
+
+
+def solve_merge_budget(window: int, fixed_overhead: int) -> tuple[int, int]:
+    """
+    Split what the window leaves between the answer and the facts supporting it.
+
+    Returns (facts_budget_tokens, answer_tokens).
+
+    The answer is reserved first because it is the deliverable, and it has a hard
+    floor: architect.md's seven capped sections cannot be written in less than
+    ANSWER_FLOOR whatever the window. Facts are the compressible term and take
+    the remainder, which is the target the consolidation ladder compresses to.
+
+    By construction fixed + answer + facts + margin == window exactly.
+    """
+    margin = safety_margin(window)
+    remainder = window - margin - fixed_overhead
+
+    if remainder < ANSWER_FLOOR + MIN_FACTS_TOKENS:
+        required = fixed_overhead + margin + ANSWER_FLOOR + MIN_FACTS_TOKENS
+        raise BudgetInfeasible("merge", window, fixed_overhead, margin, required)
+
+    answer = max(ANSWER_FLOOR, min(ANSWER_MAX_TOKENS, int(remainder * MERGE_ANSWER_FRACTION)))
+    return remainder - answer, answer
+
+
+def _resolve_context_window(config: dict) -> None:
+    """
+    Settle the three-way disagreement about how big the window actually is.
+
+    Precedence: EXPERT_CTX (injected by the orchestrator when it launches the
+    build container) > agent_config.json `context_window` > the module default.
+    The config key was read by nobody, so a 131072-token configuration silently
+    ran at whatever the environment said - 8192, under docker-compose.
+    """
+    global CONTEXT_WINDOW
+    source = "default"
+    if _ENV_CONTEXT_WINDOW:
+        source = "EXPERT_CTX"
+    elif config.get("context_window"):
+        CONTEXT_WINDOW = int(config["context_window"])
+        source = "agent_config.json"
+    print(f"📐 Context window: {CONTEXT_WINDOW} tokens (source: {source})", flush=True)
 
 
 def load_config() -> dict:
@@ -192,6 +425,121 @@ def extract_mode(text: str) -> str:
     """
     match = re.search(r"<MODE>(.*?)</MODE>", text, re.DOTALL)
     return match.group(1).strip() if match else ""
+
+
+# Headings that carry orientation rather than payload. The extractor system
+# prompt names these as non-sources, so the set has to be stated once and shared
+# rather than restated per call site - restating it per block is how NEW_REQUEST
+# came to carry an exclusion and PREVIOUS ANALYSES did not.
+ORIENTATION_HEADINGS = ("PREVIOUS ANALYSES", "NEW_REQUEST")
+
+
+def _context_block(heading: str, body: str, purpose: str) -> str:
+    """
+    Render one orientation block.
+
+    Every non-payload block goes through here, so a block cannot be added without
+    inheriting the contract the extractor prompt states about ORIENTATION_HEADINGS.
+    """
+    return f"### {heading}\n{purpose}\n\n{body}\n\n---\n\n"
+
+
+# Architect template sections 2 and 4: the paths in play and the contracts on
+# them. Stops at the next heading of any level, so a following "#### ENGINEER
+# ANALYSIS" wrapper terminates the capture rather than being swallowed by it.
+_STEER_SECTION_RE = re.compile(
+    r"^#\s*(?:2\.\s*Directory Structure|4\.\s*Contracts)\b.*?(?=^#{1,6}\s|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+
+
+def steering_extract(prior_context: str, max_tokens: int = PRIOR_STEER_MAX_TOKENS) -> str:
+    """
+    Reduce prior analyses to the part a fact extractor can actually act on.
+
+    The chunk loop's job is verbatim extraction. A previous pass's design prose
+    cannot change what a chunk says - only which of its facts are worth emitting -
+    so the chunks get the paths and contracts and nothing else, capped. The full
+    text still reaches the merge, which is where synthesis happens.
+
+    This also stops the whole architect document being re-sent on all N chunks,
+    where it inflated the fixed overhead of every single call.
+    """
+    if not prior_context:
+        return ""
+    wanted = [m.strip() for m in _STEER_SECTION_RE.findall(prior_context)]
+    return truncate_to_tokens("\n".join(wanted) or prior_context, max_tokens)
+
+
+def _extraction_system_prompt(record_cap: int) -> str:
+    """
+    The relaxed extractor prompt, with the record cap the solver actually allowed.
+
+    A cap baked in as a literal would promise more records than the solved output
+    budget can hold on a tight window, so the model would be cut off mid-record.
+    """
+    orientation = " and ".join(f"### {h}" for h in ORIENTATION_HEADINGS)
+    return (
+        "Fact extractor in a map-reduce pipeline. Records are merged verbatim and consumed by "
+        "an Architect, Engineer, Test Engineer and Auditor. Extract only: never summarise, "
+        "infer, judge or design.\n"
+        "\n"
+        "SOURCE BOUNDARY: records come ONLY from the text under ### CURRENT TASK.\n"
+        f"{orientation} are orientation - they tell you which facts matter. They are "
+        "NEVER a source of records. A record whose payload appears only in an orientation "
+        "block is a defect.\n"
+        "\n"
+        "Output newline-separated records only — no preamble, headings, fences or blank lines. "
+        f"Max {record_cap}, in order of appearance, no repeats. Every line:\n"
+        "  TYPE | <path>:<line> | <verbatim payload> | <note, max 10 words>\n"
+        "Use `-` when no line number. Omit a type entirely if absent — never write 'none'.\n"
+        "\n"
+        "PAYLOAD SECTIONS IN THIS PART names the blocks this part covers "
+        "(PROJECT_HISTORY, DIRECTORY_STRUCTURE, SYMBOL_SKELETON, ...). Use it to pick the "
+        "record TYPE — the same string means different things in a symbol map and in chat history.\n"
+        "\n"
+        "ALWAYS capture:\n"
+        "  DEP    declared dependency/runtime/framework + version\n"
+        "  CMD    runnable script or command from a manifest\n"
+        "  TEST   test path, runner, assertion library, or fixture location\n"
+        "  CONFIG env var, feature flag, or config key the code reads\n"
+        "Capture when present, listing anything NEW_REQUEST references, calls or imports first. "
+        "You see one part of a larger payload, so you cannot trace what NEW_REQUEST reaches "
+        "through code you cannot see: when unsure, include it. A later step filters:\n"
+        "  PATH   existing source file + one-sentence responsibility\n"
+        "  SYM    exported function/class/type/constant, full signature\n"
+        "  DATA   persisted or returned field name + declared type\n"
+        "  AUTH   authority decision point, or untrusted input entry\n"
+        "  RULE   requirement, constraint or invariant stated in the text\n"
+        "  GAP    symbol/path/config referenced here but not defined here\n"
+        "\n"
+        "1. VERBATIM: copy signatures, names, types, versions, commands, paths "
+        "character-for-character. Never normalise or correct.\n"
+        "2. OBSERVED ONLY: no purpose, quality, intent, risk, or 'appears to'. Not written "
+        "in the chunk means it does not exist. No findings or recommendations.\n"
+        "3. One fact per record. Never merge two symbols, paths or commands.\n"
+        "4. Cut off at the chunk boundary: copy what is present, append ` ~TRUNCATED`.\n"
+        "\n"
+        "SYM | src/http/routes/search.ts:22 | export async function search(q: string, key: string): Promise<Result[]> | public entrypoint\n"
+        "CMD | package.json:8 | npm run test:unit | vitest, unit suite\n"
+        "AUTH | src/http/routes/search.ts:19 | req.headers['x-api-key'] | untrusted, keys the lookup\n"
+        "GAP | src/http/routes/search.ts:31 | resolveTenant | imported from ../auth, not in chunk\n"
+    )
+
+
+CONSOLIDATION_SYSTEM_PROMPT = (
+    "Deduplicating filter for extracted records. Input is newline-separated records:\n"
+    "  TYPE | location | payload | note\n"
+    "\n"
+    "Output the SAME record lines, dropping only:\n"
+    "  - exact duplicates\n"
+    "  - records whose payload is a strict substring of another record's payload\n"
+    "\n"
+    "Never rewrite, merge, shorten, reorder, reword or summarise a record. Copy every "
+    "surviving line character-for-character. These records feed an Architect that must "
+    "quote signatures, versions and paths verbatim, so a paraphrase is a defect.\n"
+    "Output records only: no preamble, headings, fences or blank lines."
+)
 
 
 def _section_boundaries(text: str) -> list[tuple[int, str]]:
@@ -327,6 +675,70 @@ def _intermediate_path(pass_key: str) -> str:
     return os.path.join(INTERMEDIATE_DIR, f"distill_{pass_key}.md")
 
 
+# Sentinel that marks an intermediate file as an abort report rather than a
+# result. load_saved_pass() refuses to reuse anything carrying it.
+ABORT_MARKER = "## ❌ ABORTED — the pass could not run"
+
+
+def _write_pass_failure(pass_key: str, model_config, exc: "ExtractionFailed"):
+    """
+    Write an abort report to the pass's intermediate path.
+
+    That path is what `!architect` polls in chat, so this is the difference
+    between the user seeing the real fault in seconds and waiting out the full
+    review-gate timeout for "still running".
+    """
+    if isinstance(model_config, dict):
+        endpoint = model_config.get("base_url", "?")
+        model_name = model_config.get("model", "?")
+    else:
+        endpoint = OLLAMA_HOST
+        model_name = str(model_config)
+
+    lines = [
+        f"# Distillation Intermediate: {pass_key.title()}",
+        "",
+        ABORT_MARKER,
+        "",
+        f"**{exc.stage}** failed: {len(exc.failures)} of {exc.total} call(s) to the model "
+        "returned an error, so the extracted context would have been incomplete.",
+        "",
+        "This is **not** a finding about your codebase. No architecture was produced.",
+        "",
+        "| | |",
+        "|---|---|",
+        f"| Model | `{model_name}` |",
+        f"| Endpoint | `{endpoint}` |",
+        f"| Failed calls | {len(exc.failures)} of {exc.total} |",
+        "",
+        "### Errors",
+        "",
+    ]
+    for label, err in exc.failures:
+        lines.append(f"- **{label}** — `{err}`")
+    lines += [
+        "",
+        "### What to check",
+        "",
+        f"1. Is a server actually listening at `{endpoint}`?",
+        "2. From inside this container, `localhost` is the container — host "
+        "services need `host.docker.internal`.",
+        "3. Check `llama-server.log` / `orchestrator.log` on the host for a "
+        "model that died or was auto-unloaded mid-run.",
+        "",
+        "Fix the cause, then re-run this pass. Nothing was overwritten.",
+    ]
+
+    path = _intermediate_path(pass_key)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        print(f"  ↳ Wrote abort report to {path}", flush=True)
+    except Exception as e:
+        print(f"  ⚠ Could not write abort report: {e}", flush=True)
+
+
 def load_saved_pass(pass_key: str):
     """
     Load a previously saved pass result, or None if there isn't a usable one.
@@ -343,6 +755,15 @@ def load_saved_pass(pass_key: str):
             content = f.read()
     except Exception as e:
         print(f"  ⚠ Could not read {path}: {e}", flush=True)
+        return None
+
+    if ABORT_MARKER in content:
+        # An abort report wears the same header as a real result, so without this
+        # a later run would "reuse" a failure notice as if it were an approved
+        # architecture - exactly the silent-bad-context problem this guard exists
+        # to prevent.
+        print(f"  ⚠ {path} holds an abort report, not a result; re-running the pass.",
+              flush=True)
         return None
 
     lines = content.split("\n")
@@ -474,142 +895,227 @@ def evict_stale_models(client: httpx.Client, models: dict, keep_config: dict):
         print("  ↳ Nothing to evict - GPU already holds only what pass 1 needs.", flush=True)
 
 
+def _build_chunk_prompt(steer: str, new_request: str, section_label: str,
+                        index: int, total: int, chunk: str) -> str:
+    """
+    Assemble one extraction prompt.
+
+    Also used with an empty chunk to MEASURE the per-call overhead, so the figure
+    the budget solver works from is the real assembled framing rather than a
+    constant that drifts every time this text is edited.
+    """
+    parts = []
+    if steer:
+        parts.append(_context_block(
+            "PREVIOUS ANALYSES", steer,
+            "What earlier passes established. Orientation only: it tells you which "
+            "facts matter. Never emit a record sourced from it.",
+        ))
+    if new_request:
+        parts.append(_context_block(
+            "NEW_REQUEST", new_request,
+            "The change being planned. Repeated in every part. Orientation only: "
+            "never emit a record sourced from it.",
+        ))
+    parts.append(
+        f"### CURRENT TASK\n"
+        f"Extract records from this part of the payload. This is the only source of records.\n"
+        f"PAYLOAD SECTIONS IN THIS PART: {section_label}\n\n"
+        f"{chunk}\n\n"
+        f"---\n"
+        f"CHUNK IDENTIFIER: PART {index} OF {total}"
+    )
+    return "".join(parts)
+
+
+def _pack_buckets(parts: list, budget_tokens: int) -> list:
+    """Group parts into buckets that each fit the per-call budget."""
+    buckets, current, used = [], [], 0
+    for part in parts:
+        part = truncate_to_tokens(part, budget_tokens)
+        cost = est_tokens(part)
+        if current and used + cost > budget_tokens:
+            buckets.append(current)
+            current, used = [], 0
+        current.append(part)
+        used += cost
+    if current:
+        buckets.append(current)
+    return buckets
+
+
+def _consolidate_round(client, model_config, parts: list, window: int) -> list:
+    """
+    One deduplication pass over the extracted records.
+
+    The filter is monotonically reducing by construction - its output is a subset
+    of its input lines - which is what lets the ladder above it terminate. The
+    previous implementation asked for a "concise summary", which paraphrases: it
+    could grow, and it destroyed the verbatim property that the Architect's
+    Contracts section depends on.
+    """
+    system_tokens = est_tokens(CONSOLIDATION_SYSTEM_PROMPT)
+    # Output cannot exceed input for a filter, so splitting the spare window in
+    # half between the two is always safe: input + output <= 2 * input <= spare.
+    spare = window - safety_margin(window) - system_tokens - 64
+    bucket_budget = max(MIN_FACTS_TOKENS, spare // 2)
+
+    buckets = _pack_buckets(parts, bucket_budget)
+    consolidated = []
+    for bi, bucket in enumerate(buckets):
+        bucket_text = "\n\n".join(bucket)
+        result = _single_llm_call(
+            client, model_config, CONSOLIDATION_SYSTEM_PROMPT, bucket_text,
+            f"Consolidation {bi + 1}/{len(buckets)}",
+            max_output_tokens=max(256, min(bucket_budget, est_tokens(bucket_text))),
+        )
+        consolidated.append(result)
+    return consolidated
+
+
+def _fit_facts_to_budget(client, model_config, parts: list,
+                         facts_budget: int, window: int) -> list:
+    """
+    Compress extracted records until they fit the merge's facts budget.
+
+    Termination is guaranteed three ways: the round cap, the no-progress break,
+    and the deterministic truncation that follows. The old code checked a fixed
+    60000-char threshold once, before consolidating, and never re-checked - so a
+    consolidation that failed to shrink the facts still went to the merge.
+    """
+    rounds = 0
+    while est_tokens("\n\n".join(parts)) > facts_budget and rounds < MAX_CONSOLIDATION_ROUNDS:
+        before = est_tokens("\n\n".join(parts))
+        parts = _consolidate_round(client, model_config, parts, window)
+        after = est_tokens("\n\n".join(parts))
+        rounds += 1
+        print(f"    ↳ Consolidation round {rounds}: {before} → {after} tokens "
+              f"(budget {facts_budget})", flush=True)
+        if after > before * MIN_REDUCTION_RATIO:
+            print("    ↳ Consolidation is not converging; stopping the ladder.", flush=True)
+            break
+
+    if est_tokens("\n\n".join(parts)) <= facts_budget:
+        return parts
+
+    # Deterministic tail. Always marked: the architect has to be able to tell
+    # "the codebase has no auth layer" from "the auth records fell off the end",
+    # because R9 and R10 are exactly the rules for reasoning under missing facts.
+    def marker(dropped: int) -> str:
+        return (
+            f"[TRUNCATED: {dropped} extracted-fact block(s) dropped — the records exceeded "
+            f"the {facts_budget}-token merge budget. CONTEXT IS INCOMPLETE: prefer an "
+            f"ASSUMED: bullet over asserting a fact you cannot see.]"
+        )
+
+    # Reserve what the marker actually costs, sized with the largest count it can
+    # carry. A constant here would be the same mistake as the old flat reserve:
+    # the marker is ~70 tokens, so a 48-token guess puts the result back over.
+    keep_budget = facts_budget - est_tokens(marker(len(parts))) - 2
+    kept, used, dropped = [], 0, 0
+    for part in parts:
+        cost = est_tokens(part)
+        if used + cost <= keep_budget:
+            kept.append(part)
+            used += cost
+        else:
+            dropped += 1
+    if not kept and parts:
+        kept = [truncate_to_tokens(parts[0], keep_budget)]
+        dropped = len(parts) - 1
+
+    print(f"    ⚠ Facts still over budget after consolidation: dropping {dropped} "
+          f"block(s) to fit {facts_budget} tokens.", flush=True)
+    kept.append(marker(dropped))
+    return kept
+
+
 def call_llm(client: httpx.Client, model_config, system_prompt: str, user_content: str, prior_context: str = "") -> str:
     """
     Send a synchronous chat completion request to the configured provider.
     Uses generic extraction prompts for chunks to prevent template deadlocks.
     Accepts model_config as either a string (legacy Ollama) or a dict with provider info.
+
+    Every call is sized by the budget solver rather than a flat reserve, so the
+    prompt plus its output cannot exceed CONTEXT_WINDOW. An infeasible window
+    raises BudgetInfeasible instead of silently overflowing the server.
     """
-    prior_tokens = len(prior_context) // CHARS_PER_TOKEN
-    available_tokens = CONTEXT_WINDOW - RESERVED_TOKENS - prior_tokens
-    
-    if available_tokens < 1000:
-        available_tokens = 1000
-
-    chunk_limit = min(available_tokens, TARGET_CHUNK_SIZE)
-    chunks = chunk_text(user_content, chunk_limit)
-
-    print(f"  ↳ Input: {len(user_content) + len(prior_context)} chars total. (Ctx: {CONTEXT_WINDOW}, Chunk Limit: {chunk_limit})", flush=True)
-
-    if len(chunks) == 1:
-        full_input = ""
-        if prior_context:
-            full_input += f"### PREVIOUS ANALYSES\n{prior_context}\n\n---\n\n"
-        full_input += f"### CURRENT TASK\n{user_content}"
-        
-        print(f"    ↳ Preparing Single-pass (Ingesting {len(full_input)} chars)...", flush=True)
-        return _single_llm_call(client, model_config, system_prompt, full_input)
-
-    print(f"    ↳ Processing into {len(chunks)} parts...", flush=True)
-    partial_results = []
-
-    # [FIX] A relaxed, generic system prompt for the chunks so it doesn't deadlock trying to fill out a template it doesn't have data for.
-    relaxed_chunk_system_prompt = (
-        "Fact extractor in a map-reduce pipeline. Records are merged verbatim and consumed by "
-        "an Architect, Engineer, Test Engineer and Auditor. Extract only: never summarise, "
-        "infer, judge or design.\n"
-        "\n"
-        "Output newline-separated records only — no preamble, headings, fences or blank lines. "
-        f"Max {EXTRACTION_RECORD_CAP}, in order of appearance, no repeats. Every line:\n"
-        "  TYPE | <path>:<line> | <verbatim payload> | <note, max 10 words>\n"
-        "Use `-` when no line number. Omit a type entirely if absent — never write 'none'.\n"
-        "\n"
-        "PAYLOAD SECTIONS IN THIS PART names the blocks this part covers "
-        "(PROJECT_HISTORY, DIRECTORY_STRUCTURE, SYMBOL_SKELETON, ...). Use it to pick the "
-        "record TYPE — the same string means different things in a symbol map and in chat history.\n"
-        "\n"
-        "ALWAYS capture:\n"
-        "  DEP    declared dependency/runtime/framework + version\n"
-        "  CMD    runnable script or command from a manifest\n"
-        "  TEST   test path, runner, assertion library, or fixture location\n"
-        "  CONFIG env var, feature flag, or config key the code reads\n"
-        "Capture when present, listing anything NEW_REQUEST references, calls or imports first. "
-        "You see one part of a larger payload, so you cannot trace what NEW_REQUEST reaches "
-        "through code you cannot see: when unsure, include it. A later step filters:\n"
-        "  PATH   existing source file + one-sentence responsibility\n"
-        "  SYM    exported function/class/type/constant, full signature\n"
-        "  DATA   persisted or returned field name + declared type\n"
-        "  AUTH   authority decision point, or untrusted input entry\n"
-        "  RULE   requirement, constraint or invariant stated in the text\n"
-        "  GAP    symbol/path/config referenced here but not defined here\n"
-        "\n"
-        "1. VERBATIM: copy signatures, names, types, versions, commands, paths "
-        "character-for-character. Never normalise or correct.\n"
-        "2. OBSERVED ONLY: no purpose, quality, intent, risk, or 'appears to'. Not written "
-        "in the chunk means it does not exist. No findings or recommendations.\n"
-        "3. One fact per record. Never merge two symbols, paths or commands.\n"
-        "4. Cut off at the chunk boundary: copy what is present, append ` ~TRUNCATED`.\n"
-        "\n"
-        "SYM | src/http/routes/search.ts:22 | export async function search(q: string, key: string): Promise<Result[]> | public entrypoint\n"
-        "CMD | package.json:8 | npm run test:unit | vitest, unit suite\n"
-        "AUTH | src/http/routes/search.ts:19 | req.headers['x-api-key'] | untrusted, keys the lookup\n"
-        "GAP | src/http/routes/search.ts:31 | resolveTenant | imported from ../auth, not in chunk\n"
-    )
-
-    # Every conditional record type is scoped to the request, but the request sits
-    # at the tail of the payload and would otherwise reach only the final chunk.
+    # Pivots. Both sit at the tail of the payload and neither survives extraction,
+    # so the map-reduce has to forward them by hand - the request to every chunk,
+    # both to the merge.
     new_request = extract_request(user_content)
+    mode = extract_mode(user_content)
+
+    # A single call is merge-shaped: real system prompt, full prior context, full
+    # answer budget. Size it against that, not against the extraction budget - a
+    # payload can clear the chunk limit and still not fit here, which is how the
+    # old single-call path overflowed on a tight window.
+    single_prior = _context_block(
+        "PREVIOUS ANALYSES", prior_context,
+        "What earlier passes established.",
+    ) if prior_context else ""
+    single_fixed = est_tokens(system_prompt) + est_tokens(single_prior) + est_tokens("### CURRENT TASK\n")
+    single_facts, single_answer = solve_merge_budget(CONTEXT_WINDOW, single_fixed)
+
+    # Chunk overhead is measured from the real assembled framing, with the ceiling
+    # record cap (the longest prompt), so the solved chunk can only be conservative.
+    steer = steering_extract(prior_context)
+    chunk_fixed = (
+        est_tokens(_extraction_system_prompt(EXTRACTION_RECORD_CAP))
+        + est_tokens(_build_chunk_prompt(steer, new_request, "X" * 64, 99, 99, ""))
+    )
+    chunk_tokens, record_cap, extraction_tokens = solve_extraction_budget(CONTEXT_WINDOW, chunk_fixed)
+
+    chunks = chunk_text(user_content, slice_tokens(chunk_tokens))
+
+    print(f"  ↳ Input: {len(user_content) + len(prior_context)} chars "
+          f"(~{est_tokens(user_content) + est_tokens(prior_context)} tok). "
+          f"Ctx {CONTEXT_WINDOW}, margin {safety_margin(CONTEXT_WINDOW)}.", flush=True)
+
+    if len(chunks) == 1 and est_tokens(user_content) <= single_facts:
+        full_input = single_prior + f"### CURRENT TASK\n{user_content}"
+        print(f"    ↳ Preparing Single-pass ({len(full_input)} chars; "
+              f"budget {single_facts} tok in / {single_answer} tok out)...", flush=True)
+        result = _single_llm_call(client, model_config, system_prompt, full_input,
+                                  max_output_tokens=single_answer)
+        failure = _check_llm_result(result, "Single-pass")
+        if failure:
+            raise ExtractionFailed("Single-pass", [failure], 1)
+        return result
+
+    print(f"    ↳ Processing into {len(chunks)} parts "
+          f"(chunk {chunk_tokens} tok, cap {record_cap} records, "
+          f"out {extraction_tokens} tok, fixed {chunk_fixed} tok)...", flush=True)
+
     if not new_request:
         print("  ⚠ No NEW_REQUEST/FINAL_BUILD_COMMAND found in the payload; "
               "chunks will be extracted without one.", flush=True)
 
-    # Held for the merge pass below, which sees extracted records rather than the
-    # payload and so cannot recover either pivot on its own.
-    mode = extract_mode(user_content)
+    # A relaxed, generic system prompt for the chunks so the extractor doesn't
+    # deadlock trying to fill out a template it has no data for.
+    chunk_system_prompt = _extraction_system_prompt(record_cap)
 
+    partial_results = []
+    failures = []
     for i, (chunk, section_label) in enumerate(chunks):
         part_label = f"Part {i + 1}/{len(chunks)}"
-
-        chunk_prompt = ""
-        if prior_context:
-            chunk_prompt += f"### PREVIOUS ANALYSES\n{prior_context}\n\n---\n\n"
-
-        if new_request:
-            chunk_prompt += (
-                f"### NEW_REQUEST\n"
-                f"The change being planned. Repeated in every part; do not extract records from it.\n\n"
-                f"{new_request}\n\n---\n\n"
-            )
-
-        chunk_prompt += (
-            f"### CURRENT TASK\n"
-            f"Extract records from this part of the payload.\n"
-            f"PAYLOAD SECTIONS IN THIS PART: {section_label}\n\n"
-            f"{chunk}\n\n"
-            f"---\n"
-            f"CHUNK IDENTIFIER: PART {i + 1} OF {len(chunks)}"
+        chunk_prompt = _build_chunk_prompt(
+            steer, new_request, section_label, i + 1, len(chunks), chunk
         )
-
         print(f"    ↳ Preparing {part_label} (Payload: {len(chunk_prompt)} chars)...", flush=True)
-        # Use the relaxed prompt for the chunks
-        result = _single_llm_call(client, model_config, relaxed_chunk_system_prompt, chunk_prompt,
-                                  part_label, max_output_tokens=EXTRACTION_MAX_TOKENS)
+        result = _single_llm_call(client, model_config, chunk_system_prompt, chunk_prompt,
+                                  part_label, max_output_tokens=extraction_tokens)
+        failure = _check_llm_result(result, part_label)
+        if failure:
+            # Stop at the first dead part rather than grinding through the rest.
+            # Every remaining part will hit the same unreachable server, and the
+            # merge cannot be trusted once any facts are missing.
+            failures.append(failure)
+            raise ExtractionFailed("Chunk extraction", failures, len(chunks))
         partial_results.append(result)
 
     print("    ↳ All parts finished. Starting Merge Pass...", flush=True)
-    
-    # Component 9: Recursive merge if facts are too large
-    merged_facts = "\n\n".join(partial_results)
-    if len(merged_facts) > 60000:
-        print(f"    ↳ Facts too large ({len(merged_facts)} chars). Running consolidation...", flush=True)
-        buckets = [partial_results[i:i+5] for i in range(0, len(partial_results), 5)]
-        consolidated = []
-        for bi, bucket in enumerate(buckets):
-            bucket_text = "\n\n".join(bucket)
-            consolidation_prompt = (
-                f"Consolidate these extracted facts into a concise summary. "
-                f"Remove duplicates. Keep only unique technical requirements.\n\n{bucket_text}"
-            )
-            result = _single_llm_call(client, model_config,
-                "You are a technical summarizer. Output concise bullet points only.",
-                consolidation_prompt, f"Consolidation {bi+1}/{len(buckets)}",
-                max_output_tokens=EXTRACTION_MAX_TOKENS)
-            consolidated.append(result)
-        partial_results = consolidated
-        print(f"    ↳ Consolidated {len(buckets)} buckets into {len(consolidated)} summaries.", flush=True)
-    
-    # [FIX] Now we apply your STRICT system prompt to the merged bullets
-    #
+
     # MODE and NEW_REQUEST have to be re-stated here. Neither survives extraction
     # by design: the chunk loop shows the request to every part but forbids
     # emitting records from it, and MODE is never shown to the extractor at all.
@@ -617,33 +1123,68 @@ def call_llm(client: httpx.Client, model_config, system_prompt: str, user_conten
     # it, and a merge pass given only records has no goal to design against -
     # architect.md R10 then fires and the pass returns "# BLOCKED" instead of a
     # design. Mirrors the framing the chunk loop uses so the two agree.
-    merge_prompt = ""
+    merge_head = ""
     if mode:
-        merge_prompt += f"### MODE\n{mode}\n\n---\n\n"
+        merge_head += f"### MODE\n{mode}\n\n---\n\n"
     if new_request:
-        merge_prompt += (
+        merge_head += (
             f"### NEW_REQUEST\n"
             f"The change being planned. The extracted facts below describe the "
             f"codebase it lands in.\n\n"
             f"{new_request}\n\n---\n\n"
         )
 
-    pivots = [name for name, value in (("MODE", mode), ("NEW_REQUEST", new_request)) if value]
+    # Prior analyses reach the merge in full. The chunks saw only a capped steering
+    # extract and were forbidden from extracting records out of it, so this is the
+    # only point at which an earlier pass's design is actually read - and the
+    # engineer's whole job is mapping the architect's design onto files.
+    if prior_context:
+        merge_head += _context_block(
+            "PREVIOUS ANALYSES", prior_context,
+            "What earlier passes established. Design against it; the extracted "
+            "facts below describe the codebase it lands in.",
+        )
+
+    pivots = [name for name, value in (("MODE", mode), ("NEW_REQUEST", new_request),
+                                       ("PREVIOUS ANALYSES", prior_context)) if value]
     sources = "these details"
     if pivots:
         sources += f" and the {' and '.join(pivots)} above"
 
-    merge_prompt += (
+    merge_head += (
         "You previously extracted technical details from a larger conversation in parts. "
         "Below are the raw extracted bullet points.\n\n"
         f"Using ONLY {sources}, write your final response. "
         "You MUST strictly adhere to your system prompt instructions and template formatting.\n\n"
     )
+
+    # The merge is where the document is actually written, and it was the one call
+    # with no budget check at all: the real system prompt, every extracted record,
+    # and an 8192-token answer target, unbounded against the window.
+    merge_fixed = (
+        est_tokens(system_prompt)
+        + est_tokens(merge_head)
+        + est_tokens("#### EXTRACTED FACTS (PART 99)\n\n") * len(partial_results)
+    )
+    facts_budget, answer_tokens = solve_merge_budget(CONTEXT_WINDOW, merge_fixed)
+    print(f"    ↳ Merge budget: {facts_budget} tok facts / {answer_tokens} tok answer "
+          f"(fixed {merge_fixed} tok)", flush=True)
+
+    partial_results = _fit_facts_to_budget(
+        client, model_config, partial_results, facts_budget, CONTEXT_WINDOW
+    )
+
+    merge_prompt = merge_head
     for i, part in enumerate(partial_results):
         merge_prompt += f"#### EXTRACTED FACTS (PART {i + 1})\n{part}\n\n"
 
     # Use the REAL system prompt here
-    return _single_llm_call(client, model_config, system_prompt, merge_prompt, "Merging Parts")
+    merged = _single_llm_call(client, model_config, system_prompt, merge_prompt, "Merging Parts",
+                              max_output_tokens=answer_tokens)
+    failure = _check_llm_result(merged, "Merge")
+    if failure:
+        raise ExtractionFailed("Merge pass", [failure], 1)
+    return merged
 
 
 def _extract_delta(line: str, is_ollama: bool):
@@ -689,6 +1230,45 @@ def _extract_delta(line: str, is_ollama: bool):
     except Exception:
         # Malformed chunk or internal proxy metadata
         return None, None, False
+
+
+def _extract_prompt_tokens(line: str, is_ollama: bool):
+    """
+    Pull the server's own count of how many prompt tokens it ingested, if present.
+
+    Ollama reports prompt_eval_count on the final chunk; llama.cpp reports
+    usage.prompt_tokens when stream_options.include_usage is set. This is the only
+    ground truth available about whether the budget held - est_tokens is an
+    estimate, and a server that truncates does so silently.
+    """
+    try:
+        if is_ollama:
+            return json.loads(line).get("prompt_eval_count")
+        if line.startswith("data: ") and line != "data: [DONE]":
+            return (json.loads(line[6:]).get("usage") or {}).get("prompt_tokens")
+    except Exception:
+        return None
+    return None
+
+
+def _check_prompt_budget(label: str, server_tokens, estimated: int, max_output: int):
+    """
+    Compare the estimate against what the server actually ingested.
+
+    Closes the loop the old code left open: a prompt over num_ctx was truncated by
+    the server with no error and no log line, and the only symptom was a document
+    written from evidence that never arrived.
+    """
+    if not server_tokens:
+        return
+    if server_tokens > CONTEXT_WINDOW * BUDGET_BREACH_FRACTION:
+        print(f"\n      ⚠ BUDGET BREACH [{label}]: server ingested {server_tokens} prompt tokens "
+              f"against num_ctx={CONTEXT_WINDOW} (estimated {estimated}). The prompt was "
+              f"truncated — treat this result as unreliable.", flush=True)
+    elif estimated and server_tokens > estimated * (1 + BUDGET_DRIFT_FRACTION):
+        print(f"\n      ↳ [budget] {label}: estimated {estimated} prompt tokens, server counted "
+              f"{server_tokens}. Headroom {CONTEXT_WINDOW - server_tokens - max_output}. "
+              f"Consider lowering CHARS_PER_TOKEN_DENSE.", flush=True)
 
 
 def _salvage_note(answer_tokens: list, reasoning_tokens: list) -> str:
@@ -757,8 +1337,15 @@ def _single_llm_call(client: httpx.Client, model_config, system_prompt: str, use
             "max_tokens": max_output_tokens,
             # llama.cpp honours template kwargs; ignored harmlessly by servers that don't.
             "chat_template_kwargs": {"enable_thinking": False},
+            # Makes the server report its real prompt token count, which is what
+            # _check_prompt_budget verifies the estimate against.
+            "stream_options": {"include_usage": True},
         }
         url = f"{base_url}/v1/chat/completions"
+
+    # What the budget solver assumed this call would cost. Measured the same way
+    # here as there, so a mismatch against the server points at the estimator.
+    estimated_prompt_tokens = est_tokens(system_prompt) + est_tokens(user_content)
 
     max_retries = 3
     for attempt in range(max_retries):
@@ -809,6 +1396,7 @@ def _single_llm_call(client: httpx.Client, model_config, system_prompt: str, use
                         
                         dot_count = 0
                         last_progress = time.time()
+                        server_prompt_tokens = None
                         for line in resp.iter_lines():
                             # Stability Protocol: only a STALLED stream is a failure.
                             # A stream that is producing tokens is doing its job however
@@ -825,6 +1413,14 @@ def _single_llm_call(client: httpx.Client, model_config, system_prompt: str, use
 
                             if not first_token_received.is_set():
                                 first_token_received.set()
+
+                            # Cheap substring guard first: the usage figure appears
+                            # on one line out of thousands, and parsing every line
+                            # twice would double the streaming cost for nothing.
+                            if server_prompt_tokens is None and (
+                                "prompt_eval_count" in line or '"usage"' in line
+                            ):
+                                server_prompt_tokens = _extract_prompt_tokens(line, is_ollama)
 
                             token, reasoning, done = _extract_delta(line, is_ollama)
                             if token is None and reasoning is None:
@@ -853,6 +1449,8 @@ def _single_llm_call(client: httpx.Client, model_config, system_prompt: str, use
                     
                     elapsed = time.time() - start_time
                     print(f" ✓ ({elapsed:.1f}s)", flush=True)
+                    _check_prompt_budget(label, server_prompt_tokens,
+                                         estimated_prompt_tokens, max_output_tokens)
                     return "".join(full_response)
 
                 except httpx.ReadTimeout:
@@ -1027,61 +1625,132 @@ def detect_project_toolchain(project_dir: str) -> str:
     return result
 
 
+# Declaration modifiers that may sit between the line start and the keyword.
+# The original pattern allowed only whitespace, so every `export function X` and
+# `export interface X` in a TypeScript codebase was invisible - which is how the
+# architect ended up reporting "Missing CONTEXT" for symbols that were right
+# there in the tree it had been given.
+_SYM_MODIFIERS = (
+    r"(?P<mods>(?:export\s+default\s+|export\s+|declare\s+|public\s+|private\s+"
+    r"|protected\s+|static\s+|abstract\s+|async\s+|pub\s+)*)"
+)
+_SYM_KEYWORDS = r"(?:class|def|function|interface|type|enum|struct|trait|impl|fn|func)"
+
+# `class Foo`, `export interface Bar`, `pub fn baz`, `export type Qux = ...`
+SIGNATURE_RE = re.compile(
+    rf"^\s*{_SYM_MODIFIERS}{_SYM_KEYWORDS}\s+(?P<name>[A-Za-z0-9_]+)",
+    re.MULTILINE,
+)
+# `export const Foo = () => ...` / `const bar = async function ...`. Modern TS and
+# React declare a large share of their public surface this way, so a skeleton that
+# only understands the `function` keyword misses most components and hooks.
+ARROW_RE = re.compile(
+    rf"^\s*{_SYM_MODIFIERS}(?:const|let|var)\s+(?P<name>[A-Za-z0-9_]+)\s*"
+    rf"(?::[^=\n]+)?=\s*(?:async\s+)?"
+    rf"(?:function\b|\([^)]*\)[^=\n]*=>|[A-Za-z0-9_]+\s*=>)",
+    re.MULTILINE,
+)
+IMPORT_RE = re.compile(
+    r"^\s*(?:import\s+.+|from\s+\S+\s+import\s+.+|#include\s+.+|require\(.+\))",
+    re.MULTILINE,
+)
+
+# ~7.5k tokens at the dense rate. The old 15000 was set against an 8k window; at
+# 64k it is affordable to give the architect a map it can actually navigate.
+MAX_SKELETON_CHARS = 30000
+SKELETON_SKIP_DIRS = {"node_modules", ".git", "venv", ".venv", "__pycache__",
+                      "dist", "build", "public", ".knowledge_base",
+                      ".cline_context", ".cline_logs"}
+SKELETON_EXTS = (".py", ".ts", ".js", ".tsx", ".jsx", ".go", ".rs", ".java",
+                 ".c", ".cpp", ".h")
+
+
+def _scan_symbols(content: str):
+    """Split a file's declarations into (exported, internal), preserving order."""
+    exported, internal = [], []
+    seen = set()
+    for pattern in (SIGNATURE_RE, ARROW_RE):
+        for m in pattern.finditer(content):
+            name = m.group("name")
+            if name in seen:
+                continue
+            seen.add(name)
+            mods = m.group("mods") or ""
+            (exported if ("export" in mods or "pub" in mods) else internal).append(name)
+    return exported, internal
+
+
+def _skeleton_block(rel_path: str, line_count: int, imports: list,
+                    exported: list, internal: list, full: bool) -> str:
+    """
+    Render one file's entry.
+
+    `full` includes imports and internal helpers; the slim form keeps only the
+    exported surface, which is what a design pass actually needs to reference.
+    """
+    block = [f"\n{rel_path} ({line_count} lines)"]
+    if full and imports:
+        block.append("  imports:")
+        for imp in imports[:5]:
+            block.append(f"    {imp.strip()}")
+        if len(imports) > 5:
+            block.append(f"    ... +{len(imports) - 5} more")
+    if exported:
+        block.append("  exports:")
+        block.extend(f"    - {s}" for s in exported)
+    if full and internal:
+        block.append("  internal:")
+        block.extend(f"    - {s}" for s in internal)
+    return "\n".join(block)
+
+
 def get_symbol_skeleton(project_dir: str) -> str:
-    """Matches class/function signatures AND imports to create a navigable project map."""
-    import re
-    skeleton = ["[PROJECT SYMBOL SKELETON]"]
-    signature_re = re.compile(
-        r"^\s*(?:class|def|function|interface|type|async\s+function)\s+([a-zA-Z0-9_]+)",
-        re.MULTILINE
-    )
-    import_re = re.compile(
-        r"^\s*(?:import\s+.+|from\s+\S+\s+import\s+.+|#include\s+.+|require\(.+\))",
-        re.MULTILINE
-    )
+    """
+    Build a navigable map of the project's declarations.
 
-    total_chars = 0
-    MAX_SKELETON_CHARS = 15000
-    SKIP_DIRS = {"node_modules", ".git", "venv", ".venv", "__pycache__",
-                 "dist", "build", "public", ".knowledge_base", ".cline_context", ".cline_logs"}
-
+    Two-tier under the size cap: the full map (imports + exported + internal) if
+    it fits, otherwise exports only. Truncating mid-walk - as this used to - drops
+    whole files off the end of the directory walk, so the architect silently never
+    learns that, say, engagement-card.tsx exists. Shedding detail before shedding
+    files keeps every file represented.
+    """
+    files_data = []
     for root, dirs, files in os.walk(project_dir):
-        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        dirs[:] = [d for d in dirs if d not in SKELETON_SKIP_DIRS]
+        for file in sorted(files):
+            if not file.endswith(SKELETON_EXTS):
+                continue
+            rel_path = os.path.relpath(os.path.join(root, file), project_dir)
+            try:
+                with open(os.path.join(root, file), "r", encoding="utf-8") as f:
+                    content = f.read()
+            except Exception:
+                continue
+            imports = IMPORT_RE.findall(content)
+            exported, internal = _scan_symbols(content)
+            if imports or exported or internal:
+                files_data.append((rel_path, content.count("\n") + 1,
+                                   imports, exported, internal))
 
-        for file in files:
-            if file.endswith((".py", ".ts", ".js", ".tsx", ".jsx", ".go", ".rs", ".java", ".c", ".cpp", ".h")):
-                rel_path = os.path.relpath(os.path.join(root, file), project_dir)
-                try:
-                    with open(os.path.join(root, file), "r", encoding="utf-8") as f:
-                        content = f.read()
+    for full in (True, False):
+        blocks = [_skeleton_block(*fd, full=full) for fd in files_data]
+        total = sum(len(b) for b in blocks)
+        if total <= MAX_SKELETON_CHARS:
+            header = "[PROJECT SYMBOL SKELETON]"
+            if not full:
+                header += "\n(exported symbols only - imports and internal helpers omitted for size)"
+            return "\n".join([header] + blocks)
 
-                    imports = import_re.findall(content)
-                    symbols = signature_re.findall(content)
-                    line_count = content.count('\n') + 1
-
-                    if imports or symbols:
-                        file_block = [f"\n{rel_path} ({line_count} lines)"]
-
-                        if imports:
-                            file_block.append("  imports:")
-                            for imp in imports[:5]:
-                                file_block.append(f"    {imp.strip()}")
-                            if len(imports) > 5:
-                                file_block.append(f"    ... +{len(imports)-5} more")
-
-                        if symbols:
-                            file_block.append("  defines:")
-                            for sym in symbols:
-                                file_block.append(f"    - {sym}")
-
-                        block_str = "\n".join(file_block)
-                        if total_chars + len(block_str) > MAX_SKELETON_CHARS:
-                            skeleton.append("\n... [Skeleton truncated]")
-                            return "\n".join(skeleton)
-                        skeleton.append(block_str)
-                        total_chars += len(block_str)
-                except Exception:
-                    continue
+    # Even exports-only overflows: keep as many whole files as fit, and say how
+    # many were dropped rather than trailing off mid-walk.
+    skeleton, total, kept = ["[PROJECT SYMBOL SKELETON]"], 0, 0
+    for block in [_skeleton_block(*fd, full=False) for fd in files_data]:
+        if total + len(block) > MAX_SKELETON_CHARS:
+            break
+        skeleton.append(block)
+        total += len(block)
+        kept += 1
+    skeleton.append(f"\n... [Skeleton truncated: {kept} of {len(files_data)} files shown]")
     return "\n".join(skeleton)
 
 
@@ -1092,6 +1761,7 @@ def run_distillation():
     print("=" * 60, flush=True)
 
     config = load_config()
+    _resolve_context_window(config)
     models = config.get("models", {})
     prompts = load_prompts(config)
     messages = load_conversation()
@@ -1329,7 +1999,28 @@ def run_distillation():
                 # Passes 3 and 4 only read the previous plans. They do not get chunked!
                 target_content = "Review the PREVIOUS ANALYSES provided above based strictly on your system role and required template format. Do not invent new features or write source code."
 
-            result = call_llm(client, model_config, prompt, target_content, prior_context)
+            try:
+                result = call_llm(client, model_config, prompt, target_content, prior_context)
+            except BudgetInfeasible as e:
+                # A misconfigured window is an operator problem, not something to
+                # paper over. Stop here with the arithmetic rather than writing a
+                # .clinerules assembled from a truncated pass.
+                update_status(f"Aborted: {e}")
+                print(f"\n  ❌ {pass_key}: {e}", flush=True)
+                print("  ↳ Aborting before .clinerules is written; nothing was overwritten.",
+                      flush=True)
+                raise SystemExit(2)
+            except ExtractionFailed as e:
+                # The chat review gate (!architect) polls _intermediate_path for
+                # this pass and shows whatever lands there. Writing the diagnostic
+                # to that same path turns a silent 680s wait into an immediate,
+                # accurate report of why the pass could not run.
+                update_status(f"Aborted: {e}")
+                _write_pass_failure(pass_key, model_config, e)
+                print(f"\n  ❌ {pass_key}: {e}", flush=True)
+                print("  ↳ Aborting before .clinerules is written; nothing was overwritten.",
+                      flush=True)
+                raise SystemExit(2)
             results[pass_key] = result
             previous_model_config = model_config
             print(f"  ✓ Complete ({len(result)} chars)")

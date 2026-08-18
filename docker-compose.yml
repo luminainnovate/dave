@@ -56,7 +56,11 @@ services:
     environment:
       - OLLAMA_HOST=http://host.docker.internal:11434
       - AGENT_CONFIG_PATH=/app/agent_config.json
-      - EXPERT_CTX=8192
+      # EXPERT_CTX is deliberately unset: distill.py falls back to
+      # agent_config.json's context_window, which is the single place the window
+      # is configured. The orchestrator still injects EXPERT_CTX when it launches
+      # a build, and that continues to win. The previous 8192 here silently
+      # overrode a 131072 config and over-committed every prompt.
     working_dir: /workspace
 
 networks:
