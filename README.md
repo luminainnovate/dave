@@ -70,7 +70,8 @@ Agent DAVE is a fully autonomous software factory starting from a conversation, 
     -   **Context Distillation:** Automatically compresses long conversations into actionable `.clinerules` through a 4-pass expert review (Architect, Engineer, Test, Safety).
     -   **Iterative Rebuilding:** Run `!build` on existing projects. The system uses **Situational Awareness** (reading your directory tree and README) to build on top of current progress instead of starting from scratch. You can continue to build on top of existing projects by running `!build` again in the same conversation. 
     -   **Noise Suppression:** Automatically bootstraps a `.gitignore` to prevent agents from being distracted by `node_modules`, `.git`, or virtual environments.
--   **Project Extraction (`!move`):** Automatically reconstructs entire project structures from chat conversations. It parses folder trees and code snippets, reconstructs them in a dedicated `conversations/` directory, and opens the result in VS Code.
+-   **Project Extraction (`!move`):** Automatically reconstructs entire project structures from chat conversations. It parses folder trees and code snippets, reconstructs them in a dedicated `conversations/` directory.
+    -   **Editor Stays Closed:** Nothing opens VS Code on its own. Pass `!move --open` when you want the folder opened, or set `BRAIN_OPEN_EDITOR=1` to make that the default.
     -   **Manual Tuning Safety:** If a project has already been initialized before by the build pipeline (`.clinerules` exists), `!move` will **skip** snippet extraction to protect your manual code changes/tuning from being reverted.
     -   **Smart Conflict Management:** The extraction system only updates files that have actually changed, keeping the structure up to date.
     -   **Clean Metadata:** Organizes logs into `.cline_logs/` and technical context into `.cline_context/`, keeping your project root clutter-free.
@@ -312,7 +313,7 @@ These are the shipped defaults. `DEFAULT_EXPERT_MODEL` is also set to `qwen3.8:2
 
 ```python
 EXPERT_CONFIG = {
-    "model": "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q3_K_XL",
+    "model": "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL",
     "provider": "llamacpp",
     "base_url": "http://localhost:8080",
 }

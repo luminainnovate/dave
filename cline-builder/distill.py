@@ -11,9 +11,12 @@ Manages Ollama model loading/unloading between passes for VRAM safety.
 Isolates context between passes using Markdown boundaries.
 """
 
+import collections
+import hashlib
 import json
 import os
 import re
+import sys
 import time
 import httpx
 import threading
@@ -63,8 +66,13 @@ SECTION_OPEN_RE = re.compile(
 
 # The request is the pivot every conditional record type hangs off, and it lives
 # at the tail of the payload - so without this it reaches only the final chunk.
-# ITERATIVE_REBUILD and FRESH_BUILD name it differently.
+# ITERATIVE_REBUILD and NEW_BUILD name it differently.
 REQUEST_TAGS = ("NEW_REQUEST", "FINAL_BUILD_COMMAND")
+
+# Assistant turns the orchestrator injects as command acknowledgements. They are
+# chat chrome, not conversation, and conversation_to_text drops them.
+RECEIPT_MARKERS = ("**Build pipeline triggered.**",)
+SUPERSEDED_MARKER = "(superseded - identical to a later response below)"
 
 # Output caps. Without these the server generates against the full context window,
 # so a chunk-extraction prompt that falls into a repetition loop runs for minutes
@@ -122,6 +130,15 @@ MIN_REDUCTION_RATIO = 0.9      # a round must remove >=10% or the ladder stops
 
 # Chunks get a capped steering extract of prior analyses; the merge gets it all.
 PRIOR_STEER_MAX_TOKENS = 400
+
+# Absolute ceiling on knowledge-base injection. The real limit is solved per run
+# by solve_kb_budget(); this only stops a very large window from pulling in an
+# unbounded KB just because it can.
+KB_MAX_CHARS = 100000
+
+# Marks where the knowledge base goes while the rest of the payload is still
+# being assembled. Never appears in a payload that reaches a model.
+KB_PLACEHOLDER = "\x00KNOWLEDGE_BASE\x00"
 
 # A server-reported prompt above this fraction of the window means it truncated.
 BUDGET_BREACH_FRACTION = 0.95
@@ -300,6 +317,51 @@ def solve_merge_budget(window: int, fixed_overhead: int) -> tuple[int, int]:
     return remainder - answer, answer
 
 
+def solve_addendum_budget(window: int, system_tokens: int, payload_tokens: int) -> int:
+    """
+    Characters still spendable on extra payload without leaving the single-pass path.
+
+    Shared by the two things that get appended to an already-assembled payload:
+    the knowledge base and the evidence read to clear a blocker. Both have the
+    same constraint - fit alongside the payload, the system prompt and the answer
+    the pass still has to write, inside one merge-shaped call.
+
+    ANSWER_MAX_TOKENS is held back on top of the solver's own answer reserve: the
+    engineer pass sees this payload plus the architect's full document as prior
+    context, and it has to fit too.
+    """
+    fixed = system_tokens + est_tokens("### CURRENT TASK\n")
+    try:
+        facts, _answer = solve_merge_budget(window, fixed)
+    except BudgetInfeasible:
+        return 0
+    return max(0, (facts - payload_tokens - ANSWER_MAX_TOKENS) * CHARS_PER_TOKEN_DENSE)
+
+
+def solve_kb_budget(window: int, system_tokens: int, payload_tokens: int) -> int:
+    """
+    Decide how many characters of knowledge base the window can still hold.
+
+    Returns a character budget for select_relevant_kb.
+
+    The KB cap used to be a 100000-character literal - 33k tokens at the dense
+    rate, over half of a 64k window - set with no reference to the budget solver
+    that sizes every other part of the call. It could not overflow the server,
+    because call_llm re-measures and falls back, but that fallback is the point:
+    a payload that fits one merge-shaped call is sent whole and loses nothing,
+    while anything larger goes through chunked extraction and reaches the merge
+    as capped bullet records. A large KB could therefore silently downgrade the
+    architect from the lossless path to the lossy one - the KB itself displacing
+    the codebase facts it was added to inform.
+
+    So the KB takes what is genuinely spare after the rest of the payload, and
+    nothing more. ANSWER_MAX_TOKENS is held back on top: the engineer pass sees
+    this same payload plus the architect's full answer as prior context, and it
+    has to fit single-pass too.
+    """
+    return min(KB_MAX_CHARS, solve_addendum_budget(window, system_tokens, payload_tokens))
+
+
 def _resolve_context_window(config: dict) -> None:
     """
     Settle the three-way disagreement about how big the window actually is.
@@ -372,14 +434,278 @@ def load_conversation() -> list:
 
 
 def conversation_to_text(messages: list) -> str:
-    """Flatten conversation messages into a readable text block."""
+    """
+    Flatten conversation messages into a readable text block.
+
+    Two reductions, both lossless for a design pass. PROJECT_HISTORY is the
+    single largest element of the payload - measured at 52% of it - and most of
+    what makes it large is not conversation.
+
+    Orchestrator receipts ("Build pipeline triggered") are UI acknowledgements
+    echoed back into the transcript. They repeat verbatim once per build and say
+    nothing about the design.
+
+    Superseded assistant turns are the other half: re-running !architect on a
+    refined prompt produces a byte-identical proposal often enough that the same
+    multi-kilobyte block lands in the history several times. The last occurrence
+    is kept in place - it sits nearest the current request - and earlier copies
+    collapse to a one-line marker, so the user turn they answered still has a
+    visible reply and the turn structure survives intact.
+    """
     parts = []
+    last_seen = {}
     for msg in messages:
         role = msg.get("role", "unknown").upper()
         content = msg.get("content", "")
-        if content.strip():
-            parts.append(f"[{role}]\n{content}")
+        if not content.strip():
+            continue
+        if role == "ASSISTANT" and any(m in content for m in RECEIPT_MARKERS):
+            continue
+        if role == "ASSISTANT":
+            key = hashlib.md5(content.encode("utf-8")).hexdigest()
+            if key in last_seen:
+                parts[last_seen[key]] = f"[{role}]\n{SUPERSEDED_MARKER}"
+            last_seen[key] = len(parts)
+        parts.append(f"[{role}]\n{content}")
     return "\n\n---\n\n".join(parts)
+
+
+# --- Blocker protocol ---------------------------------------------------------
+#
+# Every prompt defines a way for a pass to refuse. architect.md R10 emits a bare
+# two-line "# BLOCKED"; the other three emit "# 1. Blockers" with "- BLOCKER: ...
+# | NEEDS: ..." lines and, per their output contract, stop there.
+#
+# Nothing read any of it. A blocked architect was assembled into .clinerules
+# verbatim, every downstream pass then blocked on the missing specification, and
+# the build loop ran five full build/verify/safety iterations against a document
+# whose first heading was "# BLOCKED" - measured at four hours of GPU time on a
+# 27B model. Meanwhile the architect's stated need ("the actual mock data shapes,
+# service endpoint contracts") was sitting on the mounted volume, and the payload
+# was using 21k of a 52k budget, so there was room to simply show it the files.
+#
+# So a blocker is now a request, not an epitaph: resolve it once by reading what
+# the pass says it needs, and if it still cannot proceed, stop before writing
+# .clinerules rather than spending hours implementing a refusal.
+
+_ARCHITECT_BLOCKED_RE = re.compile(r"^#\s*BLOCKED\b", re.MULTILINE)
+_BLOCKER_LINE_RE = re.compile(r"^\s*-\s*BLOCKER:\s*(.+)$", re.MULTILINE)
+
+# A pass with nothing to report is told to emit "- none", but the only line shape
+# its template ever shows is "- BLOCKER: ...". Models resolve that ambiguity by
+# writing "- BLOCKER: - none" - a declaration of no blockers that reads as one, and
+# stops a run whose four passes all succeeded. Treat an empty statement as empty.
+_EMPTY_BLOCKER_RE = re.compile(
+    r"^[-\s*]*(none|n/?a|nil|null|empty|no blockers?)\b[\s.:|-]*"
+    r"(needs:\s*(none|n/?a|-)?\s*)?$",
+    re.IGNORECASE,
+)
+
+# Only the passes that receive the payload can be unblocked by reading files.
+# Passes 3 and 4 see a ~90-token instruction to review the earlier analyses, so
+# their blockers are always "the previous specification is missing" - which is
+# fixed by unblocking the pass upstream, not by handing them source code.
+EVIDENCE_RETRY_PASSES = ("architect", "engineer")
+EVIDENCE_MAX_FILES = 12
+EVIDENCE_MAX_FILE_CHARS = 24000
+BLOCKER_RESOLVE_MAX_TOKENS = 300
+
+
+def detect_blockers(result: str) -> list:
+    """
+    Return the blocker statements a pass emitted, or [] if it produced a design.
+
+    Handles both refusal shapes: the architect's bare "# BLOCKED" document and
+    the "- BLOCKER: ... | NEEDS: ..." bullets the other three use. "- none" is
+    the healthy value of that section and never matches, whether it arrives as a
+    bare bullet or stuffed into the BLOCKER slot.
+    """
+    if not result:
+        return []
+    blockers = [m.strip() for m in _BLOCKER_LINE_RE.findall(result)
+                if not _EMPTY_BLOCKER_RE.match(m.strip())]
+    if blockers:
+        return blockers
+    if _ARCHITECT_BLOCKED_RE.search(result):
+        # R10's second line carries the reason; fall back to the whole document
+        # if the model emitted the heading without one.
+        reasons = [ln.strip(" -\t") for ln in result.splitlines()
+                   if ln.strip().startswith("-") and ln.strip() != "- none"]
+        return reasons or [result.strip()]
+    return []
+
+
+BlockerPaths = collections.namedtuple("BlockerPaths", ("present", "absent"))
+
+
+def _looks_like_path(candidate: str) -> bool:
+    """True for something worth reporting as absent rather than as model noise."""
+    return "/" in candidate or re.search(r"\.[A-Za-z0-9]{1,5}$", candidate) is not None
+
+
+def resolve_blocker_paths(client, model_config, blockers: list,
+                          skeleton: str, project_dir: str) -> BlockerPaths:
+    """
+    Ask the model which workspace files would clear its own blockers.
+
+    A regex over the blocker text will not do this. The real one read "lacks the
+    actual mock data shapes, service endpoint contracts and frontend consumption
+    patterns" - concepts, not paths. Mapping those onto files is exactly what the
+    symbol skeleton plus a model is for, and the model is already resident.
+
+    Returns present paths and absent ones separately. Absence is an answer, not a
+    dead end: a pass that blocks on "is schema.ts already partially defined?" is
+    resolved by "that file does not exist", so discarding the miss sends the retry
+    back in knowing no more than it did the first time.
+    """
+    system = (
+        "You map blockers onto files. Given blockers from a design pass and a "
+        "symbol skeleton of the repository, list the repository-relative paths "
+        "whose CONTENTS would resolve them.\n"
+        f"Output at most {EVIDENCE_MAX_FILES} paths, one per line, nothing else. "
+        "No commentary, no bullets, no backticks. If no file would help, output "
+        "exactly: NONE"
+    )
+    user = (
+        "### BLOCKERS\n" + "\n".join(f"- {b}" for b in blockers) +
+        "\n\n### REPOSITORY SYMBOL SKELETON\n" + skeleton +
+        "\n\n### CURRENT TASK\nList the paths.\n"
+    )
+    raw = _single_llm_call(client, model_config, system, user, "Blocker resolution",
+                           max_output_tokens=BLOCKER_RESOLVE_MAX_TOKENS)
+    if _check_llm_result(raw, "Blocker resolution"):
+        print("  ⚠ Blocker resolution call failed; continuing without evidence.", flush=True)
+        return []
+
+    paths, absent = [], []
+    for line in raw.splitlines():
+        candidate = line.strip().strip("-*` \t")
+        if not candidate or candidate.upper() == "NONE" or " " in candidate:
+            continue
+        candidate = candidate.lstrip("./")
+        full = os.path.join(project_dir, candidate)
+        if os.path.isfile(full):
+            if candidate not in paths:
+                paths.append(candidate)
+        elif _looks_like_path(candidate) and candidate not in absent:
+            absent.append(candidate)
+        if len(paths) >= EVIDENCE_MAX_FILES:
+            break
+    return BlockerPaths(paths, absent[:EVIDENCE_MAX_FILES])
+
+
+def read_evidence(project_dir: str, paths: list, budget_chars: int,
+                  absent: list = None) -> str:
+    """
+    Read the requested files into a payload block, within budget.
+
+    Budget is shared across the set and spent in the order the resolver returned,
+    which is its own relevance ordering. A file that does not fit whole is
+    truncated with a marker rather than skipped - a partial interface is still
+    more than the skeleton's bare symbol name.
+
+    `absent` names files the pass asked for that do not exist. They are stated
+    explicitly and cost almost no budget, and they are worth a block on their own:
+    "that file is not there" can be the whole answer.
+    """
+    absent = absent or []
+    if (not paths and not absent) or budget_chars <= 0:
+        return ""
+
+    blocks, remaining, included, skipped = [], budget_chars, [], []
+    for rel in paths:
+        if remaining <= 0:
+            skipped.append(rel)
+            continue
+        try:
+            with open(os.path.join(project_dir, rel), "r", encoding="utf-8") as f:
+                content = f.read()
+        except Exception:
+            skipped.append(rel)
+            continue
+        cap = min(remaining, EVIDENCE_MAX_FILE_CHARS)
+        if len(content) > cap:
+            content = content[:cap] + f"\n... [truncated: {len(content) - cap} more characters]"
+        remaining -= len(content)
+        included.append(rel)
+        blocks.append(f'<file path="{rel}">\n{content}\n</file>')
+
+    if not blocks and not absent:
+        return ""
+    note = ""
+    if absent:
+        note += ("\n  <ABSENT>These paths do not exist in the workspace. That is "
+                 "the verified answer, not a gap: treat each as a file to be "
+                 "created from scratch, with no existing contents to reconcile. "
+                 "Do not block on them again: " + ", ".join(absent) + "</ABSENT>\n")
+    if skipped:
+        note += ("\n  <NOT_READ>Requested but not read (budget spent): "
+                 + ", ".join(skipped) + "</NOT_READ>\n")
+    print(f"  📎 Evidence: {len(included)} file(s), "
+          f"{budget_chars - remaining} chars — {', '.join(included) or 'none'}", flush=True)
+    if absent:
+        print(f"  📭 Confirmed absent: {', '.join(absent)}", flush=True)
+    return (
+        "\n\n  <REQUESTED_EVIDENCE>\n"
+        "  You previously reported these blockers. The findings below were read "
+        "from the workspace to resolve them. Design against them; do not block on "
+        "facts they now supply.\n"
+        + "\n".join(blocks) + note +
+        "  </REQUESTED_EVIDENCE>\n"
+    )
+
+
+def resolve_pass_blockers(client, pass_key: str, model_config, prompt: str,
+                          target_content: str, prior_context: str,
+                          symbol_skeleton: str, result: str) -> str:
+    """
+    Satisfy a pass's blockers once, and return whatever it produced afterwards.
+
+    Returns the original result unchanged when there is nothing to do, so the
+    caller can apply it unconditionally. Shared by the initial distillation and
+    by the re-plan, which is just as capable of asking for a file it cannot see.
+    """
+    blockers = detect_blockers(result)
+    if not (blockers and pass_key in EVIDENCE_RETRY_PASSES and symbol_skeleton):
+        return result
+
+    print(f"  🚧 {pass_key} reported {len(blockers)} blocker(s); "
+          f"resolving against the workspace...", flush=True)
+    for b in blockers:
+        print(f"     · {b[:150]}", flush=True)
+    try:
+        found = resolve_blocker_paths(
+            client, model_config, blockers, symbol_skeleton, "/workspace"
+        )
+    except Exception as e:
+        print(f"  ⚠ Blocker resolution errored ({e}); continuing.", flush=True)
+        found = BlockerPaths([], [])
+
+    budget = solve_addendum_budget(
+        CONTEXT_WINDOW, est_tokens(prompt),
+        est_tokens(target_content) + est_tokens(prior_context),
+    )
+    evidence = read_evidence("/workspace", found.present, budget, found.absent)
+    if not evidence:
+        print("  ⚠ No readable evidence identified for these blockers.", flush=True)
+        return result
+
+    print(f"  ↻ Re-running {pass_key} with the evidence attached "
+          f"(budget {budget} chars)...", flush=True)
+    update_status(f"Resolving blockers: {pass_key}")
+    try:
+        retried = call_llm(client, model_config, prompt,
+                           target_content + evidence, prior_context)
+    except (BudgetInfeasible, ExtractionFailed) as e:
+        print(f"  ⚠ Retry failed ({e}); keeping the blocked result.", flush=True)
+        return result
+
+    if detect_blockers(retried):
+        print(f"  ⚠ {pass_key} is still blocked after reading {len(found.present)} "
+              f"file(s) and confirming {len(found.absent)} absent.", flush=True)
+    else:
+        print(f"  ✓ {pass_key} unblocked by the evidence.", flush=True)
+    return retried
 
 
 def _resolve_model_config(model_entry, default_host: str = None) -> dict:
@@ -766,6 +1092,15 @@ def load_saved_pass(pass_key: str):
               flush=True)
         return None
 
+    if detect_blockers(content):
+        # Same reasoning one step further on. A blocked pass is a question, not a
+        # design; reusing it would make every later run inherit the same dead end
+        # without ever re-asking. Answer it in the file by hand and it resumes.
+        print(f"  ⚠ {path} still reports blockers; re-running the pass. "
+              f"(Edit the file to answer them and it will be reused as-is.)",
+              flush=True)
+        return None
+
     lines = content.split("\n")
     if lines and lines[0].startswith("# Distillation Intermediate:"):
         content = "\n".join(lines[1:])
@@ -1072,7 +1407,15 @@ def call_llm(client: httpx.Client, model_config, system_prompt: str, user_conten
           f"(~{est_tokens(user_content) + est_tokens(prior_context)} tok). "
           f"Ctx {CONTEXT_WINDOW}, margin {safety_margin(CONTEXT_WINDOW)}.", flush=True)
 
-    if len(chunks) == 1 and est_tokens(user_content) <= single_facts:
+    # Chunk COUNT must not decide this. TARGET_CHUNK_SIZE is a latency ceiling on
+    # how much one extraction call ingests, not a statement about what the window
+    # holds - so a 15k-token payload against a 64k window was being split into two
+    # chunks and sent through map-reduce for no reason. That path is lossy by
+    # construction: the merge sees only the extractor's capped bullet records, so
+    # any detail it failed to capture (the JSX the architect kept asking for) is
+    # gone before the design pass starts. If the whole payload fits one
+    # merge-shaped call, send it whole and skip extraction entirely.
+    if est_tokens(user_content) <= single_facts:
         full_input = single_prior + f"### CURRENT TASK\n{user_content}"
         print(f"    ↳ Preparing Single-pass ({len(full_input)} chars; "
               f"budget {single_facts} tok in / {single_answer} tok out)...", flush=True)
@@ -1350,14 +1693,18 @@ def _single_llm_call(client: httpx.Client, model_config, system_prompt: str, use
     max_retries = 3
     for attempt in range(max_retries):
         first_token_received = threading.Event()
-        
-        def heartbeat():
+
+        # `own_event` binds the Event object into the thread rather than closing
+        # over the name. The name is rebound at the top of the next attempt, and a
+        # closure would follow it: the previous heartbeat would start polling the
+        # NEW attempt's unset Event, never observe its own set(), and run for the
+        # life of the process. Two stalls meant two threads printing two unrelated
+        # elapsed counters into the same stream.
+        def heartbeat(own_event=first_token_received):
             start_wait = time.time()
-            while not first_token_received.is_set():
-                time.sleep(5)
-                if not first_token_received.is_set():
-                    elapsed = int(time.time() - start_wait)
-                    print(f"      ↳ [Waiting for LLM... {elapsed}s]", flush=True)
+            while not own_event.wait(5):
+                elapsed = int(time.time() - start_wait)
+                print(f"      ↳ [Waiting for LLM... {elapsed}s]", flush=True)
 
         heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
         heartbeat_thread.start()
@@ -1485,6 +1832,12 @@ def _single_llm_call(client: httpx.Client, model_config, system_prompt: str, use
             first_token_received.set()
             print(f"\n  ❌ Unexpected error: {e}")
             return f"[ERROR: {e}]"
+        finally:
+            # Belt and braces for the paths that return or continue without
+            # setting it, so no attempt can ever outlive itself and print over
+            # the next one. Runs on the success return too, which is correct.
+            first_token_received.set()
+            heartbeat_thread.join(timeout=6)
 
     return "[ERROR: Max retries exceeded]"
 
@@ -1506,7 +1859,7 @@ STOP_WORDS = {"the","a","an","is","it","to","and","or","of","in","on","for",
               "all","just","get","set","use","new","add","now","our","its"}
 
 
-def select_relevant_kb(kb_dir: str, instruction: str, max_chars: int = 100000) -> str:
+def select_relevant_kb(kb_dir: str, instruction: str, max_chars: int = KB_MAX_CHARS) -> str:
     """Score and select only relevant KB files based on keyword matching."""
     import glob
     import re
@@ -1580,6 +1933,76 @@ def select_relevant_kb(kb_dir: str, instruction: str, max_chars: int = 100000) -
     total = len(scored_files)
     print(f"  📖 KB Selection: {matched}/{total} files matched, {total_chars} chars injected (cap: {max_chars})", flush=True)
     return result
+
+
+# npm writes this into `scripts.test` when nothing is configured. Treating it as
+# a real suite would make the gate fail every project that never set one up.
+_NPM_TEST_PLACEHOLDER = "no test specified"
+
+
+def detect_test_command(project_dir: str) -> str:
+    """
+    The command that decides whether this project's tests pass, or "" if none.
+
+    Separate from detect_project_toolchain, which produces prose for a model to
+    read ("Test Runner: jest/vitest"). This has to be runnable by a shell, so it
+    resolves the ambiguity: a package.json test script is the project's own
+    answer to how it is tested, and beats any guess made from a marker file.
+
+    Returns "" freely. A project with no suite is not a project that should be
+    blocked from completing - it is one whose completion gate degrades to what
+    it was before, which the caller reports rather than hides.
+    """
+    def has(*names) -> bool:
+        return any(os.path.exists(os.path.join(project_dir, n)) for n in names)
+
+    pkg = os.path.join(project_dir, "package.json")
+    if os.path.isfile(pkg):
+        deps = {}
+        try:
+            with open(pkg, "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+            scripts = manifest.get("scripts", {})
+            deps = {**manifest.get("dependencies", {}),
+                    **manifest.get("devDependencies", {})}
+            test_script = str(scripts.get("test", "")).strip()
+            if test_script and _NPM_TEST_PLACEHOLDER not in test_script.lower():
+                return "npm test --silent"
+        except Exception:
+            pass
+
+        # No `test` script is not the same as no tests. The repo this was built
+        # against ships vitest.config.ts, a tests/ directory and vitest in
+        # devDependencies, and simply never wired up the npm alias - so a
+        # manifest-only check found nothing to gate on the one project that most
+        # needed gating. Fall through to the runner's own config and deps.
+        #
+        # Playwright is deliberately not used here even when present: it drives a
+        # real browser against a running server, which is a slow and flaky signal
+        # for a completion gate rather than a cheap and decisive one.
+        if has("vitest.config.ts", "vitest.config.js", "vitest.config.mts") or "vitest" in deps:
+            return "npx --no-install vitest run --reporter=dot"
+        if has("jest.config.ts", "jest.config.js", "jest.config.mjs") or "jest" in deps:
+            return "npx --no-install jest --ci"
+
+    if os.path.isfile(os.path.join(project_dir, "Cargo.toml")):
+        return "cargo test --quiet"
+    if os.path.isfile(os.path.join(project_dir, "go.mod")):
+        return "go test ./..."
+    if os.path.isfile(os.path.join(project_dir, "pom.xml")):
+        return "mvn -q test"
+    if any(os.path.isfile(os.path.join(project_dir, m))
+           for m in ("build.gradle", "build.gradle.kts")):
+        return "gradle test --quiet"
+
+    # Python has no manifest key for this, so go by what is there to collect. A
+    # manifest is not required: a directory of test_*.py files is a test suite
+    # whether or not anyone wrote a pyproject.toml.
+    for root, dirs, files in os.walk(project_dir):
+        dirs[:] = [d for d in dirs if d not in SKELETON_SKIP_DIRS]
+        if any(f.startswith("test_") and f.endswith(".py") for f in files):
+            return "python3 -m pytest -q"
+    return ""
 
 
 def detect_project_toolchain(project_dir: str) -> str:
@@ -1704,6 +2127,87 @@ def _skeleton_block(rel_path: str, line_count: int, imports: list,
     return "\n".join(block)
 
 
+BARE_FILES_HEADING = "\nfiles with no symbols at this detail level (present, listed for navigation):"
+
+
+def _render_skeleton(files_data: list, full: bool) -> tuple[list, str]:
+    """
+    Render every file, splitting out the ones that carry no detail.
+
+    In the exports-only tier a file whose declarations are all internal renders
+    as a bare `path (N lines)` header - measured at 110 of 255 entries, 23% of
+    the skeleton, spent on three lines each to say a file exists. Those collapse
+    into one comma-separated roll-up.
+
+    They are listed rather than dropped: prune_tree_against_skeleton removes
+    from the directory tree everything the skeleton covers, so a file that fell
+    out of both would disappear from the payload entirely.
+    """
+    blocks, bare = [], []
+    for rel_path, line_count, imports, exported, internal in files_data:
+        block = _skeleton_block(rel_path, line_count, imports, exported, internal, full)
+        if "\n" in block.strip():
+            blocks.append(block)
+        else:
+            bare.append(rel_path)
+    footer = f"{BARE_FILES_HEADING}\n{', '.join(bare)}\n" if bare else ""
+    return blocks, footer
+
+
+def skeleton_paths(skeleton: str) -> set:
+    """
+    Every project-relative path the skeleton accounts for.
+
+    Covers both renderings: the per-file entries and the bare roll-up footer.
+    """
+    paths = set(re.findall(r"^(\S+) \(\d+ lines\)$", skeleton, re.MULTILINE))
+    footer = skeleton.split(BARE_FILES_HEADING.strip())
+    if len(footer) > 1:
+        paths.update(p.strip() for p in footer[-1].split(",") if p.strip())
+    return paths
+
+
+# tree(1) pads with non-breaking spaces, not plain ones, so both are accepted
+# here - matching only U+0020 silently reconstructs nothing and prunes nothing.
+_TREE_LINE_RE = re.compile("^((?:[\u2502 \u00a0][ \u00a0]{3})*)(?:[\u251c\u2514]\u2500\u2500 )(.+)$")
+
+
+def prune_tree_against_skeleton(tree_output: str, covered: set) -> str:
+    """
+    Drop from the directory tree every file the symbol skeleton already names.
+
+    The two blocks were assembled independently and overlap almost completely -
+    94% of the tree's code files also appear in the skeleton, with their full
+    relative paths - so the tree was spending ~3k tokens restating them.
+
+    Paths are reconstructed from tree's indentation rather than matched on
+    basename, so `src/a/index.ts` is never dropped because `src/b/index.ts`
+    happens to be in the skeleton. Directory lines always survive: the shape of
+    the tree is the part the skeleton does not carry.
+    """
+    if not covered:
+        return tree_output
+
+    stack, kept, dropped = [], [], 0
+    for line in tree_output.splitlines():
+        m = _TREE_LINE_RE.match(line)
+        if not m:
+            kept.append(line)
+            continue
+        depth = len(m.group(1)) // 4
+        del stack[depth:]
+        stack.append(m.group(2).strip())
+        if "/".join(stack) in covered:
+            dropped += 1
+            continue
+        kept.append(line)
+
+    if dropped:
+        kept.append(f"\n[{dropped} source files omitted here - "
+                    f"they appear in SYMBOL_SKELETON with full paths]")
+    return "\n".join(kept)
+
+
 def get_symbol_skeleton(project_dir: str) -> str:
     """
     Build a navigable map of the project's declarations.
@@ -1733,25 +2237,47 @@ def get_symbol_skeleton(project_dir: str) -> str:
                                    imports, exported, internal))
 
     for full in (True, False):
-        blocks = [_skeleton_block(*fd, full=full) for fd in files_data]
-        total = sum(len(b) for b in blocks)
+        blocks, footer = _render_skeleton(files_data, full)
+        total = sum(len(b) for b in blocks) + len(footer)
         if total <= MAX_SKELETON_CHARS:
             header = "[PROJECT SYMBOL SKELETON]"
             if not full:
                 header += "\n(exported symbols only - imports and internal helpers omitted for size)"
-            return "\n".join([header] + blocks)
+            return "\n".join([header] + blocks + ([footer] if footer else []))
 
     # Even exports-only overflows: keep as many whole files as fit, and say how
     # many were dropped rather than trailing off mid-walk.
-    skeleton, total, kept = ["[PROJECT SYMBOL SKELETON]"], 0, 0
-    for block in [_skeleton_block(*fd, full=False) for fd in files_data]:
+    blocks, footer = _render_skeleton(files_data, full=False)
+    skeleton, total, kept = ["[PROJECT SYMBOL SKELETON]"], len(footer), 0
+    for block in blocks:
         if total + len(block) > MAX_SKELETON_CHARS:
             break
         skeleton.append(block)
         total += len(block)
         kept += 1
-    skeleton.append(f"\n... [Skeleton truncated: {kept} of {len(files_data)} files shown]")
+    skeleton.append(f"\n... [Skeleton truncated: {kept} of {len(blocks)} detailed entries shown]")
+    if footer:
+        skeleton.append(footer)
     return "\n".join(skeleton)
+
+
+# Chat commands that launch a pipeline run. Any of them can appear alone or with
+# a real instruction attached; only the attached text is a design request.
+TRIGGER_COMMANDS = ("!build", "!architect", "!approve", "!review")
+_TRIGGER_SYNTAX_RE = re.compile(
+    r"!build|!architect|!approve|!review|--repo\s+\S+|--kb\s+\S+|--open",
+    flags=re.IGNORECASE,
+)
+
+
+def _is_trigger_message(content: str) -> bool:
+    lowered = (content or "").lower()
+    return any(cmd in lowered for cmd in TRIGGER_COMMANDS)
+
+
+def strip_trigger_syntax(content: str) -> str:
+    """Return what the user actually said, with command tokens and flags removed."""
+    return _TRIGGER_SYNTAX_RE.sub("", content or "").strip()
 
 
 def run_distillation():
@@ -1780,6 +2306,10 @@ def run_distillation():
     has_git = os.path.exists("/workspace/.git")
     has_code = any(f for f in os.listdir("/workspace") if f not in [".cline_context", ".cline_logs", ".knowledge_base", "conversation.json"])
     is_rebuild = os.path.exists(OUTPUT_PATH) or has_git or has_code
+    # Set in the rebuild branch only. The blocker-resolution retry maps blockers
+    # onto files through it, so a fresh build - which has no code to read - leaves
+    # it empty and skips the retry rather than raising.
+    symbol_skeleton = ""
     
     if is_rebuild:
         status_text = "ALREADY PARTIALLY IMPLEMENTED" if not has_git else "EXISTING REPOSITORY DETECTED"
@@ -1794,32 +2324,47 @@ def run_distillation():
             tree_output = "(Could not generate directory tree)"
             
         symbol_skeleton = get_symbol_skeleton("/workspace")
+        tree_output = prune_tree_against_skeleton(
+            tree_output, skeleton_paths(symbol_skeleton)
+        )
         toolchain_info = detect_project_toolchain("/workspace")
         
         latest_instruction = ""
         user_directives = ""
         for msg in reversed(messages):
-            if msg.get("role") == "user" and "!build" in msg.get("content", "").lower():
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content", "")
+            if not _is_trigger_message(content):
+                continue
+            directives = strip_trigger_syntax(content)
+            if not directives:
+                # A bare trigger (`!approve`, `!build` with no text) carries no
+                # design intent. Handing it over as NEW_REQUEST is how the
+                # architect ends up blocking on "this is a build directive, not a
+                # design request", so keep walking back to the real instruction.
+                continue
+            latest_instruction = content
+            user_directives = f"\n  <USER_DIRECTIVES>\n{directives}\n  </USER_DIRECTIVES>\n"
+            break
+
+        if not latest_instruction:
+            # No trigger message carried text: fall back to the most recent user
+            # message that says something, skipping bare commands.
+            for msg in reversed(messages):
+                if msg.get("role") != "user":
+                    continue
                 content = msg.get("content", "")
-                latest_instruction = content
-                # Extract directives: remove !build and flags
-                import re
-                directives = re.sub(r'!build|--repo\s+\S+|--kb\s+\S+', '', content, flags=re.IGNORECASE).strip()
-                if directives:
-                    user_directives = f"\n  <USER_DIRECTIVES>\n{directives}\n  </USER_DIRECTIVES>\n"
-                break
-                
-        if not latest_instruction and messages:
-            latest_instruction = messages[-1].get("content", "")
+                if strip_trigger_syntax(content):
+                    latest_instruction = content
+                    break
 
         readme_content = read_workspace_file("README.md")
         issues_content = read_workspace_file(".cline_context/.build_issues.md")
         
-        kb_content = ""
-        kb_dir = "/workspace/.knowledge_base"
-        if os.path.exists(kb_dir):
-            kb_content = select_relevant_kb(kb_dir, latest_instruction)
-            
+        # The KB is selected last, once everything it competes with has been
+        # measured - see solve_kb_budget. A placeholder holds its position so the
+        # block still lands between PROJECT_HISTORY and PROJECT_OVERVIEW.
         conversation_text = (
             f"<SITUATIONAL_AWARENESS>\n"
             f"  <MODE>ITERATIVE_REBUILD</MODE>\n"
@@ -1843,9 +2388,8 @@ def run_distillation():
             f"  </PROJECT_HISTORY>\n\n"
         )
         
-        if kb_content:
-            conversation_text += f"\n<BEST_PRACTICES_KNOWLEDGE_BASE>\n{kb_content}\n</BEST_PRACTICES_KNOWLEDGE_BASE>\n\n"
-        
+        conversation_text += KB_PLACEHOLDER
+
         if readme_content:
             conversation_text += f"  <PROJECT_OVERVIEW>\n```markdown\n{readme_content}\n```\n  </PROJECT_OVERVIEW>\n\n"
             
@@ -1862,6 +2406,29 @@ def run_distillation():
             f"  <NEW_REQUEST>\n{latest_instruction}\n  </NEW_REQUEST>\n"
             f"</PROJECT_DATA>"
         )
+
+        # Everything else is now assembled and measurable, so the KB can be given
+        # exactly the room that is left rather than a fixed 100k characters.
+        kb_dir = "/workspace/.knowledge_base"
+        kb_block = ""
+        if os.path.exists(kb_dir):
+            payload_tokens = est_tokens(conversation_text.replace(KB_PLACEHOLDER, ""))
+            system_tokens = max(
+                (est_tokens(prompts.get(k, "")) for k in ("architect", "engineer")),
+                default=0,
+            )
+            kb_budget = solve_kb_budget(CONTEXT_WINDOW, system_tokens, payload_tokens)
+            print(f"  📖 KB budget: {kb_budget} chars "
+                  f"(window {CONTEXT_WINDOW}, payload ~{payload_tokens} tok, "
+                  f"system ~{system_tokens} tok)", flush=True)
+            if kb_budget <= 0:
+                print("  📖 KB: no room left in the window; skipping.", flush=True)
+            else:
+                kb_content = select_relevant_kb(kb_dir, latest_instruction, kb_budget)
+                if kb_content:
+                    kb_block = (f"\n<BEST_PRACTICES_KNOWLEDGE_BASE>\n{kb_content}\n"
+                                f"</BEST_PRACTICES_KNOWLEDGE_BASE>\n\n")
+        conversation_text = conversation_text.replace(KB_PLACEHOLDER, kb_block)
     else:
         print(f"\n✨ Fresh build detected for {PROJECT_NAME}. Assembling historical context...", flush=True)
         
@@ -1883,7 +2450,7 @@ def run_distillation():
 
         conversation_text = (
             f"<SITUATIONAL_AWARENESS>\n"
-            f"  <MODE>FRESH_BUILD</MODE>\n"
+            f"  <MODE>NEW_BUILD</MODE>\n"
             f"  <STATUS>This is a NEW PROJECT START. Establish the foundational structure and implementation plan.</STATUS>\n"
             f"  <DIRECTIVES>\n"
             f"    1. [P0] FOUNDATION: Read the 'PROJECT_HISTORY' to understand the core vision, tech stack, and requirements.\n"
@@ -2021,6 +2588,11 @@ def run_distillation():
                 print("  ↳ Aborting before .clinerules is written; nothing was overwritten.",
                       flush=True)
                 raise SystemExit(2)
+
+            result = resolve_pass_blockers(
+                client, pass_key, model_config, prompt,
+                target_content, prior_context, symbol_skeleton, result,
+            )
             results[pass_key] = result
             previous_model_config = model_config
             print(f"  ✓ Complete ({len(result)} chars)")
@@ -2040,17 +2612,45 @@ def run_distillation():
         # if previous_model_config:
         #     unload_model(client, previous_model_config)
 
+    still_blocked = {k: detect_blockers(v) for k, v in results.items()}
+    still_blocked = {k: v for k, v in still_blocked.items() if v}
+
     # A partial run (the review gate) must not overwrite .clinerules with an
     # incomplete ruleset - the approve run assembles the real one.
     missing = [key for key, _ in all_passes if key not in results]
     if missing:
         update_status("Awaiting review.")
         print(f"\n⏸️  Partial distillation complete. Skipped: {', '.join(missing)}", flush=True)
+        if still_blocked:
+            # Surfaced, not fatal: the whole point of the review gate is to put
+            # this in front of a human, who can answer the blocker directly in
+            # chat and re-run. Exiting non-zero here would kill that loop.
+            print(f"  ⚠ Still blocked: {', '.join(still_blocked)} — the review "
+                  f"below explains what is missing.", flush=True)
         print(f"  ↳ .clinerules NOT written; review {_intermediate_path(passes[0][0])} then approve.", flush=True)
         print("=" * 60, flush=True)
         print("✅ Review gate reached", flush=True)
         print("=" * 60, flush=True)
         return
+
+    # A blocked pass is a refusal, and implementing a refusal is the single most
+    # expensive thing this pipeline can do: the last time it happened the build
+    # loop spent four hours across five iterations against a .clinerules whose
+    # architecture section read "# BLOCKED". Stop where BudgetInfeasible and
+    # ExtractionFailed stop - before anything is overwritten.
+    if still_blocked:
+        update_status("Aborted: unresolved blockers.")
+        print("\n  ❌ Distillation is blocked and could not be resolved from the "
+              "workspace.", flush=True)
+        for key, blockers in still_blocked.items():
+            print(f"\n  [{key}]", flush=True)
+            for b in blockers:
+                print(f"    · {b}", flush=True)
+        print("\n  ↳ Aborting before .clinerules is written; nothing was overwritten.",
+              flush=True)
+        print("  ↳ Supply the missing facts in chat and re-run !build, or use "
+              "!architect to iterate on the design first.", flush=True)
+        raise SystemExit(3)
 
     print(f"\n📝 Writing {OUTPUT_PATH}", flush=True)
     update_status("Assembling .clinerules...")
@@ -2059,11 +2659,200 @@ def run_distillation():
     with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
         f.write(clinerules)
 
+    # Baseline for the re-plan trigger: from here on, growth in .build_issues.md
+    # is growth the current plan has not accounted for.
+    write_replan_state(_issues_bytes(), 0)
+
     update_status("Distillation complete.")
     print(f"  ✓ Written ({len(clinerules)} chars)", flush=True)
     print("=" * 60, flush=True)
     print("✅ Distillation complete", flush=True)
     print("=" * 60, flush=True)
+
+
+# --- Re-plan on evidence ------------------------------------------------------
+#
+# Distillation runs once, in Phase 1, and the build loop then re-runs the same
+# .clinerules against the same objective up to max_build_iterations times. So a
+# design flaw discovered on iteration 2 gets patched tactically three more times
+# and is never redesigned: .build_issues.md accumulates the evidence, but the
+# architect only ever sees it on the *next* !build.
+#
+# This closes that loop. When the issues file has grown materially since the plan
+# was written, the design-bearing passes re-run against the current tree, the
+# current skeleton and the accumulated issues, and .clinerules is rebuilt. One
+# re-plan costs roughly one pass; the failure it replaces costs a whole build.
+
+BUILD_ISSUES_PATH = "/workspace/.cline_context/.build_issues.md"
+REPLAN_STATE_PATH = os.path.join(INTERMEDIATE_DIR, ".replan_state.json")
+
+# Both design passes re-run, not just the architect. The roadmap is a file-level
+# mapping *of* the architecture, so revising the architecture and keeping the old
+# roadmap produces a .clinerules that disagrees with itself - the expensive half
+# of the cost buys the only version that is coherent. Narrow this to
+# ["architect"] in agent_config.json if the GPU time matters more.
+DEFAULT_REPLAN_PASSES = ("architect", "engineer")
+
+# Carried forward rather than re-run: these two never see the codebase, so the
+# build has taught them nothing new.
+REPLAN_CARRY_PASSES = ("test_engineer", "safety")
+
+
+def _issues_bytes() -> int:
+    try:
+        return os.path.getsize(BUILD_ISSUES_PATH)
+    except OSError:
+        return 0
+
+
+def read_replan_state() -> dict:
+    try:
+        with open(REPLAN_STATE_PATH, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        return {"issues_bytes": int(state.get("issues_bytes", 0)),
+                "replans": int(state.get("replans", 0))}
+    except Exception:
+        return {"issues_bytes": 0, "replans": 0}
+
+
+def write_replan_state(issues_bytes: int, replans: int) -> None:
+    try:
+        os.makedirs(os.path.dirname(REPLAN_STATE_PATH), exist_ok=True)
+        with open(REPLAN_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump({"issues_bytes": issues_bytes, "replans": replans}, f)
+    except Exception as e:
+        print(f"  ⚠ Could not record re-plan state: {e}", flush=True)
+
+
+def replan_due(growth_threshold: int, max_replans: int) -> tuple:
+    """
+    Decide whether the plan has fallen far enough behind reality to redo it.
+
+    Returns (due, reason).
+
+    The trigger is *growth* since the plan was last written, not absolute size. A
+    large issues file that has stopped growing describes problems already being
+    worked through; one that keeps growing describes a plan that is not matching
+    what the code is doing.
+    """
+    state = read_replan_state()
+    if max_replans <= 0:
+        return False, "re-planning disabled (max_replans=0)"
+    if state["replans"] >= max_replans:
+        return False, f"re-plan budget spent ({state['replans']}/{max_replans})"
+
+    growth = _issues_bytes() - state["issues_bytes"]
+    if growth < growth_threshold:
+        return False, (f"issues grew {growth}B since the plan "
+                       f"(threshold {growth_threshold}B)")
+    return True, (f"issues grew {growth}B since the plan "
+                  f"(threshold {growth_threshold}B)")
+
+
+ISSUES_PLACEHOLDER = "\x00BUILD_ISSUES\x00"
+
+
+def build_replan_payload(previous: dict, new_request: str,
+                         system_tokens: int = 0) -> str:
+    """
+    Assemble the evidence for a revision: what was planned, what happened, what
+    the code looks like now.
+
+    MODE stays ITERATIVE_REBUILD rather than becoming a new value. architect.md's
+    R7 and R8 are mutually exclusive and it is told exactly one is active for the
+    current MODE, so an unrecognised mode leaves both inactive and the output
+    contract undefined. A re-plan of a partially-built project is a rebuild; the
+    revision framing goes in its own block instead.
+    """
+    tree = "(Could not generate directory tree)"
+    try:
+        import subprocess
+        tree = subprocess.check_output(
+            ["tree", "/workspace", "-I",
+             "node_modules|.git|venv|.venv|.cline_context|.cline_logs|__pycache__|dist|build|public|.knowledge_base"],
+            text=True, stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+    skeleton = get_symbol_skeleton("/workspace")
+    tree = prune_tree_against_skeleton(tree, skeleton_paths(skeleton))
+    toolchain = detect_project_toolchain("/workspace")
+
+    issues = ""
+    if os.path.exists(BUILD_ISSUES_PATH):
+        try:
+            with open(BUILD_ISSUES_PATH, "r", encoding="utf-8") as f:
+                issues = f.read().strip()
+        except Exception:
+            pass
+
+    payload = (
+        "<SITUATIONAL_AWARENESS>\n"
+        "  <MODE>ITERATIVE_REBUILD</MODE>\n"
+        "  <STATUS>A build against your PREVIOUS_PLAN is in progress and has run "
+        "into the problems recorded in BUILD_ISSUES. You are revising that plan, "
+        "not starting one.</STATUS>\n"
+        "  <DIRECTIVES>\n"
+        "    1. [P0] REVISE: Keep every part of PREVIOUS_PLAN that BUILD_ISSUES "
+        "does not contradict. Change only what the evidence forces.\n"
+        "    2. [P0] EVIDENCE: Treat BUILD_ISSUES as fact. It is what happened "
+        "when the previous plan was executed, including harness test results.\n"
+        "    3. [P0] CURRENT_STATE: DIRECTORY_STRUCTURE and SYMBOL_SKELETON are "
+        "regenerated as of now and already include work completed so far.\n"
+        "    4. [P0] NO_RESTART: Work already built and not implicated in "
+        "BUILD_ISSUES stands. Do not plan to rewrite it.\n"
+        "    5. [P1] SCOPE: NEW_REQUEST is unchanged. Deliver it, adjusted for "
+        "what execution has shown to be wrong.\n"
+        "  </DIRECTIVES>\n"
+        "</SITUATIONAL_AWARENESS>\n\n"
+        "<PROJECT_DATA>\n"
+        f"  <NAME>{PROJECT_NAME}</NAME>\n"
+    )
+    for key in ("architect", "engineer"):
+        if previous.get(key):
+            payload += (f"  <PREVIOUS_PLAN source=\"{key}\">\n"
+                        f"{previous[key]}\n  </PREVIOUS_PLAN>\n\n")
+    # Always emitted, even when empty. The directives above tell the model to
+    # treat BUILD_ISSUES as fact and to preserve whatever it does not contradict,
+    # so omitting the block entirely would leave those instructions pointing at
+    # nothing. An explicit "none recorded" is a fact it can act on.
+    payload += ISSUES_PLACEHOLDER
+    payload += (
+        f"  <DIRECTORY_STRUCTURE>\n```\n{tree}\n```\n  </DIRECTORY_STRUCTURE>\n\n"
+        f"  <SYMBOL_SKELETON>\n{skeleton}\n  </SYMBOL_SKELETON>\n\n"
+    )
+    if toolchain:
+        payload += f"  {toolchain}\n\n"
+    payload += f"  <NEW_REQUEST>\n{new_request}\n  </NEW_REQUEST>\n</PROJECT_DATA>"
+
+    if not issues:
+        return payload.replace(ISSUES_PLACEHOLDER,
+                               "  <BUILD_ISSUES>none recorded</BUILD_ISSUES>\n\n")
+
+    # .build_issues.md only ever grows, and every re-plan appends the gate output
+    # that triggered it, so on a long build it is the one part of this payload
+    # with no natural bound. Left uncapped it would eventually push the re-plan
+    # off the single-pass path and into chunked extraction - the same silent
+    # downgrade solve_kb_budget exists to prevent.
+    #
+    # The tail is kept rather than the head: the most recent failures are the
+    # ones the revision has to answer.
+    budget = solve_addendum_budget(
+        CONTEXT_WINDOW, system_tokens,
+        est_tokens(payload.replace(ISSUES_PLACEHOLDER, "")),
+    )
+    if len(issues) > budget > 0:
+        dropped = len(issues) - budget
+        issues = (f"[{dropped} characters of older issues elided; the most recent "
+                  f"are below]\n...\n" + issues[-budget:])
+        print(f"  ↳ Build issues clipped to the last {budget} chars "
+              f"({dropped} elided).", flush=True)
+    elif budget <= 0:
+        issues = "[build issues omitted: no room left in the context window]"
+
+    return payload.replace(ISSUES_PLACEHOLDER,
+                           f"  <BUILD_ISSUES>\n{issues}\n  </BUILD_ISSUES>\n\n")
 
 
 def assemble_clinerules(results: dict, config: dict, messages: list) -> str:
@@ -2091,10 +2880,33 @@ def assemble_clinerules(results: dict, config: dict, messages: list) -> str:
         "> Auto-generated by Multi-Agent Distillation Pipeline",
         f"> Timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}",
         "",
-        "## ⚠️ CORE DIRECTIVES (High Priority)",
-        "The following requirements are non-negotiable and must be prioritized over all other implementation details:",
-        "",
     ]
+
+    # The plan comes first.
+    #
+    # This document used to open with the test and safety passes under a "CORE
+    # DIRECTIVES (High Priority)" banner, followed by twenty operational rules,
+    # and only then the architecture and the roadmap. That inverted the actual
+    # priority twice over: the design the pipeline exists to produce was the last
+    # thing the agent read, and the two passes promoted above it are the two that
+    # never see the codebase - they receive a ~90-token instruction to review the
+    # earlier analyses and nothing else. They are commentary on the plan, so they
+    # now sit after it, as gates the plan has to satisfy.
+    section_map = {
+        "architect": ("Architecture & Directory Structure", "🏗️"),
+        "engineer": ("Implementation Roadmap", "⚙️"),
+    }
+    for key, (title, icon) in section_map.items():
+        if key in results:
+            doc.extend([f"## {icon} {title}", "", results[key], ""])
+
+    if "test_engineer" in results or "safety" in results:
+        doc.extend([
+            "## ⚠️ GATES ON THE PLAN ABOVE",
+            "The plan is not complete until these are satisfied. They constrain the "
+            "implementation; they do not replace it.",
+            "",
+        ])
 
     if "test_engineer" in results:
         doc.append("### 🧪 Critical Test & Quality Gates")
@@ -2107,6 +2919,8 @@ def assemble_clinerules(results: dict, config: dict, messages: list) -> str:
         doc.append("")
 
     doc.extend([
+        "## 🔧 Operating Rules",
+        "",
         "<operational_constraints>",
         f"- Max project size: {limits.get('max_project_size_mb', 4096)} MB",
         f"- Max build iterations: {limits.get('max_build_iterations', 5)}",
@@ -2132,22 +2946,168 @@ def assemble_clinerules(results: dict, config: dict, messages: list) -> str:
         "",
     ])
 
-    section_map = {
-        "architect": ("Architecture & Directory Structure", "🏗️"),
-        "engineer": ("Implementation Roadmap", "⚙️"),
-    }
-
-    for key, (title, icon) in section_map.items():
-        if key in results:
-            doc.extend([
-                f"## {icon} {title}",
-                "",
-                results[key],
-                "",
-            ])
-
     return "\n".join(doc)
 
 
+def run_replan(growth_threshold: int, max_replans: int) -> int:
+    """
+    Revise the plan against what the build has learned, then rewrite .clinerules.
+
+    Returns a shell exit code. Non-fatal by design: every failure path leaves the
+    existing .clinerules in place and returns 0, because a build that is making
+    progress must not be killed by a re-plan that could not run. The only thing
+    a bad re-plan is allowed to cost is the GPU time it used.
+    """
+    due, reason = replan_due(growth_threshold, max_replans)
+    if not due:
+        print(f"  ↻ Re-plan not triggered: {reason}", flush=True)
+        return 0
+
+    print("=" * 60, flush=True)
+    print(f"🔄 Re-planning against build evidence — {reason}", flush=True)
+    print("=" * 60, flush=True)
+    update_status("Re-planning against build evidence...")
+
+    config = load_config()
+    _resolve_context_window(config)
+    models = config.get("models", {})
+    prompts = load_prompts(config)
+    replan_passes = tuple(config.get("limits", {}).get(
+        "replan_passes", DEFAULT_REPLAN_PASSES))
+
+    previous = {}
+    for key in replan_passes + REPLAN_CARRY_PASSES:
+        saved = load_saved_pass(key)
+        if saved:
+            previous[key] = saved
+    if not any(previous.get(k) for k in replan_passes):
+        print("  ⚠ No previous plan on disk to revise; keeping .clinerules as is.",
+              flush=True)
+        return 0
+
+    try:
+        messages = load_conversation()
+    except Exception as e:
+        print(f"  ⚠ Could not read the conversation ({e}); keeping .clinerules.",
+              flush=True)
+        return 0
+
+    new_request = ""
+    for msg in reversed(messages):
+        if msg.get("role") == "user" and "!build" in msg.get("content", "").lower():
+            new_request = msg.get("content", "")
+            break
+    if not new_request and messages:
+        new_request = messages[-1].get("content", "")
+
+    system_tokens = max((est_tokens(prompts.get(k, "")) for k in replan_passes),
+                        default=0)
+    payload = build_replan_payload(previous, new_request, system_tokens)
+    print(f"📄 Re-plan payload: {len(payload)} chars (~{est_tokens(payload)} tok)",
+          flush=True)
+
+    replans_so_far = read_replan_state()["replans"]
+
+    def abandon(message: str) -> int:
+        """
+        Give up on this revision without touching the plan the build is using.
+
+        The baseline moves to the current issues size but the re-plan count does
+        not: a failure should not spend the budget, or one bad attempt would cost
+        a good one later. Moving the baseline stops the same evidence re-firing
+        the trigger on the very next iteration, so the next attempt waits for
+        genuinely new evidence rather than burning a pass per iteration.
+        """
+        print(f"  ⚠ {message}", flush=True)
+        write_replan_state(_issues_bytes(), replans_so_far)
+        return 0
+
+    skeleton_for_blockers = get_symbol_skeleton("/workspace")
+    results = dict(previous)
+    previous_model_config = None
+    revised = []
+
+    with httpx.Client() as client:
+        for pass_key in replan_passes:
+            print(f"\n🔄 Re-planning: {pass_key}", flush=True)
+            print("-" * 40, flush=True)
+            model_config = _resolve_model_config(
+                models.get(pass_key, models.get("architect")))
+            model_name = model_config.get("model", "")
+            prompt = prompts.get(pass_key, "Revise the plan.")
+
+            prev_name = previous_model_config.get("model", "") if previous_model_config else None
+            if prev_name and prev_name != model_name:
+                print(f"  ↳ Switching model: {prev_name} → {model_name}", flush=True)
+                unload_model(client, previous_model_config)
+
+            # Only passes revised earlier in *this* run become prior context, so
+            # the engineer maps files against the architecture just revised rather
+            # than the one it replaced.
+            prior_context = "\n\n".join(
+                f"#### {k.upper()} ANALYSIS\n{results[k]}" for k in revised
+            )
+
+            try:
+                result = call_llm(client, model_config, prompt, payload, prior_context)
+            except (BudgetInfeasible, ExtractionFailed) as e:
+                return abandon(f"Re-plan of {pass_key} failed ({e}); keeping the "
+                               f"existing plan.")
+
+            result = resolve_pass_blockers(
+                client, pass_key, model_config, prompt,
+                payload, prior_context, skeleton_for_blockers, result,
+            )
+            if detect_blockers(result):
+                # Unlike the initial distillation, this is not fatal: there is
+                # already a working plan on disk and a build using it.
+                return abandon(f"Re-planned {pass_key} is blocked; discarding the "
+                               f"revision and keeping the existing plan.")
+
+            results[pass_key] = result
+            revised.append(pass_key)
+            previous_model_config = model_config
+            print(f"  ✓ Revised ({len(result)} chars)", flush=True)
+
+    # Nothing is persisted until every pass has succeeded. A revision written as
+    # each pass finished would leave the architect's new design on disk while
+    # .clinerules still held the old one if the engineer then blocked - and the
+    # next re-plan reads those intermediates, so it would revise a design the
+    # build was never given.
+    clinerules = assemble_clinerules(results, config, messages)
+    try:
+        with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
+            f.write(clinerules)
+        for pass_key in revised:
+            path = _intermediate_path(pass_key)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(f"# Distillation Intermediate: {pass_key.title()}\n\n"
+                        f"{results[pass_key]}")
+    except Exception as e:
+        return abandon(f"Could not persist the revision ({e}); the old plan stands.")
+
+    write_replan_state(_issues_bytes(), replans_so_far + 1)
+    update_status("Re-plan complete.")
+    print(f"\n  ✓ .clinerules rewritten ({len(clinerules)} chars) from revised "
+          f"{', '.join(replan_passes)}", flush=True)
+    print("=" * 60, flush=True)
+    return 0
+
+
 if __name__ == "__main__":
+    # `--test-command <dir>` prints the project's test command and exits. The
+    # build loop calls this once per iteration rather than reading a value cached
+    # at distillation time, because on a fresh build the suite does not exist yet
+    # when Phase 1 runs - it is written during Phase 2, by the agent being gated.
+    if len(sys.argv) > 2 and sys.argv[1] == "--test-command":
+        print(detect_test_command(sys.argv[2]))
+        raise SystemExit(0)
+    # `--replan <growth_bytes> <max_replans>` is called by the build loop between
+    # iterations. It decides for itself whether the plan has fallen behind, so
+    # the shell does not have to duplicate the trigger logic.
+    if sys.argv[1:2] == ["--replan"]:
+        threshold = int(sys.argv[2]) if len(sys.argv) > 2 else 2000
+        budget = int(sys.argv[3]) if len(sys.argv) > 3 else 2
+        raise SystemExit(run_replan(threshold, budget))
     run_distillation()

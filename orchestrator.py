@@ -29,16 +29,16 @@ logger = logging.getLogger("Bob-Orchestrator")
 #     "provider": "llamacpp",
 #     "base_url": "http://localhost:8081",
 # }
-EXPERT_CONFIG = {
-   "model": "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL",
-    "provider": "llamacpp",
-    "base_url": "http://localhost:8081",
-}
 # EXPERT_CONFIG = {
-#    "model": "qwen3.8:27b",
-#     "provider": "ollama",
-#     "base_url": "http://localhost:11434",
+#     "model": "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL",
+#     "provider": "llamacpp",
+#     "base_url": "http://localhost:8080",
 # }
+EXPERT_CONFIG = {
+   "model": "qwen3.8:27b",
+    "provider": "ollama",
+    "base_url": "http://localhost:11434",
+}
 ROUTER_CONFIG = {
     "model": "qwen2.5:1.5b",
     "provider": "ollama",
@@ -52,7 +52,7 @@ DEFAULT_EXPERT_MODEL = "qwen3.8:27b" # Keep this as default, if you know what yo
 
 # llama.cpp managed process settings (only used when provider is "llamacpp")
 LLAMACPP_BINARY = "/home/jonathan/.local/bin/llama"  # llama.app unified binary (serves via the `serve` subcommand)
-LLAMACPP_DEFAULT_ARGS = ["--cache-type-k", "q8_0", "--cache-type-v", "q8_0"]  # Extra CLI args (KV Quant enabled)
+LLAMACPP_DEFAULT_ARGS = []  # Extra CLI args (KV Quant enabled) //"--cache-type-k", "q8_0", "--cache-type-v", "q8_0"
 
 COMFYUI_URL = "http://localhost:8188"
 EXPERT_CTX = 65536    # Context for the expert model (64k) - 128k of KV crowds the
@@ -66,6 +66,31 @@ CLINE_CTX = 65536     # Context for the Cline agent (64k) - see EXPERT_CTX
 # file, before any correction.
 AGENT_MAX_HOPS = 8        # read-only turns
 AGENT_MAX_HOPS_WRITE = 12  # write-enabled turns
+
+# --- CONTEXT BUDGET ---
+# Everything the orchestrator puts in front of the Expert is sized against
+# EXPERT_CTX rather than against standalone literals, so halving the window
+# halves the budgets with it instead of silently overflowing.
+#
+# The divisor matches distill.py's est_tokens(): deliberately pessimistic, so a
+# budget error costs headroom rather than a truncated prompt.
+CHARS_PER_TOKEN_DENSE = 3
+
+# Raw conversation history. The remainder covers what the pruner never sees -
+# PROJECT_CONTEXT, tool schemas, tool results, and the reply itself.
+HISTORY_BUDGET_FRACTION = 0.45
+
+# @file mentions. These are read whole off disk into the system message, after
+# the pruner has already run, so nothing downstream bounds them.
+MENTION_BUDGET_FRACTION = 0.08
+
+# Tool results across one turn. A write turn is 12 hops and each hop can return
+# a full file, so the per-turn total is the figure that matters, not the
+# per-call one.
+TOOL_RESULT_BUDGET_FRACTION = 0.22
+
+# Smallest useful clipped tool result. Under this, suppress and say so.
+TOOL_RESULT_MIN_CHARS = 512
 
 # --- STATE MANAGEMENT ---
 gpu_lock = asyncio.Lock()
@@ -169,11 +194,51 @@ def _adapt_body(body: dict, config: dict) -> dict:
     return adapted
 
 
-def _prune_messages(messages: list, max_chars: int = 90000) -> list:
+def _clip_text(text: str, limit: int, what: str) -> str:
+    """
+    Cut a string to a character budget, keeping both ends.
+
+    Head and tail are both kept because the two things being clipped want
+    opposite halves: a source file leads with imports and declarations, a build
+    log ends with the error. The elision is stated inline so the model knows it
+    is looking at an excerpt and can ask for the rest.
+    """
+    if limit <= 0 or len(text) <= limit:
+        return text
+    head = int(limit * 0.7)
+    tail = limit - head
+    omitted = len(text) - limit
+    return (f"{text[:head]}\n\n"
+            f"... [{omitted} characters of {what} elided to fit the context window; "
+            f"request a specific region if you need it] ...\n\n"
+            f"{text[-tail:]}")
+
+
+def _history_budget_chars() -> int:
+    """
+    How much of the Expert's window the raw conversation may occupy.
+
+    This used to be a flat 90000, a number with no relationship to EXPERT_CTX.
+    It happened to be safe at 64k and would have become an overflow the moment
+    the window was reduced - which is exactly the kind of change the context
+    accounting invites. Derived here instead, so the two move together.
+
+    HISTORY_BUDGET_FRACTION leaves the remainder for what the history does not
+    include and the pruner never sees: the injected PROJECT_CONTEXT, the tool
+    schemas, the tool results accumulated across a turn's hops, and the model's
+    own reply.
+    """
+    return int(EXPERT_CTX * CHARS_PER_TOKEN_DENSE * HISTORY_BUDGET_FRACTION)
+
+
+def _prune_messages(messages: list, max_chars: int = None) -> list:
     """
     In-place pruner that ensures the conversation remains below a safe threshold.
     Preserves the system message (first) and the most recent turns (last 4).
     """
+    if max_chars is None:
+        max_chars = _history_budget_chars()
+
     if not messages or len(messages) <= 5:
         return messages
 
@@ -1254,7 +1319,8 @@ async def proxy_ollama(request: Request):
             logger.info("Command: Switched to General Mode.")
         elif "!move" in prompt_lower:
             logger.info("Command: Move initiated.")
-            success = mover.handle_move(messages)
+            # VS Code only opens when explicitly requested via `!move --open`.
+            success = mover.handle_move(messages, open_editor="--open" in prompt_lower)
             msg = "Files moved!" if "Moved" in success else "Files failed to move!"
             return _command_response(msg, is_streaming, is_native)
         elif "!architect" in prompt_lower:
@@ -1817,7 +1883,20 @@ async def _handle_agentic_request(body: dict, project_dir: str, target_url: str,
     """
     MAX_HOPS = max_hops
     current_hops = 0
-    
+
+    # Tool results are the last unbounded input to the Expert. Each hop appends a
+    # full result to the message list and re-sends the whole thing, and the list
+    # never passes through _prune_messages again - so a 12-hop write turn that
+    # reads a few large files grows the prompt without limit until the server
+    # truncates it, silently, from the front.
+    #
+    # One budget for the whole turn rather than a per-call cap: hop 1 reading one
+    # big file and hop 9 reading nine small ones cost the same and both have to
+    # fit. Per call, half the turn's budget, so no single result can starve the
+    # rest of the loop.
+    tool_budget = int(EXPERT_CTX * CHARS_PER_TOKEN_DENSE * TOOL_RESULT_BUDGET_FRACTION)
+    tool_result_chars = 0
+
     original_messages = body.get("messages", [])
     # For response parsing: native Ollama format only when backend is Ollama AND client is native
     response_is_native = backend_is_ollama and is_native
@@ -1876,6 +1955,24 @@ async def _handle_agentic_request(body: dict, project_dir: str, target_url: str,
                 tool_started = time.monotonic()
                 result = await asyncio.to_thread(_execute_tool, name, args, project_dir, conv_id)
                 tracer.tool_result(name, result, time.monotonic() - tool_started)
+
+                raw_len = len(result)
+                per_call_cap = min(tool_budget // 2, max(0, tool_budget - tool_result_chars))
+                # Below the floor a clip returns a stub with two elision markers
+                # and almost no content, which reads as a broken tool rather than
+                # an exhausted budget. Say what actually happened instead.
+                if per_call_cap < TOOL_RESULT_MIN_CHARS:
+                    result = (f"[Tool result suppressed: this turn's tool-output budget "
+                              f"({tool_budget} characters) is spent. Summarise what you "
+                              f"have and answer, or narrow the request.]")
+                else:
+                    result = _clip_text(result, per_call_cap, f"{name} output")
+                tool_result_chars += min(raw_len, per_call_cap)
+                if len(result) < raw_len:
+                    logger.info(f"[Context Budget] Clipped {name} result "
+                                f"{raw_len} -> {len(result)} chars "
+                                f"({tool_result_chars}/{tool_budget} spent this turn).")
+                    tracer.note(f"tool result clipped: {name} {raw_len} → {len(result)} chars")
 
                 tool_msg = {
                     "role": "tool",
@@ -2062,11 +2159,22 @@ def _get_symbol_skeleton(project_dir: str) -> str:
 
 
 def _parse_file_mentions(text: str, project_dir: str) -> str:
-    """Detects @filename mentions and reads their content."""
+    """
+    Detects @filename mentions and reads their content.
+
+    Bounded as a group, not per file. The mentions are concatenated into the
+    system message after _prune_messages has already run, so a turn mentioning
+    four large files used to add unbounded content to a prompt nothing further
+    downstream measures. Each file is clipped to what is left of the budget, and
+    once it is spent the remaining mentions are named rather than read - the
+    model can still see they exist and ask for one with a tool call.
+    """
     mentions = re.findall(r"@([a-zA-Z0-9_\-\./\\]+\.[a-zA-Z0-9]+)", text)
     if not mentions:
         return ""
-        
+
+    remaining = int(EXPERT_CTX * CHARS_PER_TOKEN_DENSE * MENTION_BUDGET_FRACTION)
+    deferred = []
     context_blocks = ["\n[REQUESTED FILE CONTENT]"]
     for filename in mentions:
         # Search for file in project_dir
@@ -2086,14 +2194,25 @@ def _parse_file_mentions(text: str, project_dir: str) -> str:
                 break
             
         if found_path:
+            rel = os.path.relpath(found_path, project_dir)
+            if remaining <= 0:
+                deferred.append(rel)
+                continue
             try:
                 with open(found_path, "r", encoding="utf-8") as f:
                     content = f.read()
-                    # No truncation for explicit @mentions as per plan
-                    context_blocks.append(f'\n<file name="{os.path.relpath(found_path, project_dir)}">\n{content}\n</file>')
+                clipped = _clip_text(content, remaining, f"{rel}")
+                remaining -= min(len(content), remaining)
+                context_blocks.append(f'\n<file name="{rel}">\n{clipped}\n</file>')
             except Exception as e:
                 context_blocks.append(f"\n[Error reading {filename}: {e}]")
-                
+
+    if deferred:
+        context_blocks.append(
+            f"\n[Also mentioned, not read - the @mention budget was spent: "
+            f"{', '.join(deferred)}. Use orchestrator_read_file for any of these.]"
+        )
+
     return "\n".join(context_blocks) if len(context_blocks) > 1 else ""
 
 
@@ -2189,7 +2308,7 @@ async def _trigger_build_pipeline(messages: list, extra_env: Optional[dict] = No
 
         # 2. Extract files via mover
         # This creates the project folder in ./conversations/
-        status_msg = mover.handle_move(messages)
+        status_msg = mover.handle_move(messages, open_editor=False)
         target_dir = None
         if "No code snippets" in status_msg:
             # Check if we already have a bound project

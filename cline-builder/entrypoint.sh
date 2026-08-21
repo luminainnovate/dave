@@ -73,11 +73,22 @@ if [ -f "/workspace/.build_issues.md" ] && [ ! -f "/workspace/.cline_context/.bu
     mv /workspace/.build_issues.md /workspace/.cline_context/ 2>/dev/null || true
 fi
 
-# Clear previous run artifacts to ensure no confusion
-echo "🧹 Cleaning previous run logs and distillation files..."
+# Clear previous run artifacts to ensure no confusion.
+# The distill_*.md files are the exception on a resume run: they ARE the reviewed
+# architecture that !approve exists to reuse, so wiping them here would force a
+# regeneration with the approve directive as the design brief.
+DISTILL_RESUME="${DISTILL_RESUME:-}"
 rm -f /workspace/.cline_logs/*.txt
-rm -f /workspace/.cline_context/distill_*.md
 rm -f /workspace/.build_complete
+case "$(echo "$DISTILL_RESUME" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes)
+        echo "🧹 Cleaning previous run logs (keeping reviewed distillation for resume)..."
+        ;;
+    *)
+        echo "🧹 Cleaning previous run logs and distillation files..."
+        rm -f /workspace/.cline_context/distill_*.md
+        ;;
+esac
 
 # --- Noise Suppression Bootstrap ---
 # Ensure node_modules and metadata are physically ignored by the agent's tools
@@ -186,6 +197,16 @@ MAX_ITERATIONS=$(jq -r '.limits.max_build_iterations // 5' "$CONFIG_PATH")
 # Consecutive-mistake budget passed to the Cline CLI's --retries flag.
 # Default matches the CLI's own default so an absent config changes nothing.
 CLINE_MAX_RETRIES=$(jq -r '.limits.cline_max_retries // 6' "$CONFIG_PATH")
+# Per-phase wall-clock budget handed to the Cline CLI's --timeout flag. A run that
+# exceeds it is killed mid-turn and the iteration is lost, so these scale with task
+# complexity, not with model speed. Defaults match the values these replaced.
+BUILD_TIMEOUT=$(jq -r '.limits.build_timeout_secs // 1800' "$CONFIG_PATH")
+VERIFY_TIMEOUT=$(jq -r '.limits.verify_timeout_secs // 1800' "$CONFIG_PATH")
+SAFETY_TIMEOUT=$(jq -r '.limits.safety_timeout_secs // 1800' "$CONFIG_PATH")
+# The final iteration switches from building to stabilization: it inherits every
+# bug the earlier rounds deferred, so it gets its own, larger budget.
+FINAL_BUILD_TIMEOUT=$(jq -r '.limits.final_build_timeout_secs // empty' "$CONFIG_PATH")
+[ -z "$FINAL_BUILD_TIMEOUT" ] && FINAL_BUILD_TIMEOUT="$BUILD_TIMEOUT"
 # Extract cline model: handle both string ("model_name") and object ({"model": "..."}) formats
 CLINE_MODEL=$(jq -r 'if (.models.cline | type) == "object" then .models.cline.model else (.models.cline // "qwen3.8:27b") end' "$CONFIG_PATH")
 CLINE_PROVIDER=$(jq -r 'if (.models.cline | type) == "object" then (.models.cline.provider // "ollama") else "ollama" end' "$CONFIG_PATH")
@@ -231,7 +252,12 @@ echo "========================================="
 PYTHONUNBUFFERED=1 python3 /app/distill.py
 DISTILL_EXIT=$?
 
-if [ $DISTILL_EXIT -ne 0 ]; then
+if [ $DISTILL_EXIT -eq 3 ]; then
+    echo "✗ STOPPED: the design passes reported blockers that could not be resolved"
+    echo "  from the workspace. Nothing was built and .clinerules was not written."
+    echo "  Answer the blockers listed above in chat, then re-run !build."
+    exit 1
+elif [ $DISTILL_EXIT -ne 0 ]; then
     echo "✗ FATAL: Distillation failed (exit code ${DISTILL_EXIT})"
     exit 1
 fi
@@ -301,11 +327,121 @@ setup_git_safety
 # =============================================================================
 # SESSION STATE GENERATOR (Component 3)
 # =============================================================================
+
+# The agent is told to read .session_state.md as its FIRST ACTION every step, so
+# whatever this function writes is charged against the build window before any
+# work starts. Measured at 78066 characters (~26k tokens, 40% of a 64k window)
+# with 96% of it in Previous Step Summaries: `tail -10` caps lines, not bytes,
+# and a single log line carrying a tool payload ran to 6872 characters. Every
+# section that concatenates a file it does not control is now byte-capped, the
+# same way Agent Discovery Notes already was.
+SESSION_STATE_ISSUES_BYTES=4000
+SESSION_STATE_AUDIT_BYTES=4000
+SESSION_STATE_NOTES_BYTES=3000
+SESSION_STATE_SUMMARY_BYTES=6000
+SESSION_STATE_LINE_CHARS=300
+
+# =============================================================================
+# TEST GATE
+# =============================================================================
+# The only objective signal in the pipeline.
+#
+# Completion was previously decided entirely by the agent: the verify prompt asks
+# it to write '.build_complete' containing VERIFIED "if the app is 100% working",
+# and the safety prompt appends SAFE. Nothing checked. `CLINE_EXIT` is captured
+# after the build phase and only echoed; verify and safety exit codes are not
+# captured at all. So the pipeline's definition of done was the model's opinion
+# of its own work, which on a hard task is exactly where it is least reliable.
+#
+# This runs the project's own test command and requires exit 0 before that
+# opinion is accepted. Failures are appended to .build_issues.md, which
+# generate_session_state already feeds back into the next iteration - so a failed
+# gate steers the next round instead of merely blocking this one.
+TEST_GATE_TIMEOUT=$(jq -r '.limits.test_gate_timeout_secs // 900' "$CONFIG_PATH")
+
+# Re-plan trigger. distill.py owns the decision (growth since the plan was
+# written, against a budget of re-plans); these only pass the thresholds through.
+REPLAN_GROWTH_BYTES=$(jq -r '.limits.replan_issue_growth_bytes // 2000' "$CONFIG_PATH")
+MAX_REPLANS=$(jq -r '.limits.max_replans // 2' "$CONFIG_PATH")
+
+run_test_gate() {
+    local ITERATION=$1
+    local CMD
+    CMD=$(python3 /app/distill.py --test-command /workspace 2>/dev/null | head -n 1)
+
+    if [ -z "$CMD" ]; then
+        # No suite to run. Degrade to the previous behaviour rather than blocking
+        # a project that legitimately has no tests - but say so, loudly, because
+        # it means completion is back to being self-assessed.
+        echo "  ⚠ TEST GATE SKIPPED: no runnable test command detected."
+        echo "    Completion is self-reported for this build."
+        return 0
+    fi
+
+    echo "  🧪 Test gate: ${CMD} (timeout ${TEST_GATE_TIMEOUT}s)"
+    local GATE_LOG="/workspace/.cline_logs/test_gate_iter_${ITERATION}.txt"
+    set +e
+    timeout "$TEST_GATE_TIMEOUT" bash -c "cd /workspace && ${CMD}" > "$GATE_LOG" 2>&1
+    local GATE_EXIT=$?
+    set -e
+
+    if [ $GATE_EXIT -eq 0 ]; then
+        echo "  ✅ Test gate PASSED"
+        return 0
+    fi
+
+    # A missing runner is not a failing test suite, and treating it as one would
+    # block completion permanently for something the agent cannot fix. The image
+    # ships Node and Python but only httpx on the Python side, so `pytest` and an
+    # uninstalled node_modules are both realistic. Skip loudly instead.
+    if [ $GATE_EXIT -eq 127 ] || grep -qiE "no module named pytest|command not found|could not determine executable|npm error|cannot find module" "$GATE_LOG"; then
+        echo "  ⚠ TEST GATE SKIPPED: '${CMD}' could not run (runner not installed)."
+        echo "    Completion is self-reported for this build."
+        sed -n '1,5p' "$GATE_LOG" | sed 's/^/      /'
+        return 0
+    fi
+
+    if [ $GATE_EXIT -eq 124 ]; then
+        echo "  ❌ Test gate TIMED OUT after ${TEST_GATE_TIMEOUT}s"
+    else
+        echo "  ❌ Test gate FAILED (exit ${GATE_EXIT})"
+    fi
+
+    {
+        echo ""
+        echo "## Test gate failure — iteration ${ITERATION} ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+        echo "Command: \`${CMD}\` exited ${GATE_EXIT}."
+        echo "This is the harness running your tests, not your own assessment."
+        echo '```'
+        tail -c 2000 "$GATE_LOG"
+        echo '```'
+    } >> /workspace/.cline_context/.build_issues.md
+    echo "  ↳ Failure recorded in .build_issues.md for the next iteration."
+    return 1
+}
+
+# Cline's system prompt states that every user message arrives wrapped in a
+# <user_input mode="..."> tag and that the newest message's mode governs. In a
+# headless run it sends the prompt bare, so the model goes looking for an
+# attribute that is not there. The only concrete mode value left in its context is
+# the word "plan" from that very explanation, so it concludes plan mode and
+# refuses to edit - the build phase becomes an analysis it never acts on.
+#
+# Measured: the act-mode system prompt is 4253 chars with 25 tools, plan mode is
+# 6014 with 24, so these runs were always in act mode. The mode was inferred, not
+# imposed. Sending the tag back does not work either - Cline parses and strips its
+# own wrapper - so the correction has to be prose that survives as message text.
+act_mode() {
+    printf '%s\n\n%s' \
+        "[SESSION MODE: ACT] Implementation is allowed and expected in this session. No plan-mode constraint applies. Do not stop at analysis, do not ask to switch modes, and do not treat the absence of a user_input mode attribute as plan mode. Make the edits directly." \
+        "$1"
+}
+
 generate_session_state() {
     local ITERATION=$1
     local STEP=$2
     local STATE_FILE="/workspace/.cline_context/.session_state.md"
-    
+
     echo "# Session State (Auto-generated)" > "$STATE_FILE"
     echo "" >> "$STATE_FILE"
     echo "## Current Position" >> "$STATE_FILE"
@@ -317,36 +453,54 @@ generate_session_state() {
     # Inject known issues if they exist
     if [ -f "/workspace/.cline_context/.build_issues.md" ]; then
         echo "## Known Issues (from previous steps)" >> "$STATE_FILE"
-        cat /workspace/.cline_context/.build_issues.md >> "$STATE_FILE"
+        tail -c "$SESSION_STATE_ISSUES_BYTES" /workspace/.cline_context/.build_issues.md >> "$STATE_FILE"
         echo "" >> "$STATE_FILE"
     fi
-    
+
     # Inject quality audit if it exists
     if [ -f "/workspace/.cline_context/quality_audit.md" ]; then
         echo "## 🛡️ Architectural & Quality Critique" >> "$STATE_FILE"
         echo "> These notes represent the project's quality conscience. Address these critiques before implementation." >> "$STATE_FILE"
-        cat /workspace/.cline_context/quality_audit.md >> "$STATE_FILE"
+        tail -c "$SESSION_STATE_AUDIT_BYTES" /workspace/.cline_context/quality_audit.md >> "$STATE_FILE"
         echo "" >> "$STATE_FILE"
     fi
 
     # Inject analysis notes if agent wrote any
     if [ -f "/workspace/.cline_context/analysis_notes.md" ]; then
         echo "## Agent Discovery Notes" >> "$STATE_FILE"
-        tail -c 3000 /workspace/.cline_context/analysis_notes.md >> "$STATE_FILE"
+        tail -c "$SESSION_STATE_NOTES_BYTES" /workspace/.cline_context/analysis_notes.md >> "$STATE_FILE"
         echo "" >> "$STATE_FILE"
     fi
     
-    # Inject summaries from previous step logs
+    # Inject summaries from previous step logs.
+    #
+    # Assembled into a buffer first so the whole section can be byte-capped. The
+    # per-line cut matters more than the line count: the grep matches on "✓",
+    # which appears inside tool output as readily as in a summary, so a single
+    # matched line can drag a multi-kilobyte payload into the agent's memory.
+    #
+    # Ordered by mtime, not by glob. The names sort by step before iteration
+    # (build_log_iter_1, ..., safety_log_iter_1, ...), so alphabetical order puts
+    # the oldest verify log after the newest build log - and the tail -c below
+    # keeps whatever is last, which must be the most recent work.
+    local SUMMARY_BUF
+    SUMMARY_BUF=$(mktemp)
+    local log
+    while IFS= read -r log; do
+        [ -f "$log" ] || continue
+        echo "### $(basename "$log")" >> "$SUMMARY_BUF"
+        grep -iE "(FINAL SUMMARY|attempt_completion|✓|✗|ERROR|TODO|BLOCKED)" "$log" 2>/dev/null \
+            | tail -10 \
+            | cut -c "1-${SESSION_STATE_LINE_CHARS}" >> "$SUMMARY_BUF" || true
+        echo "" >> "$SUMMARY_BUF"
+    done < <(ls -1tr /workspace/.cline_logs/*.txt 2>/dev/null)
+
     echo "## Previous Step Summaries" >> "$STATE_FILE"
-    for log in /workspace/.cline_logs/*.txt; do
-        if [ -f "$log" ]; then
-            local LOG_NAME=$(basename "$log")
-            echo "### ${LOG_NAME}" >> "$STATE_FILE"
-            grep -iE "(FINAL SUMMARY|attempt_completion|✓|✗|ERROR|TODO|BLOCKED)" "$log" 2>/dev/null \
-                | tail -10 >> "$STATE_FILE" || true
-            echo "" >> "$STATE_FILE"
-        fi
-    done
+    if [ "$(wc -c < "$SUMMARY_BUF")" -gt "$SESSION_STATE_SUMMARY_BYTES" ]; then
+        echo "_(older step summaries elided - see .cline_logs/ for the full logs)_" >> "$STATE_FILE"
+    fi
+    tail -c "$SESSION_STATE_SUMMARY_BYTES" "$SUMMARY_BUF" >> "$STATE_FILE"
+    rm -f "$SUMMARY_BUF"
 }
 
 # =============================================================================
@@ -360,6 +514,7 @@ echo "========================================="
 echo "  Model:          ${CLINE_MODEL}"
 echo "  Max iterations: ${MAX_ITERATIONS}"
 echo "  Max retries:    ${CLINE_MAX_RETRIES}"
+echo "  Phase timeouts: build ${BUILD_TIMEOUT}s (final ${FINAL_BUILD_TIMEOUT}s), verify ${VERIFY_TIMEOUT}s, safety ${SAFETY_TIMEOUT}s"
 echo ""
 
 # --- Phase 2 Setup: Auto-Auth for CLI ---
@@ -391,21 +546,38 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
         exit 1
     fi
 
+    # --- Re-plan Phase ---
+    #
+    # Before building again, check whether the plan still matches reality. Skipped
+    # on the first iteration (no evidence yet) and on the last (its directive is
+    # stabilization, and moving the target then guarantees unfinished work).
+    if [ $ITERATION -gt 1 ] && [ $ITERATION -lt $MAX_ITERATIONS ]; then
+        set +e
+        PYTHONUNBUFFERED=1 python3 /app/distill.py --replan \
+            "$REPLAN_GROWTH_BYTES" "$MAX_REPLANS"
+        REPLAN_EXIT=$?
+        set -e
+        if [ $REPLAN_EXIT -ne 0 ]; then
+            echo "  ⚠ Re-plan step exited ${REPLAN_EXIT}; continuing with the existing plan."
+        fi
+    fi
+
 # --- Build Phase ---
     echo "  🔧 Running Cline (Build mode)..."
     generate_session_state "$ITERATION" "build"
 
-    CURRENT_TIMEOUT=1800 # 30 minutes
+    CURRENT_TIMEOUT="$BUILD_TIMEOUT"
     BUILD_MSG="IMPORTANT: First read '.cline_context/.session_state.md' to understand what has been done so far. Then read '.clinerules' and execute remaining implementation tasks."
 
     if [ $ITERATION -eq $MAX_ITERATIONS ]; then
         echo "  🚨 FINAL ROUND: Shifting to Stabilization and Debugging..."
         BUILD_MSG="IMPORTANT: First read '.cline_context/.session_state.md'. CRITICAL: This is the FINAL iteration (${ITERATION} of ${MAX_ITERATIONS}). Your directive is now STABILIZATION. Revisit any TODOs, uncommented code, or failing tests. Fix the root causes of any remaining bugs."
-        CURRENT_TIMEOUT=1800
+        CURRENT_TIMEOUT="$FINAL_BUILD_TIMEOUT"
     elif [ $ITERATION -gt 1 ]; then
         BUILD_MSG="IMPORTANT: First read '.cline_context/.session_state.md' to recover your memory. Continue building the project. Review what was done in the previous iteration, fix any issues, and complete remaining tasks from .clinerules. This is iteration ${ITERATION} of ${MAX_ITERATIONS}. Remember: keep momentum and don't get stuck on one bug."
     fi
 
+    BUILD_MSG=$(act_mode "$BUILD_MSG")
     set +e
     export CLINE_MODEL CURRENT_TIMEOUT BUILD_MSG CLINE_MAX_RETRIES
     script -q -e -c 'cline -v --auto-approve true \
@@ -439,12 +611,13 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     5) If the app is 100% working, safe, and has a README, create a file named '.build_complete' in the root directory containing 'VERIFIED'.
     6) CONTINUITY: Watch for '[STABILITY MONITOR]' markers in history. If a turn was cut off, do not re-read from the beginning; pick up exactly where you left off.
     7) Before testing, if a port is in use, YOU MUST ONLY use 'npx kill-port <portnumber>' to free it."
+    VERIFY_MSG=$(act_mode "$VERIFY_MSG")
     set +e
-    export CLINE_MODEL VERIFY_MSG CLINE_MAX_RETRIES
+    export CLINE_MODEL VERIFY_MSG CLINE_MAX_RETRIES VERIFY_TIMEOUT
     script -q -e -c 'cline -v --auto-approve true \
         -P openai-compatible \
         -m "$CLINE_MODEL" \
-        --timeout 1800 \
+        --timeout "$VERIFY_TIMEOUT" \
         --retries "$CLINE_MAX_RETRIES" \
         "$VERIFY_MSG"' \
         "/workspace/.cline_logs/verify_log_iter_${ITERATION}.txt"
@@ -461,12 +634,13 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     3) If you fix them or the code is already safe, append 'SAFE' to the '.build_complete' file. 
     4) CONTINUITY: Watch for '[STABILITY MONITOR]' markers in history. If a turn was cut off, do not re-read from the beginning; pick up exactly where you left off.
     5) Before testing, if a port is in use, YOU MUST ONLY use 'npx kill-port <portnumber>' to free it."
+    SAFETY_MSG=$(act_mode "$SAFETY_MSG")
     set +e
-    export CLINE_MODEL SAFETY_MSG CLINE_MAX_RETRIES
+    export CLINE_MODEL SAFETY_MSG CLINE_MAX_RETRIES SAFETY_TIMEOUT
     script -q -e -c 'cline -v --auto-approve true \
         -P openai-compatible \
         -m "$CLINE_MODEL" \
-        --timeout 1800 \
+        --timeout "$SAFETY_TIMEOUT" \
         --retries "$CLINE_MAX_RETRIES" \
         "$SAFETY_MSG"' \
         "/workspace/.cline_logs/safety_log_iter_${ITERATION}.txt"
@@ -476,9 +650,16 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
     if [ -f "/workspace/.build_complete" ]; then
         COMPLETE_CONTENT=$(cat /workspace/.build_complete)
         if echo "$COMPLETE_CONTENT" | grep -q "VERIFIED" && echo "$COMPLETE_CONTENT" | grep -q "SAFE"; then
-            echo ""
-            echo "  ✅ Build VERIFIED and SAFE on iteration ${ITERATION}"
-            BUILD_COMPLETE=true
+            # The agent's claim is necessary but not sufficient. Only the test
+            # gate can turn it into a fact.
+            if run_test_gate "$ITERATION"; then
+                echo ""
+                echo "  ✅ Build VERIFIED, SAFE and TESTS PASSING on iteration ${ITERATION}"
+                BUILD_COMPLETE=true
+            else
+                echo "  ⚠ Agent reported complete, but the test gate failed — continuing."
+                rm -f /workspace/.build_complete
+            fi
         else
             echo "  ⚠ .build_complete exists but not fully verified/safe yet"
             rm -f /workspace/.build_complete

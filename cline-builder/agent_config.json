@@ -1,14 +1,14 @@
 {
     "models": {
         "architect": {
-            "model": "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL",
-            "provider": "llamacpp",
-            "base_url": "http://host.docker.internal:8081"
+            "model": "qwen3.8:27b",
+            "provider": "ollama",
+            "base_url": "http://host.docker.internal:11434"
         },
         "engineer": {
-            "model": "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL",
-            "provider": "llamacpp",
-            "base_url": "http://host.docker.internal:8081"
+            "model": "qwen3.8:27b",
+            "provider": "ollama",
+            "base_url": "http://host.docker.internal:11434"
         },
         "test_engineer": {
             "model": "muse-glimmer:latest",
@@ -16,14 +16,14 @@
             "base_url": "http://host.docker.internal:11434"
         },
         "safety": {
-            "model": "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL",
-            "provider": "llamacpp",
-            "base_url": "http://host.docker.internal:8081"
+            "model": "qwen3.8:27b",
+            "provider": "ollama",
+            "base_url": "http://host.docker.internal:11434"
         },
         "cline": {
-            "model": "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL",
-            "provider": "llamacpp",
-            "base_url": "http://host.docker.internal:8081"
+            "model": "qwen3.8:27b",
+            "provider": "ollama",
+            "base_url": "http://host.docker.internal:11434"
         }
     },
     "ollama_host": "http://host.docker.internal:11434",
@@ -42,7 +42,17 @@
     
     "limits": {
         "max_project_size_mb": 8192,
-        "max_build_iterations": 5,
-        "cline_max_retries": 6
+        "max_build_iterations": 6,
+        "cline_max_retries": 6,
+        "build_timeout_secs": 3600,
+        "final_build_timeout_secs": 5400,
+        "verify_timeout_secs": 3600,
+        "safety_timeout_secs": 2400,
+        "test_gate_timeout_secs": 900,
+
+        "_replan_help": "Between build iterations, re-run the design passes against .build_issues.md when it has grown this many bytes since the plan was written. Set max_replans to 0 to disable. replan_passes defaults to architect+engineer; narrow it to [\"architect\"] to halve the GPU cost at the price of a roadmap that no longer matches the revised architecture.",
+        "replan_issue_growth_bytes": 2000,
+        "max_replans": 2,
+        "replan_passes": ["architect", "engineer"]
     }
 }

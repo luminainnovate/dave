@@ -273,10 +273,30 @@ def get_conversation_id(messages: list) -> str:
     hash_obj = hashlib.md5(first_user_msg.encode('utf-8'))
     return hash_obj.hexdigest()[:12]
 
-def handle_move(messages: list) -> str:
+def _maybe_open_editor(target_dir: str, open_editor: bool) -> str:
     """
-    Extracts snippets, parses trees, saves to stable folder, and opens in VS Code.
+    Opens target_dir in VS Code, but only when explicitly asked to.
+
+    Opt-in via the `open_editor` argument (e.g. `!move --open`) or by setting
+    BRAIN_OPEN_EDITOR=1 in the environment. Never fires implicitly.
     """
+    if not open_editor:
+        return ""
+    try:
+        subprocess.run(["code", "."], cwd=target_dir, check=True, capture_output=True)
+        return "Opened folder in VS Code."
+    except Exception as e:
+        logger.error(f"Failed to open VS Code: {e}")
+        return f"Failed to open VS Code automatically (Error: {e})."
+
+def handle_move(messages: list, open_editor: bool = None) -> str:
+    """
+    Extracts snippets, parses trees, and saves to a stable folder.
+
+    VS Code is only launched when open_editor is True (or BRAIN_OPEN_EDITOR is set).
+    """
+    if open_editor is None:
+        open_editor = os.environ.get("BRAIN_OPEN_EDITOR", "").strip().lower() in ("1", "true", "yes", "on")
     try:
         snippets, suggested_root = extract_snippets(messages)
         if not snippets:
@@ -327,14 +347,8 @@ def handle_move(messages: list) -> str:
         # --- Safety Check for Autonomous Projects ---
         if os.path.exists(os.path.join(target_dir, ".clinerules")):
             logger.info(f"Skipping snippet move for {target_dir} (.clinerules exists)")
-            try:
-                subprocess.run(["code", "."], cwd=target_dir, check=True, capture_output=True)
-                vscode_msg = "Opened folder in VS Code."
-            except Exception as e:
-                logger.error(f"Failed to open VS Code: {e}")
-                vscode_msg = f"Failed to open VS Code automatically (Error: {e})."
-                
-            return f"Project is already managed by the AI Builder pipeline (pointing to `{target_dir}`). Snippets were NOT overwritten to protect autonomous progress.\n\n{vscode_msg}"
+            vscode_msg = _maybe_open_editor(target_dir, open_editor)
+            return f"Project is already managed by the AI Builder pipeline (pointing to `{target_dir}`). Snippets were NOT overwritten to protect autonomous progress.\n\n{vscode_msg}".rstrip()
         # ------------------------------------------
         
         is_cloned = os.path.exists(os.path.join(target_dir, ".git"))
@@ -366,16 +380,11 @@ def handle_move(messages: list) -> str:
                 skipped_count += 1
                 continue
             
-        try:
-            # Ensure target_dir exists even if no files were saved
-            os.makedirs(target_dir, exist_ok=True)
-            subprocess.run(["code", "."], cwd=target_dir, check=True, capture_output=True)
-            vscode_msg = "Opened folder in VS Code."
-        except Exception as e:
-            logger.error(f"Failed to open VS Code: {e}")
-            vscode_msg = f"Failed to open VS Code automatically (Error: {e})."
+        # Ensure target_dir exists even if no files were saved
+        os.makedirs(target_dir, exist_ok=True)
+        vscode_msg = _maybe_open_editor(target_dir, open_editor)
 
-        return f"Moved {saved_count} files (skipped {skipped_count}) to `{target_dir}`\n\n{vscode_msg}"
+        return f"Moved {saved_count} files (skipped {skipped_count}) to `{target_dir}`\n\n{vscode_msg}".rstrip()
 
     except Exception as e:
         logger.error(f"Error in handle_move: {e}")
