@@ -1,29 +1,41 @@
 {
     "models": {
         "architect": {
-            "model": "qwen3.8:27b",
-            "provider": "ollama",
-            "base_url": "http://host.docker.internal:11434"
+            "model": "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL",
+            "provider": "llamacpp",
+            "base_url": "http://host.docker.internal:8081",
+            "reasoning": "low"
+        },
+        "bugfix": {
+            "model": "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL",
+            "provider": "llamacpp",
+            "base_url": "http://host.docker.internal:8081",
+            "_reasoning_help": "medium, not xhigh. At xhigh on a ~70k-token evidence payload this pass spent its ENTIRE output cap on thinking - measured at exactly 12288 tokens, the cap - and was cut off before it finished writing the document. Section 2 sits near the top, so the harness reported 'section 2 declared no COMMAND' and burned every retry on the same wall. The reserve now scales with the level, which makes xhigh survivable, but medium is what this pass actually needs: it is tracing a payload through four files, not solving a research problem.",
+            "reasoning": "medium"
         },
         "engineer": {
-            "model": "qwen3.8:27b",
-            "provider": "ollama",
-            "base_url": "http://host.docker.internal:11434"
+            "model": "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL",
+            "provider": "llamacpp",
+            "base_url": "http://host.docker.internal:8081",
+            "reasoning": "low"
         },
         "test_engineer": {
             "model": "muse-glimmer:latest",
             "provider": "ollama",
-            "base_url": "http://host.docker.internal:11434"
+            "base_url": "http://host.docker.internal:11434",
+            "reasoning": "low"
         },
         "safety": {
-            "model": "qwen3.8:27b",
-            "provider": "ollama",
-            "base_url": "http://host.docker.internal:11434"
+            "model": "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL",
+            "provider": "llamacpp",
+            "base_url": "http://host.docker.internal:8081",
+            "reasoning": "low"
         },
         "cline": {
-            "model": "qwen3.8:27b",
-            "provider": "ollama",
-            "base_url": "http://host.docker.internal:11434"
+            "model": "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL",
+            "provider": "llamacpp",
+            "base_url": "http://host.docker.internal:8081",
+            "reasoning": "low"
         }
     },
     "ollama_host": "http://host.docker.internal:11434",
@@ -34,6 +46,7 @@
     
     "prompts": {
         "architect": "prompts/architect.md",
+        "bugfix": "prompts/bugfix.md",
         "engineer": "prompts/engineer.md",
         "test_engineer": "prompts/test_engineer.md",
         "safety": "prompts/safety.md"
@@ -45,6 +58,10 @@
         "max_build_iterations": 6,
         "cline_max_retries": 6,
         "build_timeout_secs": 3600,
+        "_review_help": "review_enabled is the master switch: false drops the phase and the loop runs build -> verify -> safety exactly as it did before. Override for a single run with `-e REVIEW_ENABLED=false` without editing this file. The Review phase runs between Build and Verify, scoped to only the files the build phase wrote, so it needs less wall-clock than the phases that sweep the whole project. It is skipped automatically on an iteration where the build wrote nothing. review_thinking_level is the Cline CLI's --thinking flag (reasoning effort): none|low|medium|high|xhigh. Raise it to trade wall-clock for depth of review; an empty string omits the flag and leaves the provider default.",
+        "review_enabled": true,
+        "review_timeout_secs": 2400,
+        "review_thinking_level": "medium",
         "final_build_timeout_secs": 5400,
         "verify_timeout_secs": 3600,
         "safety_timeout_secs": 2400,
@@ -53,6 +70,10 @@
         "_replan_help": "Between build iterations, re-run the design passes against .build_issues.md when it has grown this many bytes since the plan was written. Set max_replans to 0 to disable. replan_passes defaults to architect+engineer; narrow it to [\"architect\"] to halve the GPU cost at the price of a roadmap that no longer matches the revised architecture.",
         "replan_issue_growth_bytes": 2000,
         "max_replans": 2,
-        "replan_passes": ["architect", "engineer"]
+        "replan_passes": ["architect", "engineer"],
+
+        "_bugfix_help": "`!bugfix` swaps the architect for the bugfix pass, which must declare a COMMAND that actually fails before its diagnosis is accepted. bugfix_max_repro_attempts is how many times the pass may be re-run with the observed output fed back; 1 means run the repro once and never retry, 0 disables verification entirely and the diagnosis becomes self-reported. Each attempt after the first costs a design pass plus at most one round of blocker evidence, so 3 is roughly 15-25 minutes of GPU and the review gate will usually return 'still running' before it finishes - that is expected, and `!review` picks it up. bugfix_repro_timeout_secs caps a single run of the declared command.",
+        "bugfix_max_repro_attempts": 3,
+        "bugfix_repro_timeout_secs": 300
     }
 }

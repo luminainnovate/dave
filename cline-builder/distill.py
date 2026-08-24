@@ -16,7 +16,10 @@ import hashlib
 import json
 import os
 import re
+import shlex
+import subprocess
 import sys
+import textwrap
 import time
 import httpx
 import threading
@@ -131,6 +134,66 @@ MIN_REDUCTION_RATIO = 0.9      # a round must remove >=10% or the ladder stops
 # Chunks get a capped steering extract of prior analyses; the merge gets it all.
 PRIOR_STEER_MAX_TOKENS = 400
 
+# --- Reasoning effort ---
+# Per-pass, set as "reasoning" on a model entry in agent_config.json.
+#
+# The values are the model template's own, not ours: it resolves
+# reasoning_effort to 'xhigh' when unset, aliases 'high' to 'xhigh', and calls
+# raise_exception on anything outside xhigh/medium/low. "off" is not one of them
+# - the template expresses off as enable_thinking=false, which prefills an empty
+# <think></think> - so it is translated rather than passed through. Validating
+# here turns a config typo into a startup error instead of an HTTP 500 several
+# minutes into a pass.
+REASONING_LEVELS = ("off", "low", "medium", "xhigh")
+DEFAULT_REASONING = "low"
+
+# What a thinking pass is allowed to spend on the reasoning channel.
+#
+# Reasoning tokens are charged against the SAME output cap and the SAME KV as
+# the answer, so a pass that thinks with the budget solved for its answer alone
+# spends the cap on thought and emits zero answer tokens - the exact failure
+# _salvage_note() describes. The reserve is therefore paid twice, symmetrically:
+# subtracted from the window before the budget is solved, and added to the cap
+# sent to the server. That keeps fixed + prompt + answer + reasoning + margin
+# <= window true by construction.
+#
+# Sized for 'low'. Raising a pass to xhigh without raising this reproduces the
+# runaway that cost the build agent a whole 64k slot.
+REASONING_RESERVE_TOKENS = 4096
+
+# ...which is exactly what happened next, because the reserve was one number for
+# every thinking level. `low` and `xhigh` drew the same 4096, so raising the
+# bugfix pass to xhigh raised how much it thought without raising where it was
+# allowed to think. On a ~70k-token evidence payload it spent the whole output
+# cap - measured at exactly ANSWER_MAX_TOKENS + 4096 - on reasoning, and the
+# document was cut off before section 2. The harness then reported "section 2
+# declared no COMMAND", which is true, useless, and three retries deep into the
+# same wall.
+#
+# The reserve is what a level is EXPECTED to think, so it scales with the level.
+# The multipliers are deliberately generous: over-reserving costs prompt budget,
+# which the solver reports and truncates cleanly, while under-reserving costs the
+# answer itself and is only visible as a downstream parse failure. Those two
+# failures are not symmetric, so this errs upward.
+REASONING_RESERVE_MULTIPLIER = {
+    "off": 0.0,
+    "low": 1.0,
+    "medium": 2.0,
+    "xhigh": 4.0,
+}
+
+# --- Sampling ---
+# The model card's thinking-mode figures. The previous 0.3 was set for a
+# non-thinking model and is far below both of the card's presets (thinking
+# 1.0/0.95/20, instruct 0.7/0.80/20); on this family a temperature that low is a
+# repetition-loop risk, which is the shape of the failure that has been showing
+# up in long passes. min_p 0.0 disables it, as the card specifies - llama.cpp
+# defaults it to 0.05.
+SAMPLING_TEMPERATURE = 1.0
+SAMPLING_TOP_P = 0.95
+SAMPLING_TOP_K = 20
+SAMPLING_MIN_P = 0.0
+
 # Absolute ceiling on knowledge-base injection. The real limit is solved per run
 # by solve_kb_budget(); this only stops a very large window from pulling in an
 # unbounded KB just because it can.
@@ -148,11 +211,51 @@ BUDGET_DRIFT_FRACTION = 0.15
 # Stability Protocol: how long a stream may go with NO new token before we give up.
 # This is an idle timer, not a wall-clock deadline - a healthy fast stream is never
 # killed for the crime of having a lot to say.
-STALL_TIMEOUT = 45.0
+#
+# It only behaves as an idle timer once the model is RESIDENT. httpx's read timeout
+# is the gap between socket reads, and before the first token there are no reads,
+# so on a cold model this budget silently covers eviction, an 18GB load from disk,
+# a 64k KV-cache allocation and the whole prompt eval. That is how a healthy model
+# burns three attempts at 45s each and reports "No tokens of any kind received".
+# preload_model() exists to take the load out of this budget - keep them paired.
+#
+# Sized from observation, not taste. At 45.0 the test_engineer pass was measured
+# completing in 44.1s on one run and failing all three attempts on the next: the
+# real time-to-first-token was sitting ON the boundary, so the pass was a coin
+# flip. Cold load is not the cause (measured at 6.7s for an 18GB model) and
+# neither is thinking (first byte at 4.1s on an 11.6k-char prompt, idle GPU) -
+# what is left is contention, which is exactly what a first-token budget should
+# absorb rather than fail on. Raise this before suspecting the model.
+STALL_TIMEOUT = float(os.environ.get("STALL_TIMEOUT", "150"))
+
+# How long a cold model may take to become resident. Loading is disk- and
+# VRAM-bound and has nothing to do with generation speed, so it gets its own
+# budget rather than borrowing the stall timer's.
+MODEL_LOAD_TIMEOUT = float(os.environ.get("MODEL_LOAD_TIMEOUT", "600"))
+
+# --- Design pass ---
+# Pass 1 answers "what should this codebase become". There are two ways to ask
+# that and they want different roles, not different phrasings of one role:
+# `!architect` designs new structure, `!bugfix` removes one defect and touches
+# nothing else. They are alternatives, never stages - a bug report handed to the
+# architect comes back as a refactor, and a feature request handed to the bugfix
+# pass comes back BLOCKED for want of a symptom.
+#
+# So the pipeline is parameterised on which one occupies slot 1. Everything
+# downstream - the intermediate path, resume, the re-plan, the .clinerules
+# assembly - follows this key, and the default leaves `!build` and `!architect`
+# running exactly the pipeline they ran before this existed.
+DESIGN_PASSES = ("architect", "bugfix")
+DISTILL_DESIGN_PASS = os.environ.get("DISTILL_DESIGN_PASS", "").strip().lower() or "architect"
+if DISTILL_DESIGN_PASS not in DESIGN_PASSES:
+    raise SystemExit(
+        f"DISTILL_DESIGN_PASS='{DISTILL_DESIGN_PASS}' is not a design pass. "
+        f"Expected one of: {', '.join(DESIGN_PASSES)}."
+    )
 
 # --- Review Gate ---
 # Which passes to run this invocation. Empty means the full 4-pass pipeline.
-# The review gate sets DISTILL_PASSES=architect to stop after pass 1.
+# The review gate sets DISTILL_PASSES to the design pass to stop after pass 1.
 DISTILL_PASSES = os.environ.get("DISTILL_PASSES", "").strip()
 # Reuse a previously saved pass result instead of regenerating it. What is on
 # disk is authoritative, so a hand-edited architecture survives into the build.
@@ -209,9 +312,14 @@ class ExtractionFailed(RuntimeError):
         )
 
 
+def _looks_like_llm_error(result) -> bool:
+    """True for the sentinel string a call returns when it gave up."""
+    return isinstance(result, str) and result.startswith("[ERROR:")
+
+
 def _check_llm_result(result: str, label: str):
     """Return (label, error) if a call gave up, else None."""
-    if isinstance(result, str) and result.startswith("[ERROR:"):
+    if _looks_like_llm_error(result):
         return (label, result.strip()[1:-1].removeprefix("ERROR:").strip())
     return None
 
@@ -505,10 +613,31 @@ _EMPTY_BLOCKER_RE = re.compile(
 # Passes 3 and 4 see a ~90-token instruction to review the earlier analyses, so
 # their blockers are always "the previous specification is missing" - which is
 # fixed by unblocking the pass upstream, not by handing them source code.
-EVIDENCE_RETRY_PASSES = ("architect", "engineer")
+EVIDENCE_RETRY_PASSES = ("architect", "bugfix", "engineer")
 EVIDENCE_MAX_FILES = 12
 EVIDENCE_MAX_FILE_CHARS = 24000
+# Smallest slice of a file worth attaching. The failure this guards is a leftover
+# budget that covers the truncation marker and little else: the block carries no
+# content, teaches the pass nothing, and still counts the path as delivered -
+# burning it out of the retry loop for good. Leftovers this small go to
+# <NOT_READ> instead, so the next round can spend a whole budget on them.
+#
+# Deliberately low. "Truncated beats skipped" is the rule this function is built
+# on - a partial interface still beats the skeleton's bare symbol name - so this
+# is a floor against empty blocks, not a quality bar on the slice.
+EVIDENCE_MIN_SLICE_CHARS = 200
 BLOCKER_RESOLVE_MAX_TOKENS = 300
+
+# How many times a pass may block, be shown files, and try again.
+#
+# One is right for design: the architect blocks on a specification gap, and a gap
+# that survives being shown the files is a gap the workspace does not contain.
+# Diagnosis is the opposite shape - reading files IS the work, and each round
+# narrows the search rather than re-asking the same question - so the bugfix pass
+# is allowed to follow the trail. The cost is a full pass per round, so it is
+# bounded rather than open.
+EVIDENCE_ROUNDS = {"bugfix": 3}
+EVIDENCE_ROUNDS_DEFAULT = 1
 
 
 def detect_blockers(result: str) -> list:
@@ -536,6 +665,11 @@ def detect_blockers(result: str) -> list:
 
 
 BlockerPaths = collections.namedtuple("BlockerPaths", ("present", "absent"))
+
+# What read_evidence actually put in the payload, as opposed to what was asked
+# for. The two diverge whenever the budget runs out mid-set, and the caller has
+# to mark only `included` as seen - see resolve_pass_blockers.
+Evidence = collections.namedtuple("Evidence", ("text", "included"))
 
 
 def _looks_like_path(candidate: str) -> bool:
@@ -575,7 +709,11 @@ def resolve_blocker_paths(client, model_config, blockers: list,
                            max_output_tokens=BLOCKER_RESOLVE_MAX_TOKENS)
     if _check_llm_result(raw, "Blocker resolution"):
         print("  ⚠ Blocker resolution call failed; continuing without evidence.", flush=True)
-        return []
+        # BlockerPaths, not a bare list. The caller reads `.present` OUTSIDE the
+        # try that guards this call, so returning [] here raised AttributeError
+        # and took down the pass on the one path that exists to survive a failed
+        # resolution.
+        return BlockerPaths([], [])
 
     paths, absent = [], []
     for line in raw.splitlines():
@@ -594,8 +732,96 @@ def resolve_blocker_paths(client, model_config, blockers: list,
     return BlockerPaths(paths, absent[:EVIDENCE_MAX_FILES])
 
 
+# A blocker names `<path>::<symbol>` because that is the shape the prompts ask
+# for. Keeping the symbol lets the reader slice a large file around the thing
+# actually being asked about instead of taking whatever happens to be at the top.
+_BLOCKER_SYMBOL_RE = re.compile(r"([\w./-]+\.[A-Za-z0-9]{1,5})::([A-Za-z_]\w*)")
+
+# What a definition of `X` looks like across the languages this pipeline sees.
+# Preferred over a bare name match because the first mention of a symbol in a
+# file is usually an import or a reference, and slicing around an import teaches
+# the pass nothing about the shape it asked for.
+_DEFINITION_RE_TMPL = (
+    r"^[ \t]*(?:export\s+)?(?:default\s+)?(?:declare\s+)?(?:abstract\s+)?"
+    r"(?:async\s+)?(?:public\s+|private\s+|protected\s+)?"
+    r"(?:interface|type|class|enum|function|const|let|var|def|struct|impl)\s+{}\b"
+)
+
+
+def blocker_symbol_hints(blockers: list) -> dict:
+    """Map path -> [symbol] for every `<path>::<symbol>` a blocker named."""
+    hints = {}
+    for b in blockers or []:
+        for path, symbol in _BLOCKER_SYMBOL_RE.findall(b or ""):
+            hints.setdefault(path.lstrip("./"), []).append(symbol)
+    return hints
+
+
+def _find_definition(content: str, symbols) -> "int | None":
+    """Offset of the earliest definition of any named symbol, else any mention."""
+    best = None
+    for sym in symbols or []:
+        m = re.search(_DEFINITION_RE_TMPL.format(re.escape(sym)), content,
+                      re.MULTILINE)
+        if not m:
+            m = re.search(rf"\b{re.escape(sym)}\b", content)
+        if m and (best is None or m.start() < best):
+            best = m.start()
+    return best
+
+
+def _slice_around_symbols(content: str, keep: int, symbols) -> str:
+    """
+    Take `keep` characters centred on the symbol the blocker asked about.
+
+    The head slice this replaces made a whole class of blocker unanswerable. An
+    architect asked for `src/types/domain.ts::DomainControlChallenge`; the
+    definition sits at byte 27473 of 33736 and the cap is 24000, so it was handed
+    24k of the file that did NOT contain the one symbol it named. It blocked
+    again, in the same words, with its single retry round already spent - and the
+    failure is invisible, because a plausible slice of the right file looks like
+    the request was honoured.
+
+    Falls back to the head slice when no symbol was named or none is found, which
+    is the old behaviour and the right default: the top of a file is where its
+    imports and principal declarations usually are.
+    """
+    if len(content) <= keep:
+        return content
+
+    tail_marker = "\n... [truncated: {} more characters]"
+    head_marker = "... [{} earlier characters omitted]\n"
+
+    def head_slice() -> str:
+        body = content[:max(0, keep - len(tail_marker.format(len(content))))]
+        return body + tail_marker.format(len(content) - len(body))
+
+    hit = _find_definition(content, symbols)
+    if hit is None:
+        return head_slice()
+
+    # Reserve against the untruncated length so the reservation can only ever be
+    # too large - the same defensive sizing the caller uses, for the same reason.
+    reserve = len(head_marker.format(len(content))) + len(tail_marker.format(len(content)))
+    window = keep - reserve
+    if window < EVIDENCE_MIN_SLICE_CHARS:
+        return head_slice()
+
+    # A quarter of the window ahead of the definition, so the surrounding context
+    # comes too; the rest follows it, which is where a body or field list lives.
+    start = max(0, hit - window // 4)
+    end = min(len(content), start + window)
+    start = max(0, end - window)
+
+    out = head_marker.format(start) if start > 0 else ""
+    out += content[start:end]
+    if end < len(content):
+        out += tail_marker.format(len(content) - end)
+    return out
+
+
 def read_evidence(project_dir: str, paths: list, budget_chars: int,
-                  absent: list = None) -> str:
+                  absent: list = None, symbol_hints: dict = None) -> "Evidence":
     """
     Read the requested files into a payload block, within budget.
 
@@ -607,10 +833,14 @@ def read_evidence(project_dir: str, paths: list, budget_chars: int,
     `absent` names files the pass asked for that do not exist. They are stated
     explicitly and cost almost no budget, and they are worth a block on their own:
     "that file is not there" can be the whole answer.
+
+    Returns an Evidence(text, included). `included` is the subset actually read:
+    a set that overruns the budget leaves the rest in <NOT_READ>, and the caller
+    must not record those as supplied or the pass can never ask for them again.
     """
     absent = absent or []
     if (not paths and not absent) or budget_chars <= 0:
-        return ""
+        return Evidence("", [])
 
     blocks, remaining, included, skipped = [], budget_chars, [], []
     for rel in paths:
@@ -625,13 +855,26 @@ def read_evidence(project_dir: str, paths: list, budget_chars: int,
             continue
         cap = min(remaining, EVIDENCE_MAX_FILE_CHARS)
         if len(content) > cap:
-            content = content[:cap] + f"\n... [truncated: {len(content) - cap} more characters]"
+            # The marker is spent from the budget too. Slicing to `cap` and then
+            # appending it put every truncated file over its own cap, driving
+            # `remaining` negative and skipping the rest of the request set on
+            # the next iteration. Sizing the reservation against the untruncated
+            # length only ever over-reserves, so the block cannot exceed `cap`.
+            marker = "\n... [truncated: {} more characters]"
+            keep = cap - len(marker.format(len(content)))
+            if keep < EVIDENCE_MIN_SLICE_CHARS:
+                skipped.append(rel)
+                continue
+            # Centred on the symbol the blocker named, not the top of the file.
+            content = _slice_around_symbols(
+                content, keep, (symbol_hints or {}).get(rel)
+            )
         remaining -= len(content)
         included.append(rel)
         blocks.append(f'<file path="{rel}">\n{content}\n</file>')
 
     if not blocks and not absent:
-        return ""
+        return Evidence("", [])
     note = ""
     if absent:
         note += ("\n  <ABSENT>These paths do not exist in the workspace. That is "
@@ -645,67 +888,601 @@ def read_evidence(project_dir: str, paths: list, budget_chars: int,
           f"{budget_chars - remaining} chars — {', '.join(included) or 'none'}", flush=True)
     if absent:
         print(f"  📭 Confirmed absent: {', '.join(absent)}", flush=True)
-    return (
+    return Evidence(
         "\n\n  <REQUESTED_EVIDENCE>\n"
         "  You previously reported these blockers. The findings below were read "
         "from the workspace to resolve them. Design against them; do not block on "
         "facts they now supply.\n"
         + "\n".join(blocks) + note +
-        "  </REQUESTED_EVIDENCE>\n"
+        "  </REQUESTED_EVIDENCE>\n",
+        included,
     )
+
+
+def print_blocker(index: int, text: str, width: int = 100) -> None:
+    """
+    Print one blocker in full, wrapped, to the build log.
+
+    This used to be clipped to 150 characters. A blocker is a single line that
+    names the artefact the pass needs AND why it cannot proceed without it - and
+    150 characters reliably landed mid-sentence, in the middle of the "why". That
+    is the half worth reading: it distinguishes a gap the workspace can close
+    (a file exists but was not in CONTEXT) from one it cannot (the request never
+    said what the expected behaviour was), and only the first is worth spending
+    another round on.
+    """
+    body = " ".join(text.split())
+    lines = textwrap.wrap(body, width=width) or [""]
+    print(f"     · [{index}] {lines[0]}", flush=True)
+    for continuation in lines[1:]:
+        print(f"           {continuation}", flush=True)
 
 
 def resolve_pass_blockers(client, pass_key: str, model_config, prompt: str,
                           target_content: str, prior_context: str,
-                          symbol_skeleton: str, result: str) -> str:
+                          symbol_skeleton: str, result: str,
+                          max_rounds: int = None) -> str:
     """
     Satisfy a pass's blockers once, and return whatever it produced afterwards.
 
     Returns the original result unchanged when there is nothing to do, so the
     caller can apply it unconditionally. Shared by the initial distillation and
     by the re-plan, which is just as capable of asking for a file it cannot see.
+
+    Runs up to EVIDENCE_ROUNDS rounds. Evidence accumulates across them: a pass
+    that blocks twice is following a trail, and dropping round one's files to
+    make room for round two's would walk it back to the start.
+
+    `max_rounds` overrides that budget. The reproduction loop passes 1: the pass
+    has already had its full allowance on the first attempt, so a re-run that
+    blocks is correcting a diagnosis rather than starting one, and letting each
+    of three attempts buy three more rounds turns one bug into twelve LLM calls.
     """
-    blockers = detect_blockers(result)
-    if not (blockers and pass_key in EVIDENCE_RETRY_PASSES and symbol_skeleton):
+    if pass_key not in EVIDENCE_RETRY_PASSES or not symbol_skeleton:
         return result
 
-    print(f"  🚧 {pass_key} reported {len(blockers)} blocker(s); "
-          f"resolving against the workspace...", flush=True)
-    for b in blockers:
-        print(f"     · {b[:150]}", flush=True)
-    try:
-        found = resolve_blocker_paths(
-            client, model_config, blockers, symbol_skeleton, "/workspace"
+    if max_rounds is None:
+        max_rounds = EVIDENCE_ROUNDS.get(pass_key, EVIDENCE_ROUNDS_DEFAULT)
+    seen = set()
+    evidence = ""
+
+    for round_no in range(1, max_rounds + 1):
+        blockers = detect_blockers(result)
+        if not blockers:
+            return result
+
+        print(f"  🚧 {pass_key} reported {len(blockers)} blocker(s) "
+              f"(round {round_no}/{max_rounds}); resolving against the workspace...",
+              flush=True)
+        for i, b in enumerate(blockers, 1):
+            print_blocker(i, b)
+        try:
+            found = resolve_blocker_paths(
+                client, model_config, blockers, symbol_skeleton, "/workspace"
+            )
+        except Exception as e:
+            print(f"  ⚠ Blocker resolution errored ({e}); continuing.", flush=True)
+            found = BlockerPaths([], [])
+
+        # A pass that re-asks for a file it has already been shown is stuck, not
+        # progressing. Reading it a second time would spend the budget to hand
+        # back a byte-identical payload, so only genuinely new paths count.
+        fresh = [p for p in found.present if p not in seen]
+        fresh_absent = [p for p in found.absent if p not in seen]
+
+        # What the resolver made of the blockers, before any of it is acted on.
+        # Without this the log jumps from the pass's request to a file count,
+        # and a path that was classified absent, or held back as already-seen,
+        # is indistinguishable from one the budget simply could not reach.
+        repeated = [p for p in (list(found.present) + list(found.absent)) if p in seen]
+        if fresh:
+            print(f"     ↳ on disk, will read: {', '.join(fresh)}", flush=True)
+        if fresh_absent:
+            print(f"     ↳ not in the workspace (answers the blocker): "
+                  f"{', '.join(fresh_absent)}", flush=True)
+        if repeated:
+            print(f"     ↳ already supplied in an earlier round: "
+                  f"{', '.join(repeated)}", flush=True)
+
+        if not fresh and not fresh_absent:
+            print(f"  ⚠ Round {round_no} asked only for paths already supplied; "
+                  f"stopping. The pass has the contents and still cannot place "
+                  f"the defect - the gap is in the report, not the workspace.",
+                  flush=True)
+            return result
+
+        budget = solve_addendum_budget(
+            CONTEXT_WINDOW, est_tokens(prompt),
+            est_tokens(target_content) + est_tokens(prior_context) + est_tokens(evidence),
         )
-    except Exception as e:
-        print(f"  ⚠ Blocker resolution errored ({e}); continuing.", flush=True)
-        found = BlockerPaths([], [])
+        found_evidence = read_evidence("/workspace", fresh, budget, fresh_absent,
+                                       symbol_hints=blocker_symbol_hints(blockers))
+        addendum = found_evidence.text
+        if not addendum:
+            print("  ⚠ No readable evidence identified for these blockers.", flush=True)
+            return result
 
-    budget = solve_addendum_budget(
-        CONTEXT_WINDOW, est_tokens(prompt),
-        est_tokens(target_content) + est_tokens(prior_context),
-    )
-    evidence = read_evidence("/workspace", found.present, budget, found.absent)
-    if not evidence:
-        print("  ⚠ No readable evidence identified for these blockers.", flush=True)
-        return result
+        # The partial-delivery case, which is invisible otherwise: read_evidence
+        # spends one shared budget in order and leaves the rest in <NOT_READ>.
+        # Saying so here is what makes the next round's repeat request legible as
+        # progress rather than the pass going in circles.
+        unread = [p for p in fresh if p not in found_evidence.included]
+        if unread:
+            print(f"     ⏭ budget spent before reading: {', '.join(unread)} "
+                  f"— deferred to round {round_no + 1}"
+                  + (" (none left; raise DISTILL_CTX or EVIDENCE_ROUNDS)"
+                     if round_no >= max_rounds else ""), flush=True)
 
-    print(f"  ↻ Re-running {pass_key} with the evidence attached "
-          f"(budget {budget} chars)...", flush=True)
-    update_status(f"Resolving blockers: {pass_key}")
+        # Only what was actually read. Marking the whole `fresh` set seen meant a
+        # request the budget could not satisfy in one round was recorded as
+        # answered: the pass re-asked for the files it never received, every one
+        # of them failed the `not in seen` test, and the loop stopped on "asked
+        # only for paths already supplied" with rounds still on the clock. The
+        # unread ones stay unseen so the next round can spend a fresh budget on
+        # them. `fresh_absent` is different - a confirmed absence is a complete
+        # answer, costs no budget, and is always reported in full.
+        seen.update(found_evidence.included)
+        seen.update(fresh_absent)
+        evidence += addendum
+
+        print(f"  ↻ Re-running {pass_key} with the evidence attached "
+              f"(budget {budget} chars)...", flush=True)
+        update_status(f"Resolving blockers: {pass_key} (round {round_no})")
+        try:
+            result = call_llm(client, model_config, prompt,
+                              target_content + evidence, prior_context)
+        except (BudgetInfeasible, ExtractionFailed) as e:
+            print(f"  ⚠ Retry failed ({e}); keeping the blocked result.", flush=True)
+            return result
+
+        if not detect_blockers(result):
+            print(f"  ✓ {pass_key} unblocked by the evidence.", flush=True)
+            return result
+
+    print(f"  ⚠ {pass_key} is still blocked after {max_rounds} round(s) of evidence "
+          f"({len(seen)} path(s) supplied).", flush=True)
+    return result
+
+
+# --- Reproduction protocol ----------------------------------------------------
+#
+# A distillation pass is a stateless call with no tools. It cannot run anything,
+# so "I have verified this bug is reproducible" is, from a pass, an opinion - the
+# same opinion the test gate exists to stop the pipeline accepting about its own
+# output. On a hard bug that is exactly where a model is least reliable.
+#
+# So the bugfix prompt does not assert reproducibility, it declares it: one
+# COMMAND and one SIGNATURE (bugfix.md B5). This runs the command and looks for
+# the signature. A diagnosis whose repro does not fail as described is not a
+# diagnosis, and what actually happened goes back to the pass as evidence.
+#
+# The command is never handed to a shell. shlex + a first-token allowlist means
+# the prohibition on pipes and redirection in B5 is enforced by the runner rather
+# than trusted to the model - the pass names a program and its arguments, and
+# that is the whole of what it can cause to happen.
+REPRO_ALLOWED_BINARIES = frozenset({
+    "npm", "npx", "node", "python", "python3", "pytest",
+    "go", "cargo", "mvn", "gradle",
+})
+
+# Substrings that identify a broken build rather than a specific bug. A pass that
+# offers one of these as its SIGNATURE has declared a repro that any failure at
+# all would satisfy, which would verify a diagnosis at random.
+REPRO_WEAK_SIGNATURES = frozenset({
+    "error", "errors", "failed", "failure", "failures", "fail", "1 failed",
+    "exception", "traceback", "assertionerror", "test failed", "tests failed",
+    "non-zero", "exit 1", "false", "undefined", "null", "nan",
+})
+REPRO_MIN_SIGNATURE_CHARS = 8
+
+# A runner that is not installed is not a reproduced bug. Same classification the
+# build loop's test gate applies, for the same reason: it says nothing about the
+# code, so treating it as a failing repro would confirm any diagnosis on a box
+# that happens to be missing a dependency.
+#
+# The connection-refused clauses matter more than they look. This container
+# reaches the host at the docker bridge address, and a database published as
+# `127.0.0.1:5432` on the host is not listening there - so every DB-backed
+# reproduction dies with ECONNREFUSED. Without these patterns that lands in the
+# "failed, but not with the declared signature" branch, whose observation tells
+# the pass its root cause is wrong and to diagnose something else. That is the
+# one failure mode worse than not verifying: the harness actively steering a
+# correct diagnosis off the causal path over an environment fault. Classified
+# here it becomes "the environment could not run this", which is the truth.
+#
+# "no test files found" is the same class of lie: the runner started, matched
+# nothing, and exited non-zero. It says the COMMAND's path or --root is wrong,
+# not that the code is broken.
+_REPRO_UNRUNNABLE_RE = re.compile(
+    r"no module named|command not found|could not determine executable|"
+    r"npm error|cannot find module|is not recognized as|no such file or directory|"
+    r"econnrefused|connection refused|could not connect to server|"
+    r"getaddrinfo|eai_again|no test files found",
+    re.IGNORECASE,
+)
+
+# Horizontal whitespace only. `\s` would match the newline, so `- COMMAND:` with
+# an empty value silently captured the SIGNATURE line below it - a malformed
+# document that parsed cleanly into the wrong command.
+_REPRO_COMMAND_RE = re.compile(r"^[ \t]*[-*]?[ \t]*COMMAND:[ \t]*([^\n]*)$",
+                               re.MULTILINE | re.IGNORECASE)
+_REPRO_SIGNATURE_RE = re.compile(r"^[ \t]*[-*]?[ \t]*SIGNATURE:[ \t]*([^\n]*)$",
+                                 re.MULTILINE | re.IGNORECASE)
+
+# `- COMMAND: `pytest -q`.` is a correct command wearing prose punctuation. The
+# full stop sits outside the backticks, so it has to come off before they do.
+_TRAILING_PROSE_RE = re.compile(r"([`*_])[ \t]*\.[ \t]*$")
+
+
+def _unwrap_field(value: str) -> str:
+    """Strip the markdown wrapper and trailing prose a model puts round a value."""
+    value = value.strip()
+    value = _TRAILING_PROSE_RE.sub(r"\1", value)
+    for wrapper in ("`", "**", "*", "_"):
+        span = 2 * len(wrapper)
+        while len(value) > span and value.startswith(wrapper) and value.endswith(wrapper):
+            value = value[len(wrapper):-len(wrapper)].strip()
+    return value
+
+# --- REPRO_FILE ---------------------------------------------------------------
+#
+# The gate above assumes the bug already has a failing test. Most do not.
+#
+# A green suite on a broken feature is the normal case, not a strange one: the
+# suite encodes the fixtures its author wrote, and the defect is usually in the
+# gap between those fixtures and what the real caller sends. So requiring
+# section 2's COMMAND to fail against the UNMODIFIED tree - which is the only
+# tree the harness has, since nothing is written before it runs - made the gate
+# unsatisfiable for exactly the bugs it was built to catch. The pass could only
+# block, or declare a command it hoped would fail, three times, and end
+# UNVERIFIED. Both outcomes were read as "the diagnosis is bad" when what
+# actually happened was "the project has no test for this yet".
+#
+# So the reproduction may carry the test it needs. The pass names a path and
+# supplies a body; the harness writes it, runs COMMAND, and removes it again.
+# Three properties make that safe to do to somebody's checkout:
+#   - it refuses to overwrite anything that already exists, so no source file
+#     can be replaced by a diagnosis;
+#   - the path must resolve inside the project root, so `..` and absolute paths
+#     cannot escape the workspace;
+#   - removal is in a finally, so a timeout or a crash still leaves the tree as
+#     it was found.
+# The body stays in the saved document, so `!approve` can recreate it as the
+# regression test B9 already asks for - the reproduction and the regression test
+# are the same artefact, which is what they should have been all along.
+_REPRO_FILE_RE = re.compile(r"^[ \t]*[-*]?[ \t]*REPRO_FILE:[ \t]*([^\n]*)$",
+                            re.MULTILINE | re.IGNORECASE)
+# The body is the first fenced block after the REPRO_FILE line. An info string
+# (```ts) is common and ignored.
+_FENCE_RE = re.compile(r"^[ \t]*```[^\n]*\n(.*?)^[ \t]*```[ \t]*$",
+                       re.MULTILINE | re.DOTALL)
+
+# A test that asserts nothing cannot fail for the right reason. This is not a
+# quality bar, it is a floor against a pass satisfying the gate with an empty
+# file or a bare `throw` that would "fail" whatever the code did.
+REPRO_FILE_MIN_CHARS = 40
+REPRO_FILE_MAX_CHARS = 20000
+
+
+def parse_repro_file(document: str):
+    """
+    Return (path, body) for a declared REPRO_FILE, or (None, reason_or_None).
+
+    A reason of None means the document simply did not declare one, which is
+    fine - an existing failing test is still the better reproduction. A non-None
+    reason means it tried to and the declaration is unusable, which the caller
+    reports back rather than silently ignoring.
+    """
+    match = _REPRO_FILE_RE.search(document or "")
+    if not match:
+        return None, None
+
+    path = _unwrap_field(match.group(1))
+    if not path:
+        return None, "REPRO_FILE was declared with no path"
+
+    fence = _FENCE_RE.search(document, match.end())
+    if not fence:
+        return None, (f"REPRO_FILE named '{path}' but no fenced code block follows "
+                      f"it, so there is no file body to write")
+    body = fence.group(1)
+    if len(body.strip()) < REPRO_FILE_MIN_CHARS:
+        return None, (f"REPRO_FILE '{path}' has a {len(body.strip())}-character body; "
+                      f"too small to be a test that asserts anything")
+    if len(body) > REPRO_FILE_MAX_CHARS:
+        return None, (f"REPRO_FILE '{path}' is {len(body)} characters; a reproduction "
+                      f"is one focused test, not a module")
+    return (path, body), None
+
+
+def validate_repro_file(path: str, cwd: str = "/workspace"):
+    """Return None if the path is a safe, non-destructive place to write, else why not."""
+    if os.path.isabs(path):
+        return f"REPRO_FILE '{path}' is absolute; it must be relative to the project root"
+    root = os.path.realpath(cwd)
+    full = os.path.realpath(os.path.join(root, path))
+    if full != root and not full.startswith(root + os.sep):
+        return f"REPRO_FILE '{path}' resolves outside the project root"
+    if os.path.exists(full):
+        return (f"REPRO_FILE '{path}' already exists. A reproduction may not overwrite "
+                f"a file in the project; name a new path, or run the existing test "
+                f"instead of supplying one")
+    parent = os.path.dirname(full)
+    if parent and not os.path.isdir(parent):
+        return f"REPRO_FILE '{path}' is in a directory that does not exist"
+    return None
+
+
+ReproResult = collections.namedtuple("ReproResult", ("verified", "reason", "observation"))
+
+# Marks a bugfix document whose reproduction never failed as declared. Wears the
+# same shape as ABORT_MARKER and is refused by load_saved_pass for the same
+# reason: `!approve` must not build a fix for a bug nobody reproduced.
+UNVERIFIED_MARKER = "## ⚠ UNVERIFIED — the declared reproduction did not fail as described"
+
+
+def _normalise_output(text: str) -> str:
+    """Collapse whitespace and case so a signature match survives reformatting."""
+    return re.sub(r"\s+", " ", (text or "")).strip().lower()
+
+
+def parse_reproduction(document: str):
+    """
+    Return (command, signature) from a bugfix document's section 2, or (None, reason).
+
+    Tolerant of the markup a model wraps around a command - backticks, a bold
+    label, a trailing full stop - because rejecting a correct command over a pair
+    of backticks would burn a full pass to be told the same thing again.
+    """
+    cmd_match = _REPRO_COMMAND_RE.search(document or "")
+    sig_match = _REPRO_SIGNATURE_RE.search(document or "")
+    if not cmd_match:
+        return None, "section 2 declared no COMMAND"
+    if not sig_match:
+        return None, "section 2 declared no SIGNATURE"
+
+    command = _unwrap_field(cmd_match.group(1))
+    signature = _unwrap_field(sig_match.group(1))
+    if not command:
+        return None, "COMMAND was empty"
+    if not signature:
+        return None, "SIGNATURE was empty"
+    return (command, signature), None
+
+
+def validate_reproduction(command: str, signature: str):
+    """Return None if the declared repro is runnable and specific, else the reason."""
     try:
-        retried = call_llm(client, model_config, prompt,
-                           target_content + evidence, prior_context)
-    except (BudgetInfeasible, ExtractionFailed) as e:
-        print(f"  ⚠ Retry failed ({e}); keeping the blocked result.", flush=True)
-        return result
+        argv = shlex.split(command)
+    except ValueError as e:
+        return f"COMMAND is not a well-formed command line ({e})"
+    if not argv:
+        return "COMMAND was empty"
+    binary = os.path.basename(argv[0])
+    if binary not in REPRO_ALLOWED_BINARIES:
+        return (f"COMMAND starts with '{binary}', which is not one of the allowed "
+                f"runners: {', '.join(sorted(REPRO_ALLOWED_BINARIES))}")
 
-    if detect_blockers(retried):
-        print(f"  ⚠ {pass_key} is still blocked after reading {len(found.present)} "
-              f"file(s) and confirming {len(found.absent)} absent.", flush=True)
-    else:
-        print(f"  ✓ {pass_key} unblocked by the evidence.", flush=True)
-    return retried
+    normalised = _normalise_output(signature)
+    if len(normalised) < REPRO_MIN_SIGNATURE_CHARS:
+        return (f"SIGNATURE '{signature}' is {len(normalised)} characters; too short "
+                f"to identify one failure rather than any failure")
+    if normalised in REPRO_WEAK_SIGNATURES:
+        return (f"SIGNATURE '{signature}' matches any broken build, not this bug")
+    return None
+
+
+def run_reproduction(command: str, signature: str, timeout_secs: float,
+                     cwd: str = "/workspace", repro_file=None) -> ReproResult:
+    """
+    Run the declared command in the workspace and decide whether the bug appeared.
+
+    Verified means three things together: the command ran, it exited non-zero,
+    and the declared signature is in its output. Any one alone is not enough - a
+    non-zero exit from an uninstalled runner is the case this exists to reject.
+
+    `repro_file` is an optional (path, body) the pass supplied because no
+    existing test reproduces the bug. It is written before the command and
+    removed after, always - see the REPRO_FILE note above.
+    """
+    argv = shlex.split(command)
+    written = None
+    if repro_file:
+        rel, body = repro_file
+        full = os.path.join(cwd, rel)
+        try:
+            with open(full, "w", encoding="utf-8") as f:
+                f.write(body)
+            written = full
+            print(f"  📝 Wrote reproduction test {rel} ({len(body)} chars)", flush=True)
+        except OSError as e:
+            return ReproResult(False, f"could not write REPRO_FILE '{rel}' ({e})",
+                               f"The reproduction test could not be written: {e}")
+    try:
+        return _run_reproduction_command(argv, command, signature, timeout_secs, cwd)
+    finally:
+        # Unconditional: a timeout, a signature miss and a clean verification all
+        # leave the checkout exactly as it was found. The body survives in the
+        # saved document, which is what `!approve` builds the regression test from.
+        if written:
+            try:
+                os.remove(written)
+                print(f"  🧹 Removed reproduction test {repro_file[0]}", flush=True)
+            except OSError as e:
+                print(f"  ⚠ Could not remove {repro_file[0]}: {e}", flush=True)
+
+
+def _run_reproduction_command(argv, command: str, signature: str,
+                              timeout_secs: float, cwd: str) -> ReproResult:
+    """Run the command and classify the outcome. See run_reproduction."""
+    print(f"  🔁 Reproduction: {command} (timeout {int(timeout_secs)}s)", flush=True)
+    try:
+        proc = subprocess.run(
+            argv, cwd=cwd, capture_output=True, text=True,
+            timeout=timeout_secs, check=False,
+        )
+        output = (proc.stdout or "") + (proc.stderr or "")
+        exit_code = proc.returncode
+    except FileNotFoundError:
+        return ReproResult(False, f"'{argv[0]}' is not installed in this image",
+                           f"The command could not start: '{argv[0]}' was not found.")
+    except subprocess.TimeoutExpired as e:
+        partial = ((e.stdout or b"") if isinstance(e.stdout, bytes) else (e.stdout or ""))
+        detail = partial.decode("utf-8", "replace") if isinstance(partial, bytes) else partial
+        return ReproResult(False, f"timed out after {int(timeout_secs)}s",
+                           f"The command did not finish within {int(timeout_secs)}s. "
+                           f"Partial output:\n{detail[-2000:]}")
+    except Exception as e:
+        return ReproResult(False, f"could not run ({type(e).__name__}: {e})",
+                           f"The command could not be run: {e}")
+
+    tail = output[-4000:]
+    if exit_code == 127 or (exit_code != 0 and _REPRO_UNRUNNABLE_RE.search(output)):
+        return ReproResult(
+            False, f"the runner could not execute (exit {exit_code})",
+            f"The command exited {exit_code}, but the output shows a missing runner, "
+            f"module, service or test file rather than the bug. This is an environment "
+            f"or command fault and says NOTHING about the code — in particular it is "
+            f"not evidence against your root cause, so do not change the diagnosis to "
+            f"account for it. Fix the COMMAND so it runs: check the test runner's root "
+            f"in a multi-package repo (`--root <dir>` or `npm --prefix <dir>`), and "
+            f"prefer a reproduction that needs no database, server or network.\n"
+            f"Output:\n{tail}",
+        )
+    if exit_code == 0:
+        return ReproResult(
+            False, "the command succeeded; the bug did not appear",
+            f"The command exited 0. The behaviour you diagnosed did not occur. Either "
+            f"the reproduction does not exercise it, or the root cause is wrong.\n"
+            f"Output:\n{tail}",
+        )
+    if _normalise_output(signature) not in _normalise_output(output):
+        return ReproResult(
+            False, "it failed, but not with the declared signature",
+            f"The command exited {exit_code}, so something failed, but "
+            f"'{signature}' does not appear in its output. This is a different "
+            f"failure from the one you diagnosed.\nOutput:\n{tail}",
+        )
+    return ReproResult(True, f"failed with the declared signature (exit {exit_code})", "")
+
+
+def build_repro_observation(command: str, signature: str, attempt: int,
+                            total: int, result: ReproResult) -> str:
+    """Frame a failed reproduction as evidence for the next attempt."""
+    return (
+        "\n\n  <REPRO_OBSERVATION>\n"
+        f"  Attempt {attempt} of {total}. The harness ran the reproduction you "
+        "declared in section 2. It did not fail as you described, so the diagnosis "
+        "is not yet supported by anything that happened.\n"
+        f"  <COMMAND>{command}</COMMAND>\n"
+        f"  <EXPECTED_SIGNATURE>{signature}</EXPECTED_SIGNATURE>\n"
+        f"  <WHAT_HAPPENED>\n{result.observation}\n  </WHAT_HAPPENED>\n"
+        "  Treat this as fact about the system, and read it before deciding what "
+        "to change. If the command never really ran — a missing module, an "
+        "unreachable database, no test files matched — then only section 2 is "
+        "wrong; keep the diagnosis and fix the command, or supply a REPRO_FILE "
+        "that needs no external service. If the command ran and the code behaved, "
+        "the diagnosis is what is wrong; revise sections 3, 4 and 5, or emit "
+        "BLOCKED naming what you need. Either way, do not emit the same COMMAND "
+        "and the same root cause again.\n"
+        "  </REPRO_OBSERVATION>\n"
+    )
+
+
+def verify_bugfix_reproduction(client, model_config, prompt: str, target_content: str,
+                               prior_context: str, symbol_skeleton: str, result: str,
+                               max_attempts: int, timeout_secs: float) -> tuple:
+    """
+    Loop the bugfix pass until its declared reproduction actually fails.
+
+    Returns (document, verified). An unverified document is still returned - the
+    diagnosis is often most of the way there and worth reading - but it carries
+    UNVERIFIED_MARKER, which stops `!approve` building from it.
+    """
+    if max_attempts <= 0:
+        print("  ⏭️  Reproduction check disabled (bugfix_max_repro_attempts=0); "
+              "the diagnosis is self-reported.", flush=True)
+        return result, True
+
+    observations = ""
+    for attempt in range(1, max_attempts + 1):
+        if detect_blockers(result):
+            # Blocked already, and evidence retry has had its rounds. There is no
+            # section 2 to run and nothing a repro could add.
+            return result, False
+
+        parsed, reason = parse_reproduction(result)
+        repro_file = None
+        if parsed:
+            command, signature = parsed
+            reason = validate_reproduction(command, signature)
+            if not reason:
+                repro_file, file_reason = parse_repro_file(result)
+                # A malformed REPRO_FILE is reported, not dropped. Running the
+                # command without the test it was written for would fail for a
+                # reason the pass never predicted, and the observation would send
+                # it chasing that instead of fixing the declaration.
+                reason = file_reason
+                if repro_file and not reason:
+                    reason = validate_repro_file(repro_file[0])
+        else:
+            command = signature = ""
+
+        if reason:
+            print(f"  ⚠ Attempt {attempt}/{max_attempts}: {reason}", flush=True)
+            outcome = ReproResult(
+                False, reason,
+                f"The reproduction was rejected before it ran: {reason}",
+            )
+        else:
+            update_status(f"Verifying reproduction ({attempt}/{max_attempts})")
+            outcome = run_reproduction(command, signature, timeout_secs,
+                                       repro_file=repro_file)
+            if outcome.verified:
+                print(f"  ✅ Reproduced: {outcome.reason}", flush=True)
+                return result, True
+            print(f"  ❌ Not reproduced: {outcome.reason}", flush=True)
+
+        if attempt == max_attempts:
+            break
+
+        observations += build_repro_observation(
+            command, signature, attempt, max_attempts, outcome
+        )
+        print(f"  ↻ Re-running bugfix with the observation attached "
+              f"(attempt {attempt + 1}/{max_attempts})...", flush=True)
+        try:
+            result = call_llm(client, model_config, prompt,
+                              target_content + observations, prior_context)
+        except (BudgetInfeasible, ExtractionFailed) as e:
+            print(f"  ⚠ Re-run failed ({e}); keeping the unverified diagnosis.",
+                  flush=True)
+            return result, False
+        result = resolve_pass_blockers(
+            client, "bugfix", model_config, prompt,
+            target_content + observations, prior_context, symbol_skeleton, result,
+            max_rounds=1,
+        )
+
+    print(f"  ⚠ The bug was not reproduced in {max_attempts} attempt(s). The "
+          f"diagnosis is recorded but not verified.", flush=True)
+    return result, False
+
+
+def mark_unverified(document: str, attempts: int) -> str:
+    """Prepend the refusal banner `!approve` reads before building anything."""
+    return (
+        f"{UNVERIFIED_MARKER}\n\n"
+        f"The reproduction declared below was run {attempts} time(s) and never failed "
+        f"in the way this diagnosis predicts. Nothing here has been confirmed against "
+        f"running code.\n\n"
+        f"- If the diagnosis is right, fix section 2 by hand, delete this banner, and "
+        f"run `!approve`.\n"
+        f"- Otherwise re-run `!bugfix` with a sharper symptom.\n"
+        f"- `!approve` refuses while this banner is present: building from it would be "
+        f"a fix for a bug nobody has seen happen.\n\n"
+        f"---\n\n{document}"
+    )
 
 
 def _resolve_model_config(model_entry, default_host: str = None) -> dict:
@@ -722,7 +1499,36 @@ def _resolve_model_config(model_entry, default_host: str = None) -> dict:
         "provider": model_entry.get("provider", "ollama"),
         "base_url": model_entry.get("base_url", default_host),
         "args": model_entry.get("args", []),
+        "reasoning": _validate_reasoning(model_entry.get("reasoning", DEFAULT_REASONING),
+                                         model_entry.get("model", "")),
     }
+
+
+def _validate_reasoning(value, model_name: str = "") -> str:
+    """Normalise a pass's `reasoning` setting, or fail loudly on a typo."""
+    level = str(value).strip().lower()
+    if level == "high":
+        level = "xhigh"  # the template's own alias; accept it rather than reject it
+    if level not in REASONING_LEVELS:
+        raise ValueError(
+            f"Unknown reasoning level '{value}'"
+            + (f" for model '{model_name}'" if model_name else "")
+            + f". Supported: {', '.join(REASONING_LEVELS)} (or 'high', an alias for 'xhigh')."
+        )
+    return level
+
+
+def _reasoning_spec(cfg: dict) -> tuple[str, int]:
+    """
+    (level, reserve_tokens) for a resolved model config.
+
+    The reserve scales with the level, because the level is precisely a statement
+    about how much the model will think. Zero when thinking is off, so a
+    non-thinking pass keeps every token of the budget it had before this existed.
+    """
+    level = cfg.get("reasoning", DEFAULT_REASONING) if isinstance(cfg, dict) else DEFAULT_REASONING
+    multiplier = REASONING_RESERVE_MULTIPLIER.get(level, 1.0)
+    return level, int(REASONING_RESERVE_TOKENS * multiplier)
 
 
 def extract_request(text: str) -> str:
@@ -996,6 +1802,62 @@ def unload_model(client: httpx.Client, model_config: dict):
         print(f"  ⚠ Failed to unload {model_name}: {e}")
 
 
+def preload_model(client: httpx.Client, model_config: dict) -> bool:
+    """
+    Make a model resident before it is asked to generate anything.
+
+    Ollama loads a model on its first request, and with no prompt it loads and
+    returns without generating. Doing that here moves eviction, the disk read and
+    the KV-cache allocation out of the inference call's stall budget, which is
+    sized for gaps between tokens rather than for an 18GB cold start.
+
+    Best-effort: a failure here is not fatal, because the inference call will load
+    the model itself. It just does so on a 45s clock instead of this one.
+    """
+    if not isinstance(model_config, dict):
+        model_config = {"model": model_config, "provider": "ollama"}
+    model_name = model_config.get("model", "")
+    provider = model_config.get("provider", "ollama")
+    base_url = model_config.get("base_url", OLLAMA_HOST)
+
+    if provider != "ollama" or not model_name:
+        # llama.cpp servers are started by the orchestrator, which already blocks
+        # until the model is up; there is nothing to warm here.
+        return False
+
+    print(f"  ↳ Loading {model_name} into VRAM (up to {MODEL_LOAD_TIMEOUT:.0f}s)...",
+          flush=True)
+    done = threading.Event()
+
+    def heartbeat(own_event=done):
+        start = time.time()
+        while not own_event.wait(10):
+            print(f"      ↳ [Loading model... {int(time.time() - start)}s]", flush=True)
+
+    hb = threading.Thread(target=heartbeat, daemon=True)
+    hb.start()
+    started = time.time()
+    try:
+        resp = client.post(
+            f"{base_url}/api/generate",
+            json={"model": model_name, "prompt": "", "stream": False},
+            timeout=httpx.Timeout(MODEL_LOAD_TIMEOUT, connect=15.0),
+        )
+        if resp.status_code != 200:
+            print(f"  ⚠ Preload returned {resp.status_code}; the inference call will "
+                  f"load {model_name} on its own clock.", flush=True)
+            return False
+        print(f"  ✓ {model_name} resident ({time.time() - started:.1f}s)", flush=True)
+        return True
+    except Exception as e:
+        print(f"  ⚠ Preload of {model_name} failed ({type(e).__name__}); the inference "
+              f"call will load it on its own clock.", flush=True)
+        return False
+    finally:
+        done.set()
+        hb.join(timeout=11)
+
+
 def _intermediate_path(pass_key: str) -> str:
     """Where a single pass's result is written between runs."""
     return os.path.join(INTERMEDIATE_DIR, f"distill_{pass_key}.md")
@@ -1089,6 +1951,15 @@ def load_saved_pass(pass_key: str):
         # architecture - exactly the silent-bad-context problem this guard exists
         # to prevent.
         print(f"  ⚠ {path} holds an abort report, not a result; re-running the pass.",
+              flush=True)
+        return None
+
+    if UNVERIFIED_MARKER in content:
+        # A diagnosis whose reproduction never failed. Re-running is the right
+        # answer rather than reusing it: the workspace may have changed, and the
+        # verification loop gets another go at proving it. Deleting the banner by
+        # hand is the documented way to say "I checked this myself".
+        print(f"  ⚠ {path} holds an unverified diagnosis; re-running the pass.",
               flush=True)
         return None
 
@@ -1381,6 +2252,12 @@ def call_llm(client: httpx.Client, model_config, system_prompt: str, user_conten
     new_request = extract_request(user_content)
     mode = extract_mode(user_content)
 
+    # Reasoning shares the window with the prompt and the answer, so a thinking
+    # pass solves its budget against a window shortened by the same reserve that
+    # _single_llm_call() adds to the output cap. Off costs nothing.
+    _reasoning, reserve = _reasoning_spec(model_config if isinstance(model_config, dict) else {})
+    window = CONTEXT_WINDOW - reserve
+
     # A single call is merge-shaped: real system prompt, full prior context, full
     # answer budget. Size it against that, not against the extraction budget - a
     # payload can clear the chunk limit and still not fit here, which is how the
@@ -1390,7 +2267,7 @@ def call_llm(client: httpx.Client, model_config, system_prompt: str, user_conten
         "What earlier passes established.",
     ) if prior_context else ""
     single_fixed = est_tokens(system_prompt) + est_tokens(single_prior) + est_tokens("### CURRENT TASK\n")
-    single_facts, single_answer = solve_merge_budget(CONTEXT_WINDOW, single_fixed)
+    single_facts, single_answer = solve_merge_budget(window, single_fixed)
 
     # Chunk overhead is measured from the real assembled framing, with the ceiling
     # record cap (the longest prompt), so the solved chunk can only be conservative.
@@ -1399,13 +2276,14 @@ def call_llm(client: httpx.Client, model_config, system_prompt: str, user_conten
         est_tokens(_extraction_system_prompt(EXTRACTION_RECORD_CAP))
         + est_tokens(_build_chunk_prompt(steer, new_request, "X" * 64, 99, 99, ""))
     )
-    chunk_tokens, record_cap, extraction_tokens = solve_extraction_budget(CONTEXT_WINDOW, chunk_fixed)
+    chunk_tokens, record_cap, extraction_tokens = solve_extraction_budget(window, chunk_fixed)
 
     chunks = chunk_text(user_content, slice_tokens(chunk_tokens))
 
     print(f"  ↳ Input: {len(user_content) + len(prior_context)} chars "
           f"(~{est_tokens(user_content) + est_tokens(prior_context)} tok). "
-          f"Ctx {CONTEXT_WINDOW}, margin {safety_margin(CONTEXT_WINDOW)}.", flush=True)
+          f"Ctx {CONTEXT_WINDOW}, margin {safety_margin(window)}, "
+          f"reasoning {_reasoning} (reserve {reserve}).", flush=True)
 
     # Chunk COUNT must not decide this. TARGET_CHUNK_SIZE is a latency ceiling on
     # how much one extraction call ingests, not a statement about what the window
@@ -1509,12 +2387,12 @@ def call_llm(client: httpx.Client, model_config, system_prompt: str, user_conten
         + est_tokens(merge_head)
         + est_tokens("#### EXTRACTED FACTS (PART 99)\n\n") * len(partial_results)
     )
-    facts_budget, answer_tokens = solve_merge_budget(CONTEXT_WINDOW, merge_fixed)
+    facts_budget, answer_tokens = solve_merge_budget(window, merge_fixed)
     print(f"    ↳ Merge budget: {facts_budget} tok facts / {answer_tokens} tok answer "
           f"(fixed {merge_fixed} tok)", flush=True)
 
     partial_results = _fit_facts_to_budget(
-        client, model_config, partial_results, facts_budget, CONTEXT_WINDOW
+        client, model_config, partial_results, facts_budget, window
     )
 
     merge_prompt = merge_head
@@ -1546,33 +2424,41 @@ def _extract_delta(line: str, is_ollama: bool):
         try:
             chunk_data = json.loads(line)
         except Exception:
-            return None, None, False
+            return None, None, False, None
         message = chunk_data.get("message", {})
         return (
             message.get("content", ""),
             message.get("thinking", ""),
             chunk_data.get("done", False),
+            chunk_data.get("done_reason"),
         )
 
     if not line.startswith("data: "):
         # Orchestrator heartbeats and non-data SSE events
-        return None, None, False
+        return None, None, False, None
     if line == "data: [DONE]":
-        return None, None, True
+        return None, None, True, None
     try:
         chunk_data = json.loads(line[6:])
         choices = chunk_data.get("choices", [{}])
         if not choices:
-            return "", "", False
+            return "", "", False, None
         delta = choices[0].get("delta", {})
+        # The VALUE of finish_reason, not just its presence. "length" means the
+        # server stopped because the cap was reached, not because the model had
+        # finished - a truncated answer that looks exactly like a complete one to
+        # everything downstream. Discarding it is how a document cut off before
+        # section 2 came back as "section 2 declared no COMMAND".
+        finish = choices[0].get("finish_reason")
         return (
             delta.get("content", ""),
             delta.get("reasoning_content", "") or delta.get("reasoning", ""),
-            choices[0].get("finish_reason") is not None,
+            finish is not None,
+            finish,
         )
     except Exception:
         # Malformed chunk or internal proxy metadata
-        return None, None, False
+        return None, None, False, None
 
 
 def _extract_prompt_tokens(line: str, is_ollama: bool):
@@ -1614,6 +2500,93 @@ def _check_prompt_budget(label: str, server_tokens, estimated: int, max_output: 
               f"Consider lowering CHARS_PER_TOKEN_DENSE.", flush=True)
 
 
+def _report_truncation(label: str, finish_reason, output_cap: int,
+                       content: list, reasoning: list, cfg: dict) -> None:
+    """
+    Say so when the server stopped because the cap was reached, not because the
+    model was done.
+
+    The symmetric hole to _check_prompt_budget. That one closed the loop on a
+    prompt silently truncated on the way IN; this closes it on an answer silently
+    truncated on the way OUT. Both used to surface only as a downstream parse
+    failure describing the wrong thing — "section 2 declared no COMMAND" for a
+    document the model never got to finish writing.
+
+    The reasoning/content split is the whole diagnosis. A cap hit with a long
+    answer wants a bigger ANSWER_MAX_TOKENS; a cap hit with almost no answer and
+    thousands of reasoning tokens wants a lower thinking level, and no amount of
+    answer budget will fix it.
+    """
+    if finish_reason != "length":
+        return
+    answer_tokens = est_tokens("".join(content))
+    thought_tokens = est_tokens("".join(reasoning))
+    level = cfg.get("reasoning", DEFAULT_REASONING) if isinstance(cfg, dict) else DEFAULT_REASONING
+    print(f"\n      ⚠ TRUNCATED [{label}]: the server stopped at the {output_cap}-token "
+          f"output cap, not because the model finished. The answer is cut off and "
+          f"anything parsed from it is a fragment.", flush=True)
+    print(f"        ↳ ~{thought_tokens} tokens of reasoning, ~{answer_tokens} of answer, "
+          f"at reasoning '{level}'.", flush=True)
+    if thought_tokens <= answer_tokens:
+        print(f"        ↳ The answer itself hit the cap. Raise ANSWER_MAX_TOKENS, or "
+              f"ask this pass for a shorter document. The continuation will finish "
+              f"it either way.", flush=True)
+    elif level in ("low", "off"):
+        # The advice used to be "lower the reasoning level" unconditionally, which
+        # is useless at the floor - and the floor is exactly where a model that
+        # over-thinks a hard prompt lands you. reasoning_effort is a hint the
+        # model may ignore; only max_tokens binds. Continuation is the answer.
+        print(f"        ↳ Thinking outweighed the answer at '{level}', which is "
+              f"already the lowest thinking level — reasoning_effort is a hint, "
+              f"not a bound. Nothing in the config fixes this; the continuation "
+              f"round exists for it and runs with thinking off.", flush=True)
+    else:
+        print(f"        ↳ Thinking outweighed the answer. Lower this pass's reasoning "
+              f"level in agent_config.json (currently '{level}'); raising the answer "
+              f"cap will not help.", flush=True)
+
+
+def report_server_state(model_config) -> None:
+    """
+    Say what the inference server was actually doing when a call stalled.
+
+    A stall with zero tokens is indistinguishable, from the client side, between
+    "the model was never resident", "something evicted it mid-run" and "it was
+    resident and merely slow". Those have different fixes and the log recorded
+    none of them, which is how two plausible diagnoses survived a whole debugging
+    session. Ask the server; it knows.
+    """
+    if not isinstance(model_config, dict):
+        model_config = {"model": model_config, "provider": "ollama"}
+    if model_config.get("provider", "ollama") != "ollama":
+        return
+    base_url = model_config.get("base_url", OLLAMA_HOST)
+    wanted = model_config.get("model", "")
+    try:
+        with httpx.Client() as c:
+            data = c.get(f"{base_url}/api/ps", timeout=10.0).json()
+    except Exception as e:
+        print(f"      ↳ [diagnostic] /api/ps unreachable ({type(e).__name__}); "
+              f"the server itself may be down.", flush=True)
+        return
+
+    loaded = data.get("models") or []
+    if not loaded:
+        print("      ↳ [diagnostic] server reports NO model resident - the stall was "
+              "a load, not slow generation.", flush=True)
+        return
+    for m in loaded:
+        name = m.get("name") or m.get("model") or "?"
+        vram = (m.get("size_vram") or 0) / 1e9
+        ctx = m.get("context_length", "?")
+        mark = "  <-- the one this call wanted" if wanted in (name, m.get("model")) else ""
+        print(f"      ↳ [diagnostic] resident: {name} ctx={ctx} vram={vram:.1f}GB{mark}",
+              flush=True)
+    if not any(wanted in (m.get("name"), m.get("model")) for m in loaded):
+        print(f"      ↳ [diagnostic] {wanted} is NOT resident - it was evicted or never "
+              f"loaded. Check VRAM pressure against OLLAMA_MAX_LOADED_MODELS.", flush=True)
+
+
 def _salvage_note(answer_tokens: list, reasoning_tokens: list) -> str:
     """Describe what we actually managed to keep, so failures are not silent."""
     if answer_tokens:
@@ -1623,19 +2596,144 @@ def _salvage_note(answer_tokens: list, reasoning_tokens: list) -> str:
             f"Got {len(reasoning_tokens)} reasoning tokens but ZERO answer tokens - "
             "the server ignored the thinking-disable request. Salvaging nothing."
         )
-    return "No tokens of any kind received. Salvaging nothing."
+    return (
+        "No tokens of any kind received - the server never started responding, so "
+        f"this is a load or availability problem, not a slow generation. Check that "
+        f"the model is resident (preload should have made it so within "
+        f"{MODEL_LOAD_TIMEOUT:.0f}s) and that nothing evicted it in between. "
+        "Salvaging nothing."
+    )
+
+
+# --- Continuation --------------------------------------------------------------
+#
+# `reasoning_effort` is a hint, not a bound. Measured on the engineer pass at
+# level "low": ~13,300 tokens of thinking and ~1,390 of answer, against a 12,288
+# cap. The document was cut off after a page and a half, saved, and handed
+# downstream as though it were finished - and there was no lower level left to
+# drop to. The only hard bound on this model is max_tokens.
+#
+# So truncation is handled rather than prevented. The partial answer goes back as
+# an assistant turn and the model is asked to resume from exactly where it
+# stopped, WITH THINKING OFF: the reasoning has already happened, and repeating
+# it would spend the whole budget again and return a second fragment. That turns
+# a cap-length round into ~12k tokens of pure answer.
+#
+# Bounded, because a model that will not stop is a worse failure than a short
+# document, and each round costs a full prompt evaluation.
+LLM_MAX_CONTINUATIONS = 3
+
+CONTINUE_INSTRUCTION = (
+    "Your previous message was cut off mid-flow because it hit the output limit. "
+    "It was not finished.\n"
+    "Continue it from EXACTLY where it stops, and nothing else:\n"
+    "- Do not repeat any text you have already written.\n"
+    "- Do not restart, re-introduce, summarise or apologise.\n"
+    "- Do not add a preamble such as 'continuing' — your first character is the "
+    "next character of the document.\n"
+    "- Resume mid-word or mid-sentence if that is where it ended.\n"
+    "- Keep the same format and heading structure, and finish the document."
+)
+
+# How far back to look for the model repeating itself at the seam. Generous
+# enough to catch a restated heading or paragraph, small enough that a document
+# which legitimately repeats a line is not silently cut.
+CONTINUATION_OVERLAP_WINDOW = 600
+
+# Shortest repeat worth removing. The two ways to get this wrong are not
+# symmetric: too high and a restated heading survives into the middle of the
+# document, which is ugly but visible; too low and legitimately repeated text is
+# eaten, which is silent corruption. So it sits just under a typical heading -
+# "# 6. Fix Plan" is 13 characters, and an earlier floor of 20 let exactly that
+# through. For a false strip the continuation would have to open with the same
+# dozen characters the previous chunk closed on, which is a repeat, not a
+# coincidence.
+CONTINUATION_MIN_OVERLAP = 12
+
+
+def _join_continuation(prev: str, nxt: str) -> str:
+    """
+    Append `nxt` to `prev`, dropping any text the model repeated at the seam.
+
+    Instructed not to repeat itself, a model usually complies and sometimes
+    restates the last line or heading anyway. Concatenating blindly leaves a
+    duplicated fragment in the middle of the document, which is both wrong and
+    hard to spot in a 4,000-character plan.
+    """
+    if not prev:
+        return nxt
+    if not nxt:
+        return prev
+    window = prev[-CONTINUATION_OVERLAP_WINDOW:]
+    for size in range(min(len(window), len(nxt)), CONTINUATION_MIN_OVERLAP - 1, -1):
+        if nxt.startswith(window[-size:]):
+            return prev + nxt[size:]
+    return prev + nxt
 
 
 def _single_llm_call(client: httpx.Client, model_config, system_prompt: str, user_content: str,
                      label: str = "Inference", max_output_tokens: int = ANSWER_MAX_TOKENS) -> str:
     """
+    One logical model call, continued across the output cap if it truncates.
+
+    Returns the whole answer as a string, so every caller is unchanged. See the
+    note above for why continuation exists rather than a bigger cap or a lower
+    thinking level.
+    """
+    answer, finish = "", None
+    for round_no in range(LLM_MAX_CONTINUATIONS + 1):
+        text, finish = _stream_llm_once(
+            client, model_config, system_prompt, user_content,
+            label if not answer else f"{label} (cont.{round_no})",
+            max_output_tokens,
+            assistant_prefix=answer,
+            force_no_thinking=bool(answer),
+        )
+        if _looks_like_llm_error(text):
+            # A failed continuation must not discard a good partial: what we
+            # already have is strictly better than an error string.
+            if answer:
+                print(f"      ⚠ Continuation {round_no} failed ({text[:60]}); keeping "
+                      f"the {len(answer)}-character partial answer.", flush=True)
+                return answer
+            return text
+
+        answer = _join_continuation(answer, text)
+        if finish != "length":
+            return answer
+        if round_no == LLM_MAX_CONTINUATIONS:
+            break
+        print(f"      ↩ Answer hit the output cap; continuing it with thinking off "
+              f"(round {round_no + 1}/{LLM_MAX_CONTINUATIONS}, {len(answer)} chars so far)...",
+              flush=True)
+
+    print(f"      ⚠ Still incomplete after {LLM_MAX_CONTINUATIONS} continuation(s); "
+          f"returning {len(answer)} characters. Downstream will see a partial document.",
+          flush=True)
+    return answer
+
+
+def _stream_llm_once(client: httpx.Client, model_config, system_prompt: str, user_content: str,
+                     label: str = "Inference", max_output_tokens: int = ANSWER_MAX_TOKENS,
+                     assistant_prefix: str = "", force_no_thinking: bool = False) -> tuple:
+    """
     Execute a single LLM API call with streaming for live feedback.
     Supports both Ollama native and OpenAI-compatible streaming formats.
+
+    Returns (text, finish_reason). A finish_reason of "length" means the server
+    stopped at the cap rather than because the model was done, which is what
+    _single_llm_call continues from. Error paths return (message, None) — an
+    error is not something to continue.
 
     Args:
         model_config: Either a string (model name, Ollama) or a dict with provider info.
         max_output_tokens: Hard cap on generated tokens. Extraction passes want a
             tight cap; the merge pass needs room for the full templated answer.
+        assistant_prefix: A partial answer to resume. Sent as an assistant turn
+            so the model sees what it already wrote.
+        force_no_thinking: Suppress reasoning regardless of the pass's configured
+            level. Used for continuations, where the thinking has already been
+            done and repeating it would consume the budget a second time.
     """
     # Normalize config
     if isinstance(model_config, str):
@@ -1648,22 +2746,44 @@ def _single_llm_call(client: httpx.Client, model_config, system_prompt: str, use
     base_url = cfg.get("base_url", OLLAMA_HOST)
     is_ollama = provider == "ollama"
 
-    # Distillation passes want the templated answer, not the reasoning trace.
-    # Thinking models spend their entire per-part budget in the reasoning channel
-    # before emitting a single answer token, so we turn it off at the source.
+    # Reasoning effort is per pass. The reserve is added to the cap here and
+    # subtracted from the window in call_llm(), so the two stay in step: without
+    # the addition the pass would spend its answer allowance on thought, and
+    # without the subtraction the larger cap would overrun the window.
+    reasoning, reserve = _reasoning_spec(cfg)
+    if force_no_thinking:
+        # A continuation inherits the reasoning the first call already did. Left
+        # on, it would spend the whole cap thinking again and return another
+        # fragment - which is exactly the loop this exists to break.
+        reasoning, reserve = "off", 0
+    output_cap = max_output_tokens + reserve
+
+    def _messages() -> list:
+        msgs = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+        if assistant_prefix:
+            msgs.append({"role": "assistant", "content": assistant_prefix})
+            msgs.append({"role": "user", "content": CONTINUE_INSTRUCTION})
+        return msgs
+
     if is_ollama:
         payload = {
             "model": model_name,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content}
-            ],
+            "messages": _messages(),
             "stream": True,
-            "think": False,
+            # Ollama's think flag is a boolean for most models - the effort
+            # levels are a llama.cpp/template concept and do not cross over, so
+            # anything other than "off" is simply "on" here.
+            "think": reasoning != "off",
             "options": {
                 "num_ctx": CONTEXT_WINDOW,
-                "temperature": 0.3,
-                "num_predict": max_output_tokens,
+                "temperature": SAMPLING_TEMPERATURE,
+                "top_p": SAMPLING_TOP_P,
+                "top_k": SAMPLING_TOP_K,
+                "min_p": SAMPLING_MIN_P,
+                "num_predict": output_cap,
             },
             "keep_alive": "3m"
         }
@@ -1671,15 +2791,20 @@ def _single_llm_call(client: httpx.Client, model_config, system_prompt: str, use
     else:
         payload = {
             "model": model_name,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content}
-            ],
+            "messages": _messages(),
             "stream": True,
-            "temperature": 0.3,
-            "max_tokens": max_output_tokens,
-            # llama.cpp honours template kwargs; ignored harmlessly by servers that don't.
-            "chat_template_kwargs": {"enable_thinking": False},
+            "temperature": SAMPLING_TEMPERATURE,
+            "top_p": SAMPLING_TOP_P,
+            "top_k": SAMPLING_TOP_K,
+            "min_p": SAMPLING_MIN_P,
+            "max_tokens": output_cap,
+            # llama.cpp honours template kwargs; ignored harmlessly by servers that
+            # don't. Off is enable_thinking=false rather than a reasoning_effort
+            # value - the template raises on any effort outside xhigh/medium/low.
+            "chat_template_kwargs": (
+                {"enable_thinking": False} if reasoning == "off"
+                else {"reasoning_effort": reasoning}
+            ),
             # Makes the server report its real prompt token count, which is what
             # _check_prompt_budget verifies the estimate against.
             "stream_options": {"include_usage": True},
@@ -1712,6 +2837,7 @@ def _single_llm_call(client: httpx.Client, model_config, system_prompt: str, use
         try:
             full_response = []
             reasoning_response = []
+            finish_reason = None
             print(f"    {label:15} [Generating...]\n    ↳ ", end="", flush=True)
             start_time = time.time()
             
@@ -1739,7 +2865,7 @@ def _single_llm_call(client: httpx.Client, model_config, system_prompt: str, use
                                 print(f"    Error: {err_body[:200]}")
                             except Exception:
                                 pass
-                            return f"[ERROR: LLM returned status {resp.status_code}]"
+                            return f"[ERROR: LLM returned status {resp.status_code}]", None
                         
                         dot_count = 0
                         last_progress = time.time()
@@ -1769,7 +2895,9 @@ def _single_llm_call(client: httpx.Client, model_config, system_prompt: str, use
                             ):
                                 server_prompt_tokens = _extract_prompt_tokens(line, is_ollama)
 
-                            token, reasoning, done = _extract_delta(line, is_ollama)
+                            token, reasoning, done, finish = _extract_delta(line, is_ollama)
+                            if finish:
+                                finish_reason = finish
                             if token is None and reasoning is None:
                                 if done:
                                     break
@@ -1797,8 +2925,10 @@ def _single_llm_call(client: httpx.Client, model_config, system_prompt: str, use
                     elapsed = time.time() - start_time
                     print(f" ✓ ({elapsed:.1f}s)", flush=True)
                     _check_prompt_budget(label, server_prompt_tokens,
-                                         estimated_prompt_tokens, max_output_tokens)
-                    return "".join(full_response)
+                                         estimated_prompt_tokens, output_cap)
+                    _report_truncation(label, finish_reason, output_cap,
+                                       full_response, reasoning_response, cfg)
+                    return "".join(full_response), finish_reason
 
                 except httpx.ReadTimeout:
                     first_token_received.set()
@@ -1809,12 +2939,14 @@ def _single_llm_call(client: httpx.Client, model_config, system_prompt: str, use
                         # the way. Keep what the model actually produced.
                         print(f"\n      ✗ [Stability Protocol] Stream stalled ({STALL_TIMEOUT:.0f}s idle). "
                               f"{_salvage_note(full_response, reasoning_response)} Not retrying - identical prompt.")
-                        return salvaged
+                        return salvaged, None
                     if attempt < max_retries - 1:
                         print(f"\n      ⚠ [Stability Protocol] Stalled with no output. Retrying part ({attempt+2}/{max_retries})...")
+                        report_server_state(model_config)
                         continue
                     print(f"\n      ✗ [Stability Protocol] Stalled on FINAL ATTEMPT. {_salvage_note(full_response, reasoning_response)}")
-                    return "[ERROR: ReadTimeout]"
+                    report_server_state(model_config)
+                    return "[ERROR: ReadTimeout]", None
 
         except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as e:
             first_token_received.set()
@@ -1827,11 +2959,11 @@ def _single_llm_call(client: httpx.Client, model_config, system_prompt: str, use
                 time.sleep(wait_time)
                 continue
             print(f"\n  ❌ LLM request failed after {max_retries} attempts: {e}")
-            return f"[ERROR: {e}]"
+            return f"[ERROR: {e}]", None
         except Exception as e:
             first_token_received.set()
             print(f"\n  ❌ Unexpected error: {e}")
-            return f"[ERROR: {e}]"
+            return f"[ERROR: {e}]", None
         finally:
             # Belt and braces for the paths that return or continue without
             # setting it, so no attempt can ever outlive itself and print over
@@ -1839,7 +2971,7 @@ def _single_llm_call(client: httpx.Client, model_config, system_prompt: str, use
             first_token_received.set()
             heartbeat_thread.join(timeout=6)
 
-    return "[ERROR: Max retries exceeded]"
+    return "[ERROR: Max retries exceeded]", None
 
 
 def update_status(status: str):
@@ -1940,6 +3072,47 @@ def select_relevant_kb(kb_dir: str, instruction: str, max_chars: int = KB_MAX_CH
 _NPM_TEST_PLACEHOLDER = "no test specified"
 
 
+# How deep to look for a package that tests itself. One level only: a workspace
+# keeps its packages as immediate children, and walking further turns every
+# vendored example and fixture project into part of the completion gate.
+SIBLING_TEST_MAX = 4
+
+
+def _detect_sibling_test_commands(project_dir: str) -> list:
+    """
+    Test commands for immediate subdirectories that are their own package.
+
+    Returns commands runnable from the project root, because the gate runs one
+    shell line from there. `npm --prefix <dir> run test` is the portable way to
+    say that without a `cd`.
+    """
+    cmds = []
+    try:
+        entries = sorted(os.listdir(project_dir))
+    except OSError:
+        return cmds
+    for entry in entries:
+        if entry.startswith(".") or entry in SKELETON_SKIP_DIRS:
+            continue
+        sub = os.path.join(project_dir, entry)
+        if not os.path.isdir(sub):
+            continue
+        manifest_path = os.path.join(sub, "package.json")
+        if not os.path.isfile(manifest_path):
+            continue
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+        except Exception:
+            continue
+        script = str(manifest.get("scripts", {}).get("test", "")).strip()
+        if script and _NPM_TEST_PLACEHOLDER not in script.lower():
+            cmds.append(f"npm --prefix {entry} run test --silent")
+        if len(cmds) >= SIBLING_TEST_MAX:
+            break
+    return cmds
+
+
 def detect_test_command(project_dir: str) -> str:
     """
     The command that decides whether this project's tests pass, or "" if none.
@@ -1980,10 +3153,29 @@ def detect_test_command(project_dir: str) -> str:
         # Playwright is deliberately not used here even when present: it drives a
         # real browser against a running server, which is a slow and flaky signal
         # for a completion gate rather than a cheap and decisive one.
+        root_cmd = ""
         if has("vitest.config.ts", "vitest.config.js", "vitest.config.mts") or "vitest" in deps:
-            return "npx --no-install vitest run --reporter=dot"
-        if has("jest.config.ts", "jest.config.js", "jest.config.mjs") or "jest" in deps:
-            return "npx --no-install jest --ci"
+            root_cmd = "npx --no-install vitest run --reporter=dot"
+        elif has("jest.config.ts", "jest.config.js", "jest.config.mjs") or "jest" in deps:
+            root_cmd = "npx --no-install jest --ci"
+
+        # A root runner is not necessarily the whole suite. veriform-ui keeps its
+        # API in Backend/ with its own package.json and vitest.config.ts, while
+        # the root config includes only `src/**` - so the gate ran 168 frontend
+        # tests, went green, and declared a build complete with all 188 backend
+        # tests failing on a migration that had never been applied. It was not
+        # lying; it could not see them.
+        #
+        # Only reached when the root has no `test` script. A project that names
+        # its own test command has already answered this question, and second-
+        # guessing it would run somebody's suite twice.
+        sibling_cmds = _detect_sibling_test_commands(project_dir)
+        if root_cmd and sibling_cmds:
+            return " && ".join([root_cmd] + sibling_cmds)
+        if sibling_cmds:
+            return " && ".join(sibling_cmds)
+        if root_cmd:
+            return root_cmd
 
     if os.path.isfile(os.path.join(project_dir, "Cargo.toml")):
         return "cargo test --quiet"
@@ -2081,17 +3273,86 @@ IMPORT_RE = re.compile(
 # ~7.5k tokens at the dense rate. The old 15000 was set against an 8k window; at
 # 64k it is affordable to give the architect a map it can actually navigate.
 MAX_SKELETON_CHARS = 30000
+
+# How far past a symbol's name to read looking for its parameters, and how much
+# of what is found to keep. The scan has to outrun a wrapped declaration - four
+# parameters one per line is ~150 characters before the return type - while the
+# rendered cap keeps one baroque generic from crowding out a whole file.
+_SIG_SCAN_CHARS = 400
+_SIG_MAX_CHARS = 110
 SKELETON_SKIP_DIRS = {"node_modules", ".git", "venv", ".venv", "__pycache__",
                       "dist", "build", "public", ".knowledge_base",
                       ".cline_context", ".cline_logs"}
 SKELETON_EXTS = (".py", ".ts", ".js", ".tsx", ".jsx", ".go", ".rs", ".java",
                  ".c", ".cpp", ".h")
 
+# Languages with no export keyword, where the public surface has to be read from
+# indentation instead: a declaration at module level, not underscore-prefixed by
+# convention. Without this a Python project has no exported symbols at all, so
+# every signature lands in `internal` and none of them is ever rendered.
+#
+# Only these. In TypeScript a top-level `function` with no `export` is private on
+# purpose, and promoting it would offer the architect a symbol the module does
+# not export - `pub` and `public` already cover Rust and Java through _SYM_MODIFIERS.
+IMPLICIT_EXPORT_EXTS = (".py",)
 
-def _scan_symbols(content: str):
-    """Split a file's declarations into (exported, internal), preserving order."""
+
+def _signature_tail(content: str, name_end: int) -> str:
+    """
+    The declaration that follows a symbol's name: parameters and return type.
+
+    Read from the source rather than captured by SIGNATURE_RE/ARROW_RE, so the
+    patterns that decide *which* symbols exist keep matching exactly what they
+    matched before - a skeleton that gained signatures by losing symbols would be
+    a bad trade. Scanning also handles the two shapes a capture group cannot:
+    a declaration wrapped across lines, where stopping at the newline yields a
+    bare "(" and teaches nothing, and an arrow function, whose parameters sit
+    inside the matched region rather than after it.
+
+    Starts at the end of the name, so both patterns are read the same way, and
+    stops at the first token that ends a declaration at depth zero - the body
+    brace, the statement end, or the line. Braces and newlines inside the
+    parameter list are depth-protected; a stray bracket inside a string literal
+    is not, which is what the character cap is for.
+    """
+    depth, out = 0, []
+    for ch in content[name_end:name_end + _SIG_SCAN_CHARS]:
+        if ch in "([<":
+            depth += 1
+        elif ch in ")]>":
+            depth = max(depth - 1, 0)
+        elif depth == 0 and ch in "{;\n":
+            break
+        out.append(" " if ch in "\t\r" else ch)
+    # "=", ":" and "=>" are the joins between a name and its value; each is the
+    # last thing left when the value itself was a brace we stopped at.
+    sig = re.sub(r"\s+", " ", "".join(out)).strip().rstrip("=:,").strip()
+    if sig.endswith("=>"):
+        sig = sig[:-2].strip()
+    # A wrapped parameter list arrives as "( a: string, b?: number, )" once its
+    # newlines are spaces. Close it back up, trailing comma included.
+    sig = re.sub(r"\(\s+", "(", sig)
+    sig = re.sub(r",?\s+\)", ")", sig)
+    if len(sig) > _SIG_MAX_CHARS:
+        sig = sig[:_SIG_MAX_CHARS].rstrip() + "..."
+    return sig
+
+
+def _scan_symbols(content: str, ext: str = ""):
+    """
+    Split a file's declarations into (exported, internal), preserving order.
+
+    Each entry is (name, signature). The signature is what makes the difference
+    between the architect knowing a symbol exists and knowing whether it already
+    does the job - a name alone supports "there is an upsertRole", never "it
+    takes a role and returns nothing", so a design pass reading names has no way
+    to reuse a symbol and reaches for a new one beside it.
+
+    `ext` decides how the public surface is recognised; see IMPLICIT_EXPORT_EXTS.
+    """
     exported, internal = [], []
     seen = set()
+    implicit = ext in IMPLICIT_EXPORT_EXTS
     for pattern in (SIGNATURE_RE, ARROW_RE):
         for m in pattern.finditer(content):
             name = m.group("name")
@@ -2099,20 +3360,63 @@ def _scan_symbols(content: str):
                 continue
             seen.add(name)
             mods = m.group("mods") or ""
-            (exported if ("export" in mods or "pub" in mods) else internal).append(name)
+            public = "export" in mods or "pub" in mods
+            if implicit and not public:
+                # `^\s*` can consume the newlines before a declaration, so read
+                # the indentation off the last line of the match, not the first.
+                indent = m.group(0).rpartition("\n")[2]
+                public = not indent[:1].isspace() and not name.startswith("_")
+            if public:
+                exported.append((name, _signature_tail(content, m.end("name"))))
+            else:
+                # No tier renders an internal signature, so none is scanned for.
+                internal.append((name, ""))
     return exported, internal
 
 
-def _skeleton_block(rel_path: str, line_count: int, imports: list,
-                    exported: list, internal: list, full: bool) -> str:
-    """
-    Render one file's entry.
+def _sym_text(sym, with_signature: bool) -> str:
+    """Render one scanned symbol. Accepts a bare name for callers that have one."""
+    if isinstance(sym, str):
+        return sym
+    name, sig = sym
+    if not (with_signature and sig):
+        return name
+    # "f(a: string)" and "Card: React.FC" keep the name flush against what
+    # follows; "Role = a | b" and "Foo extends Bar" need the space back that
+    # normalising took off.
+    return name + ("" if sig.startswith(("(", "<", "[", ":")) else " ") + sig
 
-    `full` includes imports and internal helpers; the slim form keeps only the
-    exported surface, which is what a design pass actually needs to reference.
+
+# Detail tiers, richest first. get_symbol_skeleton emits the first one that fits
+# MAX_SKELETON_CHARS, so the order is a statement about what a design pass can
+# least afford to lose. Signatures outrank imports and internal helpers: the
+# reuse rules in architect.md (R18, R20) are answerable from an exported
+# signature and unanswerable from a bare name, and a pass that cannot answer
+# them either blocks - costing a full re-run of a 27B model - or guesses.
+SkeletonDetail = collections.namedtuple(
+    "SkeletonDetail", ("note", "imports", "signatures", "internal")
+)
+SKELETON_TIERS = (
+    SkeletonDetail("", True, True, True),
+    SkeletonDetail("(exported signatures only - imports and internal helpers "
+                   "omitted for size)", False, True, False),
+    SkeletonDetail("(symbol names only - signatures omitted for size)",
+                   True, False, True),
+    SkeletonDetail("(exported symbol names only - imports, signatures and "
+                   "internal helpers omitted for size)", False, False, False),
+)
+
+
+def _skeleton_block(rel_path: str, line_count: int, imports: list,
+                    exported: list, internal: list, detail: SkeletonDetail) -> str:
+    """
+    Render one file's entry at the given detail tier.
+
+    The exported surface is the only part every tier keeps: it is what a design
+    pass has to name to reuse anything.
     """
     block = [f"\n{rel_path} ({line_count} lines)"]
-    if full and imports:
+    if detail.imports and imports:
         block.append("  imports:")
         for imp in imports[:5]:
             block.append(f"    {imp.strip()}")
@@ -2120,17 +3424,20 @@ def _skeleton_block(rel_path: str, line_count: int, imports: list,
             block.append(f"    ... +{len(imports) - 5} more")
     if exported:
         block.append("  exports:")
-        block.extend(f"    - {s}" for s in exported)
-    if full and internal:
+        block.extend(f"    - {_sym_text(s, detail.signatures)}" for s in exported)
+    if detail.internal and internal:
         block.append("  internal:")
-        block.extend(f"    - {s}" for s in internal)
+        # Names only, at every tier. Internal helpers are navigation, not reuse
+        # surface - nothing outside the file may call one - so their signatures
+        # would spend the cap that the exported ones have to fit inside.
+        block.extend(f"    - {_sym_text(s, False)}" for s in internal)
     return "\n".join(block)
 
 
 BARE_FILES_HEADING = "\nfiles with no symbols at this detail level (present, listed for navigation):"
 
 
-def _render_skeleton(files_data: list, full: bool) -> tuple[list, str]:
+def _render_skeleton(files_data: list, detail: SkeletonDetail) -> tuple[list, str]:
     """
     Render every file, splitting out the ones that carry no detail.
 
@@ -2145,7 +3452,7 @@ def _render_skeleton(files_data: list, full: bool) -> tuple[list, str]:
     """
     blocks, bare = [], []
     for rel_path, line_count, imports, exported, internal in files_data:
-        block = _skeleton_block(rel_path, line_count, imports, exported, internal, full)
+        block = _skeleton_block(rel_path, line_count, imports, exported, internal, detail)
         if "\n" in block.strip():
             blocks.append(block)
         else:
@@ -2212,11 +3519,11 @@ def get_symbol_skeleton(project_dir: str) -> str:
     """
     Build a navigable map of the project's declarations.
 
-    Two-tier under the size cap: the full map (imports + exported + internal) if
-    it fits, otherwise exports only. Truncating mid-walk - as this used to - drops
-    whole files off the end of the directory walk, so the architect silently never
-    learns that, say, engagement-card.tsx exists. Shedding detail before shedding
-    files keeps every file represented.
+    Tiered under the size cap: emit the richest of SKELETON_TIERS that fits, from
+    the full map down to bare exported names. Truncating mid-walk - as this used
+    to - drops whole files off the end of the directory walk, so the architect
+    silently never learns that, say, engagement-card.tsx exists. Shedding detail
+    before shedding files keeps every file represented.
     """
     files_data = []
     for root, dirs, files in os.walk(project_dir):
@@ -2231,23 +3538,26 @@ def get_symbol_skeleton(project_dir: str) -> str:
             except Exception:
                 continue
             imports = IMPORT_RE.findall(content)
-            exported, internal = _scan_symbols(content)
+            exported, internal = _scan_symbols(content, os.path.splitext(file)[1])
             if imports or exported or internal:
                 files_data.append((rel_path, content.count("\n") + 1,
                                    imports, exported, internal))
 
-    for full in (True, False):
-        blocks, footer = _render_skeleton(files_data, full)
+    for detail in SKELETON_TIERS:
+        blocks, footer = _render_skeleton(files_data, detail)
         total = sum(len(b) for b in blocks) + len(footer)
         if total <= MAX_SKELETON_CHARS:
             header = "[PROJECT SYMBOL SKELETON]"
-            if not full:
-                header += "\n(exported symbols only - imports and internal helpers omitted for size)"
+            if detail.note:
+                header += f"\n{detail.note}"
+            print(f"  🦴 Skeleton: {len(files_data)} files, {total} chars, "
+                  f"signatures {'on' if detail.signatures else 'OFF'}"
+                  f"{' — ' + detail.note if detail.note else ''}", flush=True)
             return "\n".join([header] + blocks + ([footer] if footer else []))
 
-    # Even exports-only overflows: keep as many whole files as fit, and say how
-    # many were dropped rather than trailing off mid-walk.
-    blocks, footer = _render_skeleton(files_data, full=False)
+    # Even the leanest tier overflows: keep as many whole files as fit, and say
+    # how many were dropped rather than trailing off mid-walk.
+    blocks, footer = _render_skeleton(files_data, SKELETON_TIERS[-1])
     skeleton, total, kept = ["[PROJECT SYMBOL SKELETON]"], len(footer), 0
     for block in blocks:
         if total + len(block) > MAX_SKELETON_CHARS:
@@ -2263,9 +3573,9 @@ def get_symbol_skeleton(project_dir: str) -> str:
 
 # Chat commands that launch a pipeline run. Any of them can appear alone or with
 # a real instruction attached; only the attached text is a design request.
-TRIGGER_COMMANDS = ("!build", "!architect", "!approve", "!review")
+TRIGGER_COMMANDS = ("!build", "!architect", "!bugfix", "!approve", "!review")
 _TRIGGER_SYNTAX_RE = re.compile(
-    r"!build|!architect|!approve|!review|--repo\s+\S+|--kb\s+\S+|--open",
+    r"!build|!architect|!bugfix|!approve|!review|--repo\s+\S+|--kb\s+\S+|--open",
     flags=re.IGNORECASE,
 )
 
@@ -2314,7 +3624,6 @@ def run_distillation():
     if is_rebuild:
         status_text = "ALREADY PARTIALLY IMPLEMENTED" if not has_git else "EXISTING REPOSITORY DETECTED"
         print(f"\n🔄 {status_text} for {PROJECT_NAME}: Using structured context and latest instruction.", flush=True)
-        import subprocess
         try:
             tree_output = subprocess.check_output(
                 ["tree", "/workspace", "-I", "node_modules|.git|venv|.venv|.cline_context|.cline_logs|__pycache__|dist|build|public|.knowledge_base"], 
@@ -2361,6 +3670,17 @@ def run_distillation():
 
         readme_content = read_workspace_file("README.md")
         issues_content = read_workspace_file(".cline_context/.build_issues.md")
+
+        # The eight directives above are written for a design request. A bug
+        # report is not one: the same instruction to "fulfil the NEW_REQUEST"
+        # reads as licence to improve whatever the symptom touches. One line
+        # re-points them, rather than forking the whole block for two words.
+        bugfix_directive = (
+            "    9. [P0] DIAGNOSIS: NEW_REQUEST is a bug report, not a feature. "
+            "Find the one defect causing it and change nothing else. Improvements "
+            "you notice are out of scope by definition.\n"
+            if DISTILL_DESIGN_PASS == "bugfix" else ""
+        )
         
         # The KB is selected last, once everything it competes with has been
         # measured - see solve_kb_budget. A placeholder holds its position so the
@@ -2378,6 +3698,7 @@ def run_distillation():
             f"    6. [P0] FILE_STATUS_AWARENESS: If the 'ARCHITECTURE' section (developed by the architect) mentions a file that is NOT present in the 'DIRECTORY_STRUCTURE', it is a NEW component. You MUST create it.\n"
             f"    7. [P0] CONTEXT_ALIGNMENT: Use the 'PROJECT_HISTORY' to understand the intent and reasoning behind the current request.\n"
             f"    8. [P1] SCOPE_FOCUS: Focus exclusively on fulfilling the 'NEW_REQUEST' and resolving the 'KNOWN_BUILD_ISSUES'.\n"
+            f"{bugfix_directive}"
             f"  </DIRECTIVES>\n"
             f"{user_directives}"
             f"</SITUATIONAL_AWARENESS>\n\n"
@@ -2414,7 +3735,7 @@ def run_distillation():
         if os.path.exists(kb_dir):
             payload_tokens = est_tokens(conversation_text.replace(KB_PLACEHOLDER, ""))
             system_tokens = max(
-                (est_tokens(prompts.get(k, "")) for k in ("architect", "engineer")),
+                (est_tokens(prompts.get(k, "")) for k in (DISTILL_DESIGN_PASS, "engineer")),
                 default=0,
             )
             kb_budget = solve_kb_budget(CONTEXT_WINDOW, system_tokens, payload_tokens)
@@ -2429,6 +3750,17 @@ def run_distillation():
                     kb_block = (f"\n<BEST_PRACTICES_KNOWLEDGE_BASE>\n{kb_content}\n"
                                 f"</BEST_PRACTICES_KNOWLEDGE_BASE>\n\n")
         conversation_text = conversation_text.replace(KB_PLACEHOLDER, kb_block)
+    elif DISTILL_DESIGN_PASS == "bugfix":
+        # There is no bug in a project that does not exist. Reaching the fresh
+        # branch with `!bugfix` means the workspace is empty, so the pass would be
+        # asked to diagnose a symptom in code it has never been shown - which it
+        # can only answer by inventing one. Say so here rather than spending a
+        # design pass to be told the same thing.
+        print(f"\n❌ !bugfix on an empty workspace for {PROJECT_NAME}.", flush=True)
+        print("  ↳ There is no code to diagnose. Use !architect or !build to create "
+              "the project first.", flush=True)
+        update_status("Aborted: nothing to diagnose.")
+        raise SystemExit(3)
     else:
         print(f"\n✨ Fresh build detected for {PROJECT_NAME}. Assembling historical context...", flush=True)
         
@@ -2471,8 +3803,10 @@ def run_distillation():
         
     print(f"📄 Context size: {len(conversation_text)} chars", flush=True)
 
+    design_label = ("🩺  Pass 1/4: Diagnostic Engineer" if DISTILL_DESIGN_PASS == "bugfix"
+                    else "🏗️  Pass 1/4: System Architect")
     all_passes = [
-        ("architect",     "🏗️  Pass 1/4: System Architect"),
+        (DISTILL_DESIGN_PASS, design_label),
         ("engineer",      "⚙️  Pass 2/4: Engineer"),
         ("test_engineer", "🧪  Pass 3/4: Test Engineer"),
         ("safety",        "🛡️  Pass 4/4: Safety Inspector"),
@@ -2552,6 +3886,12 @@ def run_distillation():
                             print(f"  ❌ Pre-load failed after {max_retries} attempts: {e}")
                             if "101" in str(e) or "Network is unreachable" in str(e):
                                 print("    TIP: This usually means the host orchestrator is restarting the model. Check orchestrator.log on host.")
+            else:
+                # Ollama was the only provider with no warm step, so its models
+                # cold-loaded inside call_llm's stall budget. Symmetry with the
+                # branch above, and the reason test_engineer could burn 3x45s
+                # without ever receiving a token.
+                preload_model(client, model_config)
 
             prior_context = ""
             if results:
@@ -2560,7 +3900,14 @@ def run_distillation():
                     for k, v in results.items()
                 )
 
-            if pass_key in ["architect", "engineer"]:
+            # DISTILL_DESIGN_PASS, not a literal "architect": bugfix occupies the
+            # same Pass 1 slot (see DESIGN_PASSES and all_passes below) and needs
+            # the same input. Hardcoding "architect" here sent bugfix down the
+            # review branch, so it received the 157-char stub instead of the
+            # conversation - and, being pass 1, an empty prior_context alongside
+            # it. It answered the only way its B12 permits: BLOCKED, naming the
+            # REPORTED_SYMPTOM and CONTEXT it was never given.
+            if pass_key in (DISTILL_DESIGN_PASS, "engineer"):
                 target_content = conversation_text
             else:
                 # Passes 3 and 4 only read the previous plans. They do not get chunked!
@@ -2593,6 +3940,20 @@ def run_distillation():
                 client, pass_key, model_config, prompt,
                 target_content, prior_context, symbol_skeleton, result,
             )
+
+            if pass_key == "bugfix":
+                limits = config.get("limits", {})
+                result, verified = verify_bugfix_reproduction(
+                    client, model_config, prompt, target_content, prior_context,
+                    symbol_skeleton, result,
+                    max_attempts=int(limits.get("bugfix_max_repro_attempts", 3)),
+                    timeout_secs=float(limits.get("bugfix_repro_timeout_secs", 300)),
+                )
+                if not verified and not detect_blockers(result):
+                    result = mark_unverified(
+                        result, int(limits.get("bugfix_max_repro_attempts", 3))
+                    )
+
             results[pass_key] = result
             previous_model_config = model_config
             print(f"  ✓ Complete ({len(result)} chars)")
@@ -2651,6 +4012,20 @@ def run_distillation():
         print("  ↳ Supply the missing facts in chat and re-run !build, or use "
               "!architect to iterate on the design first.", flush=True)
         raise SystemExit(3)
+
+    # Same stop, one reason further on. A blocked pass refuses to diagnose; an
+    # unverified one diagnoses something nothing has been observed to do. Building
+    # the second is worse than building the first, because it looks like a plan.
+    # The review gate above returns before this, so the document is still shown in
+    # chat - this only stops a full run turning it into code.
+    if UNVERIFIED_MARKER in results.get("bugfix", ""):
+        update_status("Aborted: the bug was never reproduced.")
+        print("\n  ❌ The declared reproduction never failed as diagnosed.", flush=True)
+        print(f"  ↳ Aborting before .clinerules is written; nothing was overwritten.",
+              flush=True)
+        print(f"  ↳ Review {_intermediate_path('bugfix')}. Fix section 2 and delete "
+              f"the banner to approve it anyway, or re-run !bugfix.", flush=True)
+        raise SystemExit(4)
 
     print(f"\n📝 Writing {OUTPUT_PATH}", flush=True)
     update_status("Assembling .clinerules...")
@@ -2766,7 +4141,6 @@ def build_replan_payload(previous: dict, new_request: str,
     """
     tree = "(Could not generate directory tree)"
     try:
-        import subprocess
         tree = subprocess.check_output(
             ["tree", "/workspace", "-I",
              "node_modules|.git|venv|.venv|.cline_context|.cline_logs|__pycache__|dist|build|public|.knowledge_base"],
@@ -2809,7 +4183,7 @@ def build_replan_payload(previous: dict, new_request: str,
         "<PROJECT_DATA>\n"
         f"  <NAME>{PROJECT_NAME}</NAME>\n"
     )
-    for key in ("architect", "engineer"):
+    for key in (DISTILL_DESIGN_PASS, "engineer"):
         if previous.get(key):
             payload += (f"  <PREVIOUS_PLAN source=\"{key}\">\n"
                         f"{previous[key]}\n  </PREVIOUS_PLAN>\n\n")
@@ -2859,16 +4233,21 @@ def assemble_clinerules(results: dict, config: dict, messages: list) -> str:
     """Combine the 4-pass results into a structured .clinerules document."""
     limits = config.get("limits", {})
 
-    # Try to extract the target objective from the messages
+    # The target objective is the last thing the user actually asked for.
+    #
+    # This used to look only for "!build", which meant every gated route wrote the
+    # fallback text instead: `!architect "add SSO"` followed by `!approve` has no
+    # "!build" in it anywhere, so the document the agent reads opened with
+    # "Complete the implementation roadmap as specified." Walk back over the same
+    # trigger vocabulary run_distillation uses, skipping bare commands, so
+    # !build, !architect and !bugfix all name their own objective.
     target_obj = "Complete the implementation roadmap as specified."
     for msg in reversed(messages):
-        if "!build" in msg.get("content", "").lower():
-            import re
-            content = msg.get("content", "")
-            # Filter out !build and flags
-            target_obj = re.sub(r'!build|--repo\s+\S+|--kb\s+\S+', '', content, flags=re.IGNORECASE).strip()
-            if not target_obj:
-                target_obj = "Process project requirements and implement planned architecture."
+        if msg.get("role") != "user":
+            continue
+        directives = strip_trigger_syntax(msg.get("content", ""))
+        if directives:
+            target_obj = directives
             break
 
     doc = [
@@ -2894,6 +4273,7 @@ def assemble_clinerules(results: dict, config: dict, messages: list) -> str:
     # now sit after it, as gates the plan has to satisfy.
     section_map = {
         "architect": ("Architecture & Directory Structure", "🏗️"),
+        "bugfix": ("Diagnosis & Fix Plan", "🩺"),
         "engineer": ("Implementation Roadmap", "⚙️"),
     }
     for key, (title, icon) in section_map.items():
@@ -2939,7 +4319,7 @@ def assemble_clinerules(results: dict, config: dict, messages: list) -> str:
         "- CONTEXT PRESERVATION: Your context window is limited. NEVER read more than 300 lines at once. Use searchFiles to locate specific code before reading.",
         "- EXTERNAL MEMORY: After analyzing any file, append a 3-line summary to '.cline_context/analysis_notes.md'. This is your long-term memory.",
         "- ANTI-AMNESIA: If you feel lost or unsure what you've done, read '.cline_context/.session_state.md' and '.cline_context/analysis_notes.md' BEFORE doing anything else.",
-        "- SYMBOL SKELETON FIRST: Your .clinerules contains a Symbol Skeleton with imports and function names. Use this to navigate, not readFile.",
+        "- SYMBOL SKELETON FIRST: Your .clinerules contains a Symbol Skeleton with imports, function names and - where they fitted - their signatures. Use this to navigate, not readFile. If a signature is there, do not open the file to learn it.",
         "- DEBUG-FIRST: When you need to understand how code works, write a small probe script, run it, and read the output. This is faster and more accurate than reading 500 lines of source code.",
         "- MANDATORY TEST GATE: After editing ANY file, run the project's test suite. If tests fail after your edit, fix the regression BEFORE moving to the next task.",
         "</operational_constraints>",
@@ -2972,8 +4352,15 @@ def run_replan(growth_threshold: int, max_replans: int) -> int:
     _resolve_context_window(config)
     models = config.get("models", {})
     prompts = load_prompts(config)
-    replan_passes = tuple(config.get("limits", {}).get(
-        "replan_passes", DEFAULT_REPLAN_PASSES))
+    # `replan_passes` is configured by name, and the name it carries is
+    # "architect" because that is the design pass in every ordinary run. On a
+    # bugfix run the plan on disk is the diagnosis, so the configured design pass
+    # is substituted rather than requiring the operator to keep two lists in sync
+    # - and a config that already names "bugfix" is left exactly as written.
+    replan_passes = tuple(
+        DISTILL_DESIGN_PASS if p in DESIGN_PASSES else p
+        for p in config.get("limits", {}).get("replan_passes", DEFAULT_REPLAN_PASSES)
+    )
 
     previous = {}
     for key in replan_passes + REPLAN_CARRY_PASSES:
@@ -3040,6 +4427,7 @@ def run_replan(growth_threshold: int, max_replans: int) -> int:
             if prev_name and prev_name != model_name:
                 print(f"  ↳ Switching model: {prev_name} → {model_name}", flush=True)
                 unload_model(client, previous_model_config)
+            preload_model(client, model_config)
 
             # Only passes revised earlier in *this* run become prior context, so
             # the engineer maps files against the architecture just revised rather

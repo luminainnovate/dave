@@ -41,6 +41,12 @@ services:
       context: ./cline-builder
       dockerfile: Dockerfile
     container_name: cline-builder
+    # Run as the invoking user, not root. Everything this container writes lands
+    # in the bind-mounted workspace, and as root that made the user's own project
+    # tree unwritable to them (a chown -R was needed to run the test suite).
+    # Defaults to 1000:1000, the common single-user Linux uid. Override in .env:
+    #   BUILDER_UID=$(id -u)  BUILDER_GID=$(id -g)
+    user: "${BUILDER_UID:-1000}:${BUILDER_GID:-1000}"
     profiles:
       - build
     networks:
@@ -61,6 +67,36 @@ services:
       # is configured. The orchestrator still injects EXPERT_CTX when it launches
       # a build, and that continues to win. The previous 8192 here silently
       # overrode a 131072 config and over-committed every prompt.
+      #
+      # Database for DB-backed tests in the build phase. A generated project's own
+      # .env says localhost:5432, which inside here is this container, not the
+      # host - so these override it. The build agent cannot fix that itself: there
+      # is no docker CLI and no socket in this image, so any `docker compose up -d`
+      # it plans is a no-op.
+      #
+      # ⚠️ host.docker.internal ONLY WORKS IF THE DATABASE LISTENS ON ALL HOST
+      # INTERFACES. veriform's own compose publishes Postgres as
+      # `127.0.0.1:5432:5432` - deliberately, so the DB is not exposed off the box
+      # - and this container reaches the host at the bridge address (172.17.0.1),
+      # where nothing is listening. Every DB-backed test here dies ECONNREFUSED.
+      # Verify before believing otherwise:
+      #   docker run --rm --add-host host.docker.internal:host-gateway node:24-slim \
+      #     bash -c 'timeout 5 bash -c "</dev/null >/dev/tcp/host.docker.internal/5432"'
+      #
+      # To actually reach a loopback-published DB, join its compose network instead
+      # of going via the host, and point the URL at the container name:
+      #   DATABASE_URL=postgres://vif:vif@veriform-postgres:5432/veriform
+      # plus, under this service:  networks: [ai-workspace-net, backend_default]
+      # and at the bottom of the file:  backend_default: {external: true}
+      # That is left OFF by default because an `external` network that does not
+      # exist fails EVERY build, including ones with no database at all.
+      #
+      # None of this affects `!bugfix`: its reproduction is required to run with
+      # no database, server or network (bugfix.md B5), and distill.py classifies a
+      # refused connection as an environment fault rather than as evidence against
+      # the diagnosis.
+      - DATABASE_URL=${DATABASE_URL:-postgres://vif:vif@host.docker.internal:5432/veriform}
+      - TEST_DATABASE_URL=${TEST_DATABASE_URL:-postgres://vif:vif@host.docker.internal:5432/veriform_test}
     working_dir: /workspace
 
 networks:

@@ -21,6 +21,8 @@ import importlib.util
 import io
 import json
 import os
+import re
+import shlex
 import sys
 import tempfile
 
@@ -801,10 +803,10 @@ def test_skeleton_lists_symbolless_files_rather_than_dropping_them():
     skeleton *and* out of the tree would vanish from the payload entirely.
     """
     files_data = [
-        ("src/rich.ts", 40, ["import x"], ["Thing"], []),
-        ("src/bare.ts", 10, ["import y"], [], ["helper"]),
+        ("src/rich.ts", 40, ["import x"], [("Thing", "(a: string)")], []),
+        ("src/bare.ts", 10, ["import y"], [], [("helper", "()")]),
     ]
-    blocks, footer = distill._render_skeleton(files_data, full=False)
+    blocks, footer = distill._render_skeleton(files_data, distill.SKELETON_TIERS[-1])
     assert len(blocks) == 1, "the symbol-less file still rendered a detail block"
     assert "src/bare.ts" in footer, "the symbol-less file was dropped outright"
     assert len(footer) < 200, "the roll-up should be compact"
@@ -813,13 +815,139 @@ def test_skeleton_lists_symbolless_files_rather_than_dropping_them():
 def test_skeleton_paths_covers_both_renderings():
     """prune_tree_against_skeleton is only safe if this sees every path."""
     files_data = [
-        ("src/rich.ts", 40, ["import x"], ["Thing"], []),
-        ("src/bare.ts", 10, ["import y"], [], ["helper"]),
+        ("src/rich.ts", 40, ["import x"], [("Thing", "(a: string)")], []),
+        ("src/bare.ts", 10, ["import y"], [], [("helper", "()")]),
     ]
-    blocks, footer = distill._render_skeleton(files_data, full=False)
+    blocks, footer = distill._render_skeleton(files_data, distill.SKELETON_TIERS[-1])
     skeleton = "\n".join(["[PROJECT SYMBOL SKELETON]"] + blocks + [footer])
     paths = distill.skeleton_paths(skeleton)
     assert paths == {"src/rich.ts", "src/bare.ts"}, paths
+
+
+def test_skeleton_carries_exported_signatures():
+    """
+    The regression this exists for: the skeleton named `upsertRole` and stopped
+    there, so a design pass could see that a role writer existed and not what it
+    took or returned - which is exactly enough to add a second one beside it.
+    """
+    src = (
+        'export async function upsertRole(role: ResumeRole): Promise<void> {}\n'
+        'export type Role = "owner" | "viewer";\n'
+    )
+    exported, _internal = distill._scan_symbols(src)
+    rendered = [distill._sym_text(s, True) for s in exported]
+    assert "upsertRole(role: ResumeRole): Promise<void>" in rendered, rendered
+    assert 'Role = "owner" | "viewer"' in rendered, rendered
+
+
+def test_signature_survives_a_declaration_wrapped_across_lines():
+    """
+    Anything with more than two parameters is formatted one per line, and a
+    scan that stopped at the newline would render "upsertRole(" - worse than the
+    bare name it replaced, because it looks like information.
+    """
+    src = (
+        'export function upsertRole(\n'
+        '  role: ResumeRole,\n'
+        '  actor?: string,\n'
+        '): Promise<ResumeRole> {\n'
+        '  return role;\n'
+        '}\n'
+    )
+    exported, _internal = distill._scan_symbols(src)
+    assert distill._sym_text(exported[0], True) == \
+        "upsertRole(role: ResumeRole, actor?: string): Promise<ResumeRole>"
+
+
+def test_arrow_signature_reads_the_parameters_not_the_body():
+    """
+    ARROW_RE's match ends past the `=>`, so scanning from the match end would
+    capture the function body. Signatures are read from the end of the name.
+    """
+    src = 'export const rateLimit = async (key: string, limit: number) => { return 1; };\n'
+    exported, _internal = distill._scan_symbols(src)
+    sig = distill._sym_text(exported[0], True)
+    assert "key: string, limit: number" in sig, sig
+    assert "return 1" not in sig, sig
+
+
+def test_signature_scan_is_not_derailed_by_a_brace_in_a_default():
+    """A `{` inside the parameter list must not end the signature."""
+    src = 'export function fmt(sep = "{", pad = 2): string {}\n'
+    exported, _internal = distill._scan_symbols(src)
+    sig = distill._sym_text(exported[0], True)
+    assert "pad = 2" in sig, sig
+    assert sig.endswith("string"), sig
+
+
+def test_long_signatures_are_capped_not_left_to_run():
+    """One baroque generic must not spend the cap a whole file needs."""
+    src = f'export function wide({", ".join(f"a{i}: SomeLongTypeName" for i in range(40))}) {{}}\n'
+    exported, _internal = distill._scan_symbols(src)
+    assert len(distill._sym_text(exported[0], True)) <= distill._SIG_MAX_CHARS + 20
+
+
+def test_python_module_level_declarations_are_the_public_surface():
+    """
+    Python has no export keyword, so the exported/internal split has to come from
+    indentation. Without it every Python symbol is "internal", no tier renders a
+    signature, and the whole feature is a no-op on a Python project.
+    """
+    src = (
+        "def solve_budget(window: int, fixed: int) -> tuple:\n"
+        "    return (window, fixed)\n"
+        "def _private_helper(x):\n"
+        "    return x\n"
+        "class Runner:\n"
+        "    def method(self, a):\n"
+        "        return a\n"
+    )
+    exported, internal = distill._scan_symbols(src, ".py")
+    names = [n for n, _ in exported]
+    assert names == ["solve_budget", "Runner"], names
+    assert [n for n, _ in internal] == ["_private_helper", "method"]
+    assert distill._sym_text(exported[0], True) == \
+        "solve_budget(window: int, fixed: int) -> tuple"
+
+
+def test_typescript_without_export_stays_private():
+    """
+    The indentation fallback is for languages with no export keyword only. A
+    top-level TS function with no `export` is private on purpose, and offering it
+    to the architect would invite a design that imports what nothing exports.
+    """
+    src = "function helper(a: string) {}\nexport function api(b: number) {}\n"
+    exported, internal = distill._scan_symbols(src, ".ts")
+    assert [n for n, _ in exported] == ["api"]
+    assert [n for n, _ in internal] == ["helper"]
+
+
+def test_internal_helpers_never_carry_signatures():
+    """
+    Nothing outside a file may call its internal helpers, so their signatures are
+    not reuse surface - they would spend the cap the exported ones must fit in.
+    """
+    files_data = [("src/a.ts", 10, [], [("Api", "(x: number)")], [("helper", "(y: string)")])]
+    block = distill._render_skeleton(files_data, distill.SKELETON_TIERS[0])[0][0]
+    assert "Api(x: number)" in block
+    assert "helper" in block and "y: string" not in block
+
+
+def test_skeleton_sheds_signatures_before_it_sheds_files():
+    """
+    Tier order is the whole safety argument: a project too large for signatures
+    still gets every file, one detail level down. Losing files silently is what
+    the tiering exists to prevent.
+    """
+    files_data = [(f"src/f{i}.ts", 10, ["import x"],
+                   [(f"Sym{i}", "(a: VeryLongParameterTypeName, b: AnotherOne): Promise<void>")], [])
+                  for i in range(200)]
+
+    rich = distill._render_skeleton(files_data, distill.SKELETON_TIERS[0])[0]
+    lean = distill._render_skeleton(files_data, distill.SKELETON_TIERS[-1])[0]
+    assert sum(map(len, lean)) < sum(map(len, rich)), "the lean tier must be cheaper"
+    assert len(lean) == len(rich) == 200, "no tier may drop a file"
+    assert "Promise<void>" not in "".join(lean), "the lean tier still carried signatures"
 
 
 def test_kb_budget_leaves_the_payload_on_the_single_pass_path():
@@ -935,7 +1063,7 @@ def test_a_confirmed_absence_still_reaches_the_retry():
     """
     here = os.path.dirname(os.path.abspath(__file__))
     with contextlib.redirect_stdout(io.StringIO()):
-        block = distill.read_evidence(here, [], 10000, ["src/db/schema.ts"])
+        block = distill.read_evidence(here, [], 10000, ["src/db/schema.ts"]).text
     assert "<ABSENT>" in block
     assert "src/db/schema.ts" in block
     assert "REQUESTED_EVIDENCE" in block
@@ -945,7 +1073,7 @@ def test_absence_and_contents_travel_together():
     here = os.path.dirname(os.path.abspath(__file__))
     name = os.path.basename(__file__)
     with contextlib.redirect_stdout(io.StringIO()):
-        block = distill.read_evidence(here, [name], 5000, ["gone.ts"])
+        block = distill.read_evidence(here, [name], 5000, ["gone.ts"]).text
     assert f'<file path="{name}">' in block
     assert "<ABSENT>" in block and "gone.ts" in block
 
@@ -954,7 +1082,7 @@ def test_read_evidence_respects_its_budget():
     here = os.path.dirname(os.path.abspath(__file__))
     name = os.path.basename(__file__)
     with contextlib.redirect_stdout(io.StringIO()):
-        block = distill.read_evidence(here, [name], budget_chars=500)
+        block = distill.read_evidence(here, [name], budget_chars=500).text
     assert block, "no evidence block produced"
     assert "truncated:" in block, "an oversized file was not truncated"
     assert len(block) < 2000
@@ -962,10 +1090,10 @@ def test_read_evidence_respects_its_budget():
 
 def test_read_evidence_is_empty_without_budget_or_paths():
     here = os.path.dirname(os.path.abspath(__file__))
-    assert distill.read_evidence(here, [], 10000) == ""
-    assert distill.read_evidence(here, [], 10000, []) == ""
-    assert distill.read_evidence(here, [os.path.basename(__file__)], 0) == ""
-    assert distill.read_evidence(here, [], 0, ["gone.ts"]) == ""
+    assert distill.read_evidence(here, [], 10000).text == ""
+    assert distill.read_evidence(here, [], 10000, []).text == ""
+    assert distill.read_evidence(here, [os.path.basename(__file__)], 0).text == ""
+    assert distill.read_evidence(here, [], 0, ["gone.ts"]).text == ""
 
 
 def test_addendum_budget_keeps_a_retry_on_the_single_pass_path():
@@ -1268,6 +1396,976 @@ def test_every_trigger_command_is_recognised_and_stripped():
         assert distill._is_trigger_message(f"{cmd} do the thing")
         assert distill.strip_trigger_syntax(f"{cmd} do the thing") == "do the thing"
     assert not distill._is_trigger_message("just a normal message")
+
+
+# --- N. Reasoning effort -----------------------------------------------------
+#
+# The model template resolves reasoning_effort to 'xhigh' when it is unset and
+# raises on any value outside xhigh/medium/low, so the payload builder is the
+# only thing standing between a config typo and a mid-pass HTTP 500. "off" is
+# not one of the template's levels - it is enable_thinking=false - and these
+# assert that translation rather than assuming a passthrough.
+
+
+class _PayloadCaptured(BaseException):
+    """
+    Unwinds _single_llm_call the moment the payload exists.
+
+    BaseException deliberately: the function catches httpx errors and bare
+    Exception to drive its retry ladder, and a caught sentinel would mean three
+    attempts, two sleeps and a report_server_state() call over a dead socket.
+    """
+
+
+def _payload_for(reasoning: str, provider: str = "llamacpp") -> dict:
+    """
+    Capture the request body _single_llm_call would send, without sending it.
+
+    Patches httpx.Client rather than passing a fake: the streaming path opens
+    its own client and ignores the one handed to it.
+    """
+    captured = {}
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def stream(self, method, url, json=None, **kw):
+            captured.update(json)
+            raise _PayloadCaptured
+
+    cfg = distill._resolve_model_config({
+        "model": "m", "provider": provider,
+        "base_url": "http://x", "reasoning": reasoning,
+    })
+    real_client = distill.httpx.Client
+    distill.httpx.Client = FakeClient
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            distill._single_llm_call(None, cfg, "sys", "user", "L",
+                                     max_output_tokens=1000)
+    except _PayloadCaptured:
+        pass
+    finally:
+        distill.httpx.Client = real_client
+    return captured
+
+
+def test_reasoning_level_reaches_the_template_kwargs():
+    for level in ("low", "medium", "xhigh"):
+        kwargs = _payload_for(level).get("chat_template_kwargs")
+        assert kwargs == {"reasoning_effort": level}, f"{level}: got {kwargs}"
+
+
+def test_reasoning_off_is_sent_as_enable_thinking_false():
+    """The template raises on reasoning_effort='none'; off must not become one."""
+    kwargs = _payload_for("off").get("chat_template_kwargs")
+    assert kwargs == {"enable_thinking": False}, kwargs
+
+
+def test_high_is_accepted_as_the_templates_alias_for_xhigh():
+    assert distill._validate_reasoning("high") == "xhigh"
+    assert distill._validate_reasoning("LOW") == "low"
+
+
+def test_unknown_reasoning_level_fails_at_config_time():
+    """A typo must not survive to become a 500 several minutes into a pass."""
+    for bad in ("none", "off_", "extreme", "1"):
+        try:
+            distill._validate_reasoning(bad, "m")
+        except ValueError:
+            continue
+        raise AssertionError(f"'{bad}' was accepted as a reasoning level")
+
+
+def test_thinking_pass_is_given_room_beyond_its_answer_cap():
+    """
+    Reasoning is charged against the same cap as the answer, so the reserve has
+    to be added to it - otherwise the pass spends its answer allowance thinking
+    and returns zero answer tokens.
+    """
+    thinking = _payload_for("low")["max_tokens"]
+    off = _payload_for("off")["max_tokens"]
+    assert off == 1000, off
+    assert thinking == 1000 + distill.REASONING_RESERVE_TOKENS, thinking
+
+
+def test_the_reserve_is_taken_back_out_of_the_solver_window():
+    """
+    The other half of the same bargain: a larger cap that is not paid for out of
+    the window is just an overrun. Solving against the shortened window must
+    leave a thinking pass with a strictly smaller answer budget.
+    """
+    # Sized so the merge answer is the solver's proportional term rather than
+    # ANSWER_MAX_TOKENS: at a 64k window both sides clamp to the same ceiling
+    # and the test would pass without measuring anything.
+    window, fixed = 24576, 2000
+    facts_off, answer_off = distill.solve_merge_budget(window, fixed)
+    facts_on, answer_on = distill.solve_merge_budget(
+        window - distill.REASONING_RESERVE_TOKENS, fixed)
+    assert answer_on < answer_off, (answer_on, answer_off)
+    assert facts_on < facts_off, (facts_on, facts_off)
+
+
+def test_sampling_matches_the_model_card():
+    """
+    0.3 was set for a non-thinking model and sits below both of the card's
+    presets; on this family that is a repetition-loop risk.
+    """
+    for provider, get in (("llamacpp", lambda p: p),
+                          ("ollama", lambda p: p["options"])):
+        opts = get(_payload_for("low", provider))
+        assert opts["temperature"] == distill.SAMPLING_TEMPERATURE, provider
+        assert opts["top_p"] == distill.SAMPLING_TOP_P, provider
+        assert opts["top_k"] == distill.SAMPLING_TOP_K, provider
+        assert opts["min_p"] == distill.SAMPLING_MIN_P, provider
+
+
+def test_ollama_gets_a_boolean_because_effort_levels_do_not_cross_over():
+    assert _payload_for("xhigh", "ollama")["think"] is True
+    assert _payload_for("off", "ollama")["think"] is False
+
+
+# --- O. The bugfix design pass ----------------------------------------------
+#
+# `!bugfix` swaps the architect out of pass 1 for a diagnostician, and the thing
+# that makes it more than a differently-worded architect is that its diagnosis is
+# checked against a command that actually runs. A pass cannot run anything, so
+# "the bug is reproducible" from a pass is an opinion; these cover the machinery
+# that turns it into an exit code, and the refusal when it will not become one.
+
+_GOOD_DOC = """# 1. Symptom
+- Uploads above 5MB store zero bytes.
+# 2. Reproduction
+- COMMAND: `npx --no-install vitest run tests/upload.spec.ts`
+- SIGNATURE: expected stored size 6291456 to be greater than 0
+# 3. Evidence
+- src/storage/store.ts::store — slices to MAX_INLINE.
+"""
+
+
+def test_reproduction_is_parsed_through_the_markup_a_model_adds():
+    """
+    Backticks round a command and a trailing full stop are formatting, not intent.
+    Rejecting a correct repro over them would spend a full design pass to be told
+    the same thing again.
+    """
+    parsed, reason = distill.parse_reproduction(_GOOD_DOC)
+    assert reason is None
+    command, signature = parsed
+    assert command == "npx --no-install vitest run tests/upload.spec.ts"
+    assert signature == "expected stored size 6291456 to be greater than 0"
+
+    parsed, _ = distill.parse_reproduction(
+        "- COMMAND: `pytest -k upload`.\n- SIGNATURE: **AssertionError: size was 0**"
+    )
+    assert parsed[0] == "pytest -k upload"
+
+
+def test_a_document_with_no_reproduction_is_reported_not_guessed():
+    for doc, expect in (
+        ("# 1. Symptom\n- it breaks", "no COMMAND"),
+        ("- COMMAND: pytest", "no SIGNATURE"),
+        ("- COMMAND:\n- SIGNATURE: something specific here", "COMMAND"),
+    ):
+        parsed, reason = distill.parse_reproduction(doc)
+        assert parsed is None
+        assert expect in reason, (doc, reason)
+
+
+def test_only_a_project_runner_may_be_executed():
+    """
+    bugfix.md B5 restricts the command to a toolchain binary. Enforced here rather
+    than trusted to the prompt: the pass names a program and its arguments, and
+    that is the whole of what it can cause to happen.
+    """
+    sig = "expected stored size 6291456 to be greater than 0"
+    assert distill.validate_reproduction("npx vitest run", sig) is None
+    assert distill.validate_reproduction("python3 -m pytest -q", sig) is None
+    for bad in ("rm -rf /", "bash -c 'pytest'", "curl http://example.com",
+                "sh ./run.sh", "/bin/sh -c pytest"):
+        reason = distill.validate_reproduction(bad, sig)
+        assert reason and "not one of the allowed runners" in reason, bad
+
+
+def test_shell_operators_cannot_become_operators():
+    """
+    shlex + argv means `&&` is an argument to the runner, never a second command.
+    The prohibition in B5 is structural, not a promise the model keeps.
+    """
+    argv = distill.shlex.split("npm test && rm -rf /")
+    assert argv[0] == "npm"
+    assert "&&" in argv  # an argument, and npm will simply reject it
+    assert distill.validate_reproduction("npm test && rm -rf /",
+                                         "expected 6291456 to be above 0") is None
+
+
+def test_a_signature_that_matches_any_failure_is_not_a_signature():
+    """
+    'FAILED' identifies a broken build, not this bug, and would verify whatever
+    diagnosis happened to be in front of it.
+    """
+    for weak in ("FAILED", "Error", "1 failed", "exception", "traceback"):
+        reason = distill.validate_reproduction("pytest -q", weak)
+        assert reason, weak
+    assert distill.validate_reproduction("pytest -q", "size 0") is not None  # too short
+    assert distill.validate_reproduction(
+        "pytest -q", "AssertionError: stored size was 0, expected 6291456") is None
+
+
+def _repro(script: str, signature: str, tmp: str):
+    with contextlib.redirect_stdout(io.StringIO()):
+        return distill.run_reproduction(
+            f"python3 -c {distill.shlex.quote(script)}", signature, 30.0, cwd=tmp
+        )
+
+
+def test_a_reproduction_that_fails_as_declared_is_verified():
+    with tempfile.TemporaryDirectory() as tmp:
+        result = _repro(
+            "import sys; sys.stderr.write('AssertionError: stored size was 0\\n'); "
+            "sys.exit(1)",
+            "AssertionError: stored size was 0", tmp,
+        )
+    assert result.verified, result.reason
+
+
+def test_a_command_that_succeeds_did_not_reproduce_anything():
+    with tempfile.TemporaryDirectory() as tmp:
+        result = _repro("pass", "AssertionError: stored size was 0", tmp)
+    assert not result.verified
+    assert "did not appear" in result.reason
+    assert "exited 0" in result.observation
+
+
+def test_failing_differently_is_not_reproducing_the_bug():
+    """
+    Non-zero alone would verify any diagnosis against any broken suite. The
+    signature is what ties the failure to the cause that was claimed.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        result = _repro(
+            "import sys; sys.stderr.write('SyntaxError: bad token\\n'); sys.exit(1)",
+            "AssertionError: stored size was 0", tmp,
+        )
+    assert not result.verified
+    assert "declared signature" in result.reason
+    assert "SyntaxError: bad token" in result.observation
+
+
+def test_a_missing_runner_is_not_a_reproduced_bug():
+    """
+    Exit 127 says the box is missing a dependency. Counting it as a failing repro
+    would confirm every diagnosis on a machine with an incomplete toolchain -
+    the same classification the build loop's test gate already applies.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        with contextlib.redirect_stdout(io.StringIO()):
+            missing = distill.run_reproduction(
+                "cargo test --quiet", "AssertionError: stored size was 0", 30.0, cwd=tmp
+            )
+            modless = distill.run_reproduction(
+                "python3 -c 'import nope_not_a_module'",
+                "AssertionError: stored size was 0", 30.0, cwd=tmp,
+            )
+    assert not missing.verified
+    assert not modless.verified
+    assert "runner" in modless.reason or "installed" in missing.reason
+
+
+def test_a_reproduction_that_hangs_is_bounded():
+    with tempfile.TemporaryDirectory() as tmp:
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = distill.run_reproduction(
+                "python3 -c 'import time; time.sleep(30)'",
+                "AssertionError: stored size was 0", 1.0, cwd=tmp,
+            )
+    assert not result.verified
+    assert "timed out" in result.reason
+
+
+@contextlib.contextmanager
+def _repro_loop(outcomes, replies):
+    """Drive verify_bugfix_reproduction with scripted repro results and re-runs."""
+    saved = (distill.run_reproduction, distill.call_llm, distill.resolve_pass_blockers)
+    seen = {"runs": 0, "llm": []}
+
+    def fake_run(command, signature, timeout_secs, cwd="/workspace", repro_file=None):
+        seen["runs"] += 1
+        seen.setdefault("files", []).append(repro_file)
+        return outcomes[min(seen["runs"] - 1, len(outcomes) - 1)]
+
+    def fake_llm(client, model_config, prompt, user_content, prior_context=""):
+        seen["llm"].append(user_content)
+        return replies[min(len(seen["llm"]) - 1, len(replies) - 1)]
+
+    distill.run_reproduction = fake_run
+    distill.call_llm = fake_llm
+    distill.resolve_pass_blockers = lambda *a, **k: a[7] if len(a) > 7 else k["result"]
+    try:
+        yield seen
+    finally:
+        (distill.run_reproduction, distill.call_llm,
+         distill.resolve_pass_blockers) = saved
+
+
+_MISS = distill.ReproResult(False, "the command succeeded", "It exited 0.")
+_HIT = distill.ReproResult(True, "failed with the declared signature (exit 1)", "")
+
+
+def _verify(seen_ctx, doc, attempts=3):
+    with contextlib.redirect_stdout(io.StringIO()):
+        return distill.verify_bugfix_reproduction(
+            None, {}, "SYSTEM", "PAYLOAD", "", "skeleton", doc,
+            max_attempts=attempts, timeout_secs=5.0,
+        )
+
+
+def test_the_loop_stops_the_moment_the_bug_is_reproduced():
+    with _repro_loop([_HIT], [_GOOD_DOC]) as seen:
+        doc, verified = _verify(seen, _GOOD_DOC)
+    assert verified
+    assert seen["runs"] == 1
+    assert seen["llm"] == []  # no re-run paid for once it is proven
+
+
+def test_a_failed_reproduction_is_fed_back_as_evidence():
+    """
+    The pass is not asked to try harder; it is shown what actually happened. That
+    is the only new information in the loop, so it is what B11 makes it act on.
+    """
+    with _repro_loop([_MISS, _HIT], [_GOOD_DOC]) as seen:
+        doc, verified = _verify(seen, _GOOD_DOC)
+    assert verified
+    assert seen["runs"] == 2
+    assert len(seen["llm"]) == 1
+    fed = seen["llm"][0]
+    assert "<REPRO_OBSERVATION>" in fed
+    assert "It exited 0." in fed
+    assert fed.startswith("PAYLOAD")  # the addendum extends the payload, not replaces it
+
+
+def test_the_loop_is_bounded_and_says_so():
+    with _repro_loop([_MISS], [_GOOD_DOC]) as seen:
+        doc, verified = _verify(seen, _GOOD_DOC, attempts=3)
+    assert not verified
+    assert seen["runs"] == 3
+    assert len(seen["llm"]) == 2  # n attempts costs n-1 re-runs, not n
+
+
+def test_a_rejected_command_costs_no_subprocess():
+    """
+    A repro that fails validation is fed back without being run. The rejection is
+    the observation, and running it was never possible.
+    """
+    bad = "# 2. Reproduction\n- COMMAND: rm -rf /\n- SIGNATURE: everything is gone now\n"
+    with _repro_loop([_HIT], [_GOOD_DOC]) as seen:
+        doc, verified = _verify(seen, bad, attempts=2)
+    assert seen["runs"] == 1  # attempt 1 rejected before running; attempt 2 ran
+    assert "not one of the allowed runners" in seen["llm"][0]
+
+
+def test_verification_can_be_switched_off_but_not_silently():
+    with _repro_loop([_MISS], [_GOOD_DOC]) as seen:
+        doc, verified = _verify(seen, _GOOD_DOC, attempts=0)
+    assert verified          # self-reported, exactly as the config says
+    assert seen["runs"] == 0
+
+
+def test_an_unverified_diagnosis_is_refused_rather_than_reused():
+    """
+    Same guard as ABORT_MARKER, one reason further on. A blocked pass refuses to
+    diagnose; an unverified one diagnoses something nothing was seen to do, which
+    is worse because it looks like a plan.
+    """
+    marked = distill.mark_unverified(_GOOD_DOC, 3)
+    assert distill.UNVERIFIED_MARKER in marked
+    assert _GOOD_DOC.strip() in marked
+
+    tmp = tempfile.mkdtemp()
+    saved = distill.INTERMEDIATE_DIR
+    distill.INTERMEDIATE_DIR = tmp
+    try:
+        with open(distill._intermediate_path("bugfix"), "w", encoding="utf-8") as f:
+            f.write(f"# Distillation Intermediate: Bugfix\n\n{marked}")
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert distill.load_saved_pass("bugfix") is None
+        # Deleting the banner by hand is the documented override.
+        with open(distill._intermediate_path("bugfix"), "w", encoding="utf-8") as f:
+            f.write(f"# Distillation Intermediate: Bugfix\n\n{_GOOD_DOC}")
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert distill.load_saved_pass("bugfix") is not None
+    finally:
+        distill.INTERMEDIATE_DIR = saved
+
+
+def test_the_design_pass_is_swapped_not_added():
+    """
+    A bug report handed to the architect comes back as a refactor; a feature
+    request handed to the diagnostician comes back BLOCKED for want of a symptom.
+    They are alternatives, so exactly one occupies slot 1.
+    """
+    assert distill.DISTILL_DESIGN_PASS in distill.DESIGN_PASSES
+    assert distill.DESIGN_PASSES == ("architect", "bugfix")
+    # Both own a .clinerules section, so whichever ran is rendered under its own
+    # heading rather than falling out of the assembled document.
+    for key in distill.DESIGN_PASSES:
+        assert key in ("architect", "bugfix", "engineer")
+    doc = distill.assemble_clinerules(
+        {"bugfix": "DIAGNOSIS", "engineer": "ROADMAP"}, {"limits": {}},
+        [{"role": "user", "content": "!bugfix login 500s"}],
+    )
+    assert "Diagnosis & Fix Plan" in doc
+    assert doc.index("DIAGNOSIS") < doc.index("ROADMAP")
+
+
+def test_diagnosis_gets_more_evidence_rounds_than_design():
+    """
+    The architect blocks on a specification gap, and a gap that survives being
+    shown the files is one the workspace does not contain - so one round. For
+    diagnosis, reading files IS the work and each round narrows the search.
+    """
+    assert "bugfix" in distill.EVIDENCE_RETRY_PASSES
+    assert distill.EVIDENCE_ROUNDS.get("bugfix", 0) > distill.EVIDENCE_ROUNDS_DEFAULT
+    assert distill.EVIDENCE_ROUNDS.get("architect", distill.EVIDENCE_ROUNDS_DEFAULT) == 1
+
+
+def test_every_gate_names_its_own_objective():
+    """
+    The target objective used to be found by searching for "!build". A gated route
+    has none - `!architect "add SSO"` then `!approve` - so the agent's build
+    specification opened with the fallback text instead of the actual request.
+    """
+    for trigger in ("!build add dark mode", "!architect add SSO", "!bugfix login 500s"):
+        doc = distill.assemble_clinerules(
+            {"engineer": "ROADMAP"}, {"limits": {}},
+            [{"role": "user", "content": trigger},
+             {"role": "assistant", "content": "🔨 Build pipeline triggered."}],
+        )
+        expected = distill.strip_trigger_syntax(trigger)
+        assert f"> {expected}" in doc, trigger
+
+
+def test_a_deferred_symptom_is_still_reproducible_on_its_own():
+    """
+    A two-symptom report gets one diagnosis and the rest as DEFERRED bullets
+    (bugfix.md B13). Section 2 must reproduce the bug that was diagnosed, not the
+    report as a whole - a repro spanning both would verify a merged cause, which
+    is the fabrication B13 exists to prevent.
+    """
+    doc = """# 1. Symptom
+- Uploads above 5MB store zero bytes.
+# 2. Reproduction
+- COMMAND: npx --no-install vitest run tests/upload.spec.ts
+- SIGNATURE: expected stored size 6291456 to be greater than 0
+# 7. Out of Scope
+- DEFERRED: the login page returns 500 after a password reset
+- MAX_INLINE is duplicated as a literal in the client.
+"""
+    parsed, reason = distill.parse_reproduction(doc)
+    assert reason is None
+    command, signature = parsed
+    assert distill.validate_reproduction(command, signature) is None
+    # The deferred symptom is quoted verbatim so it can be re-run as its own
+    # !bugfix, and is what the orchestrator surfaces as the next action.
+    deferred = re.findall(r"^\s*[-*]\s*DEFERRED:\s*(.+?)\s*$", doc, re.MULTILINE)
+    assert deferred == ["the login page returns 500 after a password reset"]
+
+
+def test_a_bare_approve_does_not_become_the_objective():
+    doc = distill.assemble_clinerules(
+        {"engineer": "ROADMAP"}, {"limits": {}},
+        [{"role": "user", "content": "!bugfix uploads over 5MB store zero bytes"},
+         {"role": "assistant", "content": "🩺 Diagnosis"},
+         {"role": "user", "content": "!approve"}],
+    )
+    assert "> uploads over 5MB store zero bytes" in doc
+
+
+# --- REPRO_FILE ---------------------------------------------------------------
+
+_REPRO_FILE_DOC = """# 2. Reproduction
+- COMMAND: npx --no-install vitest run src/x.spec.ts --reporter=dot
+- SIGNATURE: stored 0 bytes of a 6291456 byte body
+- REPRO_FILE: src/x.spec.ts
+```ts
+import { it, expect } from "vitest";
+it("stores the whole body", () => { expect(store(big)).toBe(big.length); });
+```
+"""
+
+
+def test_a_reproduction_may_bring_the_test_it_needs():
+    """
+    Most bugs have no failing test yet; the suite encodes its author's fixtures.
+    Requiring the command to fail against the unmodified tree made the gate
+    unsatisfiable for exactly those bugs, so the pass may supply the test.
+    """
+    parsed, reason = distill.parse_repro_file(_REPRO_FILE_DOC)
+    assert reason is None
+    path, body = parsed
+    assert path == "src/x.spec.ts"
+    assert "stores the whole body" in body
+
+
+def test_a_document_without_a_repro_file_is_not_an_error():
+    """An existing failing test is still the better reproduction."""
+    parsed, reason = distill.parse_repro_file(_GOOD_DOC)
+    assert parsed is None and reason is None
+
+
+def test_a_repro_file_declaration_that_cannot_be_used_is_reported():
+    for doc, expect in (
+        ("- REPRO_FILE: src/x.spec.ts\n(no fence at all)", "no fenced code block"),
+        ("- REPRO_FILE:\n```ts\nsomething\n```", "no path"),
+        ("- REPRO_FILE: src/x.spec.ts\n```ts\nx\n```", "too small"),
+    ):
+        parsed, reason = distill.parse_repro_file(doc)
+        assert parsed is None, doc
+        assert expect in reason, (doc, reason)
+
+
+def test_a_reproduction_may_not_overwrite_the_project():
+    """
+    The pass is diagnosing, not editing. A REPRO_FILE that lands on an existing
+    path would replace source code with a test as a side effect of a diagnosis.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        os.makedirs(os.path.join(tmp, "src"))
+        existing = os.path.join(tmp, "src", "store.ts")
+        with open(existing, "w") as f:
+            f.write("export const store = 1;")
+
+        assert "already exists" in distill.validate_repro_file("src/store.ts", tmp)
+        assert "outside the project root" in distill.validate_repro_file("../escape.ts", tmp)
+        assert "absolute" in distill.validate_repro_file("/etc/passwd", tmp)
+        assert "does not exist" in distill.validate_repro_file("nope/x.spec.ts", tmp)
+        assert distill.validate_repro_file("src/new.spec.ts", tmp) is None
+        # untouched
+        with open(existing) as f:
+            assert f.read() == "export const store = 1;"
+
+
+def test_the_repro_file_is_removed_however_the_run_ends():
+    """
+    Written, run, deleted - on success, on failure and on a raised exception.
+    A diagnosis that leaves stray files behind is a diagnosis that edited the
+    workspace, which is the one thing this pass must not do.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        rel = "probe.spec.ts"
+        body = "it('x', () => { throw new Error('boom'); });" + " " * 40
+
+        for script in ("import sys; sys.exit(0)",
+                       "import sys; sys.stderr.write('nope'); sys.exit(1)"):
+            with contextlib.redirect_stdout(io.StringIO()):
+                distill.run_reproduction(
+                    f"python3 -c {shlex.quote(script)}", "sig", 30.0,
+                    cwd=tmp, repro_file=(rel, body),
+                )
+            assert not os.path.exists(os.path.join(tmp, rel)), script
+
+        # The file really was there while the command ran.
+        seen = os.path.join(tmp, "seen.txt")
+        script = (f"import os,shutil; shutil.copy({rel!r}, {seen!r}); "
+                  "raise SystemExit(1)")
+        with contextlib.redirect_stdout(io.StringIO()):
+            distill.run_reproduction(
+                f"python3 -c {shlex.quote(script)}", "sig", 30.0,
+                cwd=tmp, repro_file=(rel, body),
+            )
+        assert os.path.exists(seen), "the command never saw the written file"
+        assert not os.path.exists(os.path.join(tmp, rel))
+
+
+def test_an_unreachable_service_is_an_environment_fault_not_a_verdict():
+    """
+    This container reaches the host on the docker bridge, so a database
+    published on the host's loopback is refused. Classified as a signature miss,
+    the observation told the pass its root cause was wrong - steering a correct
+    diagnosis off the causal path over a networking detail.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        script = ("import sys; sys.stderr.write('Error: connect ECONNREFUSED "
+                  "172.17.0.1:5432'); sys.exit(1)")
+        with contextlib.redirect_stdout(io.StringIO()):
+            out = distill.run_reproduction(
+                f"python3 -c {shlex.quote(script)}", "role row was not inserted",
+                30.0, cwd=tmp,
+            )
+    assert not out.verified
+    assert "could not execute" in out.reason
+    assert "not evidence against your root cause" in out.observation
+
+    # Same for a runner that matched nothing: the path is wrong, not the code.
+    with tempfile.TemporaryDirectory() as tmp:
+        script = "import sys; sys.stderr.write('No test files found, exiting'); sys.exit(1)"
+        with contextlib.redirect_stdout(io.StringIO()):
+            out = distill.run_reproduction(
+                f"python3 -c {shlex.quote(script)}", "some specific thing", 30.0, cwd=tmp,
+            )
+    assert not out.verified and "could not execute" in out.reason
+
+
+def test_a_malformed_repro_file_is_rejected_before_the_command_runs():
+    """
+    Running the command without the test it was written for fails for a reason
+    the pass never predicted, and the observation sends it chasing that instead.
+    """
+    doc = _REPRO_FILE_DOC.replace("```ts\nimport", "NOFENCE\nimport")
+    with _repro_loop([_HIT], [doc]) as seen:
+        _doc, verified = _verify(seen, doc, attempts=1)
+    assert not verified
+    assert seen["runs"] == 0, "a broken declaration must cost no subprocess"
+
+
+# --- Symbol-aware evidence ----------------------------------------------------
+
+def test_a_blockers_symbol_is_carried_into_the_evidence_read():
+    hints = distill.blocker_symbol_hints([
+        "`src/types/domain.ts::DomainControlChallenge` — need its full field definition",
+        "- BLOCKER: Backend/src/routes/orgs.ts::serializeOrg | NEEDS: the return shape",
+        "src/services/org.service.ts — no symbol named here",
+    ])
+    assert hints["src/types/domain.ts"] == ["DomainControlChallenge"]
+    assert hints["Backend/src/routes/orgs.ts"] == ["serializeOrg"]
+    assert "src/services/org.service.ts" not in hints
+    assert distill.blocker_symbol_hints([]) == {}
+
+
+def test_evidence_is_sliced_around_the_symbol_not_the_top_of_the_file():
+    """
+    The failure this exists for: an architect asked for
+    `src/types/domain.ts::DomainControlChallenge`, whose definition sits at byte
+    27473 of a 33736-byte file against a 24000-char cap. The head slice handed
+    back 24k that did not contain it, so the pass blocked again in the same
+    words with its one retry round already spent - and a plausible slice of the
+    right file looks exactly like the request being honoured.
+    """
+    filler = "// padding line to push the definition well past the cap\n"
+    head = filler * 500
+    target = ("export interface DomainControlChallenge {\n"
+              "  recordName: string;\n  ttl: number;\n}\n")
+    content = head + target + filler * 200
+    keep = len(head) // 2                      # definition is far beyond this
+
+    blind = distill._slice_around_symbols(content, keep, None)
+    assert "DomainControlChallenge" not in blind, "head slice should miss it"
+
+    aimed = distill._slice_around_symbols(content, keep, ["DomainControlChallenge"])
+    assert "interface DomainControlChallenge" in aimed
+    assert "recordName" in aimed, "the fields it asked about must come too"
+    assert len(aimed) <= keep, (len(aimed), keep)
+    assert "earlier characters omitted" in aimed, "must say what was skipped"
+
+
+def test_a_definition_beats_an_earlier_mention_of_the_same_name():
+    """
+    The first occurrence of a symbol is usually an import. Slicing around an
+    import answers the blocker with the one line that carries no information.
+    """
+    content = ('import { Thing } from "./thing";\n' + ("x\n" * 4000) +
+               "export interface Thing {\n  field: string;\n}\n" + ("y\n" * 100))
+    out = distill._slice_around_symbols(content, 2000, ["Thing"])
+    assert "interface Thing" in out and "field: string" in out
+
+
+def test_slicing_never_exceeds_its_budget_or_crashes():
+    content = "export class Widget {\n" + ("  m();\n" * 5000) + "}\n"
+    for keep in (distill.EVIDENCE_MIN_SLICE_CHARS, 500, 5000, len(content) * 2):
+        for syms in (None, ["Widget"], ["NotPresent"], ["Widget", "NotPresent"]):
+            out = distill._slice_around_symbols(content, keep, syms)
+            assert len(out) <= max(keep, len(content)), (keep, syms, len(out))
+    # A file inside the cap is returned whole, markers and all absent.
+    assert distill._slice_around_symbols("short", 1000, ["x"]) == "short"
+
+
+def test_read_evidence_aims_the_slice_when_given_hints():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.makedirs(os.path.join(tmp, "src"))
+        filler = "// pad\n" * 3000
+        body = ("export interface DomainControlChallenge {\n  ttl: number;\n}\n")
+        with open(os.path.join(tmp, "src", "domain.ts"), "w") as f:
+            f.write(filler + body)
+
+        blind = distill.read_evidence(tmp, ["src/domain.ts"], 8000)
+        assert "DomainControlChallenge" not in blind.text
+
+        aimed = distill.read_evidence(
+            tmp, ["src/domain.ts"], 8000,
+            symbol_hints={"src/domain.ts": ["DomainControlChallenge"]})
+        assert "DomainControlChallenge" in aimed.text
+        assert aimed.included == ["src/domain.ts"]
+
+
+def test_a_failed_blocker_resolution_returns_the_right_shape():
+    """
+    It returned a bare [] on LLM failure, but the caller reads `.present`
+    OUTSIDE the try that guards the call - so the one path built to survive a
+    failed resolution raised AttributeError and killed the pass instead.
+    """
+    saved = distill._single_llm_call
+    distill._single_llm_call = lambda *a, **k: "[ERROR: LLM returned status 500]"
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            out = distill.resolve_blocker_paths(None, {}, ["b"], "skeleton", "/tmp")
+    finally:
+        distill._single_llm_call = saved
+    assert isinstance(out, distill.BlockerPaths), type(out)
+    assert out.present == [] and out.absent == []
+
+
+# --- Sibling test suites ------------------------------------------------------
+
+def _mkpkg(root, rel, scripts=None, dev=None):
+    d = os.path.join(root, rel) if rel else root
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "package.json"), "w") as f:
+        json.dump({"scripts": scripts or {}, "devDependencies": dev or {}}, f)
+    return d
+
+
+def test_a_sibling_package_with_its_own_suite_is_gated_too():
+    """
+    veriform-ui keeps its API in Backend/ with its own package.json and vitest
+    config, while the root config includes only src/**. The gate ran 168
+    frontend tests, went green, and declared a build complete while all 188
+    backend tests failed on an unapplied migration. It was not lying — it could
+    not see them.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        _mkpkg(tmp, "", dev={"vitest": "^4"})          # root: runner, no script
+        open(os.path.join(tmp, "vitest.config.ts"), "w").close()
+        _mkpkg(tmp, "Backend", scripts={"test": "vitest run"})
+
+        cmd = distill.detect_test_command(tmp)
+        assert "vitest run --reporter=dot" in cmd, cmd
+        assert "npm --prefix Backend run test" in cmd, cmd
+        assert cmd.index("vitest run --reporter=dot") < cmd.index("--prefix Backend")
+
+
+def test_a_projects_own_test_script_is_not_second_guessed():
+    """Naming a test command answers the question; running siblings too would
+    run somebody's suite twice."""
+    with tempfile.TemporaryDirectory() as tmp:
+        _mkpkg(tmp, "", scripts={"test": "vitest run && npm --prefix Backend run test"})
+        _mkpkg(tmp, "Backend", scripts={"test": "vitest run"})
+        assert distill.detect_test_command(tmp) == "npm test --silent"
+
+
+def test_a_sibling_suite_is_found_even_with_no_root_runner():
+    with tempfile.TemporaryDirectory() as tmp:
+        _mkpkg(tmp, "")                                # root: nothing runnable
+        _mkpkg(tmp, "api", scripts={"test": "jest"})
+        assert distill.detect_test_command(tmp) == "npm --prefix api run test --silent"
+
+
+def test_sibling_detection_ignores_the_obvious_traps():
+    with tempfile.TemporaryDirectory() as tmp:
+        _mkpkg(tmp, "")
+        _mkpkg(tmp, "node_modules", scripts={"test": "should-never-run"})
+        _mkpkg(tmp, ".cache", scripts={"test": "should-never-run"})
+        _mkpkg(tmp, "docs")                            # package, but no test script
+        _mkpkg(tmp, "vendor", scripts={"test": "echo \"Error: no test specified\""})
+        assert distill.detect_test_command(tmp) == ""
+
+        # And it is bounded, so a workspace of packages cannot become the gate.
+        for i in range(distill.SIBLING_TEST_MAX + 3):
+            _mkpkg(tmp, f"pkg{i}", scripts={"test": "vitest run"})
+        cmd = distill.detect_test_command(tmp)
+        assert cmd.count("npm --prefix") == distill.SIBLING_TEST_MAX, cmd
+
+
+# --- Continuation across the output cap ---------------------------------------
+
+@contextlib.contextmanager
+def _scripted_stream(rounds):
+    """Drive _single_llm_call with scripted (text, finish_reason) rounds."""
+    saved = distill._stream_llm_once
+    seen = []
+
+    def fake(client, cfg, system, user, label="Inference",
+             max_output_tokens=0, assistant_prefix="", force_no_thinking=False):
+        seen.append({"label": label, "prefix": assistant_prefix,
+                     "no_thinking": force_no_thinking})
+        return rounds[min(len(seen) - 1, len(rounds) - 1)]
+
+    distill._stream_llm_once = fake
+    try:
+        yield seen
+    finally:
+        distill._stream_llm_once = saved
+
+
+def _call():
+    with contextlib.redirect_stdout(io.StringIO()):
+        return distill._single_llm_call(None, {}, "SYS", "USER")
+
+
+def test_a_truncated_answer_is_continued_rather_than_shipped_as_a_fragment():
+    """
+    Measured on the engineer pass: ~13,300 tokens of thinking and ~1,390 of
+    answer against a 12,288 cap, at reasoning level 'low'. The half-written
+    document was saved and handed downstream as if finished.
+    """
+    with _scripted_stream([("# 1. Head\n- first ha", "length"),
+                           ("lf\n# 2. Tail\n- done", "stop")]) as seen:
+        out = _call()
+    assert out == "# 1. Head\n- first half\n# 2. Tail\n- done", repr(out)
+    assert len(seen) == 2
+
+
+def test_a_continuation_runs_with_thinking_off():
+    """
+    The reasoning has already been done. Left on, the continuation spends the
+    whole cap thinking again and returns a second fragment - the loop this is
+    built to break.
+    """
+    with _scripted_stream([("part one", "length"), ("part two", "stop")]) as seen:
+        _call()
+    assert seen[0]["no_thinking"] is False and seen[0]["prefix"] == ""
+    assert seen[1]["no_thinking"] is True
+    assert seen[1]["prefix"] == "part one", "the model must see what it wrote"
+    assert "cont." in seen[1]["label"]
+
+
+def test_a_clean_stop_costs_no_extra_call():
+    with _scripted_stream([("all of it", "stop")]) as seen:
+        assert _call() == "all of it"
+    assert len(seen) == 1
+
+
+def test_text_repeated_at_the_seam_is_dropped():
+    """
+    Told not to repeat itself a model usually complies and sometimes restates
+    the last heading anyway. Blind concatenation leaves a duplicated fragment
+    mid-document, which is wrong and near-invisible in a 4,000-char plan.
+    """
+    head = "# 6. Fix Plan\n- TEST: something that fails first\n"
+    with _scripted_stream([(head, "length"), (head[-40:] + "- and then passes", "stop")]):
+        out = _call()
+    assert out.count("TEST: something that fails first") == 1, repr(out)
+    assert out.endswith("- and then passes")
+
+    # A restated heading is the common case and must not survive. "# 6. Fix Plan"
+    # is 13 characters; an earlier 20-character floor let exactly this through.
+    joined = distill._join_continuation("...text\n# 6. Fix Plan\n",
+                                        "# 6. Fix Plan\n- the bullet")
+    assert joined.count("# 6. Fix Plan") == 1, repr(joined)
+
+    # Below the floor nothing is trimmed, so legitimately repeated short text
+    # survives rather than being silently eaten.
+    assert distill._join_continuation("abc", "def") == "abcdef"
+    assert distill._join_continuation("...ends", "ends here") == "...endsends here"
+    assert distill._join_continuation("", "x") == "x"
+    assert distill._join_continuation("x", "") == "x"
+
+
+def test_a_failed_continuation_keeps_what_was_already_written():
+    with _scripted_stream([("real content so far", "length"),
+                           ("[ERROR: ReadTimeout]", None)]):
+        assert _call() == "real content so far"
+
+
+def test_a_first_round_error_is_still_reported_as_an_error():
+    with _scripted_stream([("[ERROR: Max retries exceeded]", None)]):
+        out = _call()
+    assert distill._check_llm_result(out, "x") is not None
+
+
+def test_continuation_is_bounded():
+    """A model that will not stop is a worse failure than a short document."""
+    with _scripted_stream([("chunk ", "length")]) as seen:
+        out = _call()
+    assert len(seen) == distill.LLM_MAX_CONTINUATIONS + 1, len(seen)
+    assert out.startswith("chunk")
+
+
+def test_truncation_advice_does_not_tell_you_to_lower_the_lowest_level():
+    """
+    The first version said "lower this pass's reasoning level" unconditionally.
+    The pass that hit it was already at 'low' — there is nowhere to go, and the
+    advice sent the reader to a config knob that could not help.
+    """
+    def advice(level):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            distill._report_truncation("Inference", "length", 12288,
+                                       ["short answer"], ["thinking " * 5000],
+                                       {"reasoning": level})
+        return buf.getvalue()
+
+    floored = advice("low")
+    assert "Lower this pass's reasoning level" not in floored
+    assert "already the lowest" in floored and "continuation" in floored
+
+    # Where there IS room to drop, it still says so.
+    assert "Lower this pass's reasoning level" in advice("xhigh")
+
+
+# --- Reasoning reserve / truncation -------------------------------------------
+
+def test_the_reasoning_reserve_scales_with_the_level():
+    """
+    One flat reserve for every level meant raising a pass to xhigh raised how
+    much it thought without raising where it was allowed to think. The bugfix
+    pass then spent its entire output cap on reasoning and was cut off before
+    section 2, which surfaced as "section 2 declared no COMMAND".
+    """
+    reserves = {level: distill._reasoning_spec({"reasoning": level})[1]
+                for level in distill.REASONING_LEVELS}
+    assert reserves["off"] == 0
+    assert reserves["low"] < reserves["medium"] < reserves["xhigh"], reserves
+    # An unknown level must not silently reserve nothing.
+    assert distill._reasoning_spec({"reasoning": "banana"})[1] > 0
+    assert distill._reasoning_spec({})[1] == reserves[distill.DEFAULT_REASONING]
+
+
+def test_a_truncated_answer_says_so_instead_of_looking_complete():
+    """
+    finish_reason was tested for presence and its value thrown away, so "length"
+    and "stop" were indistinguishable. A cut-off document was accepted as whole
+    and only failed later, describing the wrong problem.
+    """
+    line = ('data: {"choices":[{"delta":{"content":"x"},'
+            '"finish_reason":"length"}]}')
+    token, _reasoning, done, finish = distill._extract_delta(line, False)
+    assert (token, done, finish) == ("x", True, "length")
+
+    stop = 'data: {"choices":[{"delta":{"content":"y"},"finish_reason":"stop"}]}'
+    assert distill._extract_delta(stop, False)[3] == "stop"
+    mid = 'data: {"choices":[{"delta":{"content":"z"}}]}'
+    assert distill._extract_delta(mid, False)[2:] == (False, None)
+
+    # Every early return still unpacks into four values.
+    for bad in ("garbage", "data: [DONE]", "data: {", 'data: {"choices":[]}'):
+        assert len(distill._extract_delta(bad, False)) == 4, bad
+
+
+def test_truncation_names_the_cause_it_can_actually_fix():
+    """
+    Thinking that outweighs the answer is a reasoning-level problem; a long
+    answer that hits the cap is a budget problem. Same banner, opposite fixes.
+    """
+    def report(content, reasoning, finish="length"):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            distill._report_truncation("Inference", finish, 12288,
+                                       [content], [reasoning], {"reasoning": "xhigh"})
+        return buf.getvalue()
+
+    thinky = report("# 1. Symptom", "reasoning " * 4000)
+    assert "TRUNCATED" in thinky
+    assert "Lower this pass's reasoning level" in thinky
+
+    wordy = report("answer " * 4000, "brief")
+    assert "Raise ANSWER_MAX_TOKENS" in wordy
+
+    # A clean stop is silent - the banner has to mean something when it appears.
+    assert report("done", "brief", finish="stop") == ""
 
 
 if __name__ == "__main__":
