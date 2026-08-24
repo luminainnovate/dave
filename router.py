@@ -332,8 +332,14 @@ def _classify_request(messages: list) -> str:
     role = last_msg.get("role", "")
 
     # --- Desktop Commands (always forward) ---
+    # The gate commands belong here as much as !build does. Without them
+    # `!architect`, `!bugfix`, `!approve` and `!review` fell through to
+    # "triage_needed" and reached the orchestrator only if an LLM decided they
+    # should - which is a coin flip standing between the user and a command they
+    # typed explicitly.
     desktop_commands = [
-        "!build", "!move", "!lock", "!unlock", "!stop", "!status",
+        "!build", "!architect", "!bugfix", "!approve", "!review",
+        "!move", "!lock", "!unlock", "!stop", "!status",
         "!logs", "!clone", "!expert", "!code", "!general",
         "hey expert", "hey code"
     ]
@@ -344,7 +350,7 @@ def _classify_request(messages: list) -> str:
     for m in messages:
         if m.get("role") == "system":
             sys_content = str(m.get("content", "")).lower()
-            if any(kw in sys_content for kw in ["you are cline", "distillation", "architect", "engineer"]):
+            if any(kw in sys_content for kw in ["you are cline", "distillation", "architect", "bugfix", "engineer"]):
                 return "desktop"
 
     # --- Project Context (@file mentions) ---

@@ -1,666 +1,838 @@
 ```
     ___                    __     ____  ___ _    ________
    /   | ____ ____  ____  / /_   / __ \/   | |  / / ____/
-  / /| |/ __ `/ _ \/ __ \/ __/  / / / / /| | | / / __/   
- / ___ / /_/ /  __/ / / / /_   / /_/ / ___ | |/ / /___   
-/_/  |_\__, /\___/_/ /_/\__/  /_____/_/  |_|___/_____/   
-      /____/                                             
-```                                                                                             
-                                        
-# 🧠 DAVE - The Agentic Local AI Orchestrator
+  / /| |/ __ `/ _ \/ __ \/ __/  / / / / /| | | / / __/
+ / ___ / /_/ /  __/ / / / /_   / /_/ / ___ | |/ / /___
+/_/  |_\__, /\___/_/ /_/\__/  /_____/_/  |_|___/_____/
+      /____/
+```
 
+# 🧠 br.ai.n — Agent DAVE
 
 [![CI](https://github.com/mitro54/br.ai.n/actions/workflows/ci.yml/badge.svg)](https://github.com/mitro54/br.ai.n/actions/workflows/ci.yml)
 
-Agent DAVE is a fully autonomous software factory starting from a conversation, all locally.
+A fully local, autonomous software factory. You have a conversation; it produces a reviewed
+architecture, then a working repository — on one 24 GB GPU, with no cloud calls.
 
-**br.ai.n** is an **Agentic Local AI Orchestrator** powered by **Agent DAVE**, a unified AI persona running on your local hardware. Agent DAVE manages a tiered orchestration system on a single NVIDIA GPU (24GB+ VRAM), providing instant responses for simple tasks while dynamically routing complex requests (Coding, Vision, Image Generation) to expert models.
+Two ideas carry the whole system:
 
-## Chat Commands:
+1. **One GPU, one tenant.** A FastAPI proxy (`orchestrator.py`) owns an `asyncio.Lock` over
+   VRAM. A 1.5 B router model stays resident and triages every turn; anything complex evicts
+   the router, sweeps VRAM and loads the Expert. Image generation and the Expert can never be
+   resident at the same time.
+2. **Everything is budgeted against the window.** Nothing in this repo puts an unmeasured
+   string in front of a model. Every prompt is sized as a fraction of `EXPERT_CTX`, and a
+   configuration that cannot hold a viable call fails loudly instead of silently truncating.
 
-### 🧠 VRAM & Model Control
+Builds are **iterative**. Iteration 2 is not a re-run of iteration 1: it reads the directory
+tree, symbol skeleton, README and accumulated `.build_issues.md` that iteration 1 actually
+produced, and can re-plan the architecture against that evidence mid-flight.
+
+---
+
+## 1. System architecture
+
+```mermaid
+flowchart TB
+    subgraph clients["Clients (LAN)"]
+        UI["Open WebUI :3000"]
+        PHONE["Phone / tablet / laptop"]
+    end
+
+    subgraph pi["Router node — Raspberry Pi (optional, 2-device)"]
+        RT["router.py :8001<br/>qwen2.5:1.5b on CPU<br/>COMPLEXITY_THRESHOLD"]
+        WOL["Wake-on-LAN + SSH<br/>starts start_desktop.sh"]
+    end
+
+    subgraph desktop["Desktop node — RTX 3090 / 4090, 24 GB"]
+        ORCH["orchestrator.py :8000<br/>FastAPI proxy · GPU mutex"]
+
+        subgraph ctxasm["Context assembly (see §2)"]
+            TRIAGE["analyze_request<br/>complexity · is_coding · requires_tool"]
+            PRUNE["_prune_messages<br/>HISTORY_BUDGET_FRACTION"]
+            PCTX["PROJECT_CONTEXT<br/>tree + symbol skeleton + @file"]
+            HOPS["Agentic loop<br/>AGENT_MAX_HOPS / _WRITE"]
+        end
+
+        subgraph vram["VRAM budget — 24 GB (see §3)"]
+            ROUTER["Router 1.5B ≈ 1.2 GB<br/>keep_alive 0"]
+            WEIGHTS["Expert weights<br/>-ngl all"]
+            KV["KV cache<br/>EXPERT_CTX × quant"]
+            COMFY["ComfyUI<br/>--normalvram · mutually exclusive"]
+        end
+
+        subgraph providers["Providers"]
+            OLL["Ollama :11434"]
+            LCPP["llama-server :8081<br/>spawned + health-polled"]
+            LMS["LM Studio :1234<br/>lms CLI"]
+        end
+    end
+
+    subgraph factory["cline-builder container (profile: build)"]
+        DIST["distill.py — 4 design passes<br/>budget solver + chunked extraction"]
+        RULES[".clinerules"]
+        LOOP["entrypoint.sh<br/>build → review → verify → safety → test gate"]
+        REPLAN["--replan<br/>re-derives the plan from evidence"]
+    end
+
+    SEARX["SearXNG"]
+    WORK["conversations/&lt;project&gt;/"]
+
+    PHONE --> UI
+    UI -->|"/v1/chat/completions"| RT
+    RT -->|"complexity ≤ threshold"| RT
+    RT -->|"X-Forwarded-By-Router: true<br/>skips second triage"| ORCH
+    RT -.-> WOL -.-> ORCH
+    UI -->|"1-device: direct"| ORCH
+    UI --> SEARX
+
+    ORCH --> TRIAGE --> PRUNE --> PCTX --> HOPS
+    HOPS --> OLL
+    HOPS --> LCPP
+    HOPS --> LMS
+    OLL --> WEIGHTS
+    LCPP --> WEIGHTS
+    WEIGHTS --- KV
+    ORCH -->|"gpu_lock · verified_unload"| vram
+    ORCH -->|"prompt-to-graph"| COMFY
+
+    ORCH -->|"!build / !architect / !bugfix"| DIST
+    DIST --> RULES --> LOOP
+    LOOP --> REPLAN --> DIST
+    LOOP <--> WORK
+    LOOP -->|"/internal/model/load<br/>/v1/shutdown_expert"| ORCH
+```
+
+**Reading it in one pass:** a turn enters the proxy, gets triaged by a tiny resident model,
+has its history pruned to a fraction of the window, gets project context injected, and is
+dispatched to whichever provider holds the Expert. The GPU mutex guarantees the weights and
+KV cache in the middle box have exclusive use of the card. `!build` hands the same
+conversation to a container that re-derives it into a plan and then executes that plan in a
+loop, calling back into the proxy to load and unload models as it goes.
+
+| Component | File | Role |
+|---|---|---|
+| Orchestrator proxy | `orchestrator.py` | Triage, GPU mutex, context budgeting, agentic tool loop, build triggers |
+| Pi router | `router.py` | 2-device entry point: local triage, Wake-on-LAN, SSH start of the desktop |
+| Distillation engine | `cline-builder/distill.py` | 4 design passes, closed-form budget solver, re-planning |
+| Build loop | `cline-builder/entrypoint.sh` | Iterative build → review → verify → safety → objective test gate |
+| Project extractor | `mover.py` | Rebuilds a file tree from chat, path-sanitised |
+| Repo tools | `repo_tools.py` | Read/edit/write/delete with snapshots, `!undo`, `!pr` |
+| Tracer | `tracer.py` | Human-readable decision trace to `trace.log` |
+
+---
+
+## 2. The context window
+
+`EXPERT_CTX` is the single number everything else is derived from. Change it and every budget
+below moves with it — there are no free-floating literals.
+
+```mermaid
+flowchart LR
+    subgraph win["EXPERT_CTX — one Expert call"]
+        direction TB
+        H["Conversation history<br/><b>45%</b> · HISTORY_BUDGET_FRACTION<br/>_prune_messages drops oldest middle turns<br/>system msg + last 4 turns always kept"]
+        T["Tool results, whole turn<br/><b>22%</b> · TOOL_RESULT_BUDGET_FRACTION<br/>head+tail clip, elision stated inline<br/>&lt; 512 chars → suppressed, not truncated"]
+        M["@file mentions<br/><b>8%</b> · MENTION_BUDGET_FRACTION<br/>read whole off disk after the pruner runs"]
+        R["<b>~25% remainder</b><br/>PROJECT_CONTEXT (tree + symbol skeleton)<br/>tool schemas · the reply itself"]
+    end
+
+    IN["Incoming turn"] --> win --> OUT["Dispatch<br/>options.num_ctx = EXPERT_CTX"]
+
+    style H fill:#2d6a9f,color:#fff
+    style T fill:#3d8b6b,color:#fff
+    style M fill:#8a6d3b,color:#fff
+    style R fill:#6b4c7a,color:#fff
+```
+
+Chars-per-token is deliberately **3**, not 4 (`CHARS_PER_TOKEN_DENSE`). Code, paths, JSON and
+tree output tokenise denser than prose, so every estimate rounds toward headroom.
+
+### The distillation window (a different, harder problem)
+
+The design passes get a payload larger than any window, so `distill.py` solves the budget in
+closed form rather than reserving a flat constant:
+
+```mermaid
+flowchart TB
+    P["Payload: PROJECT_HISTORY, DIRECTORY_STRUCTURE,<br/>SYMBOL_SKELETON, KNOWN_BUILD_ISSUES,<br/>PROJECT_OVERVIEW, TOOLCHAIN, NEW_REQUEST"]
+    Q{"est_tokens(payload) + system + answer<br/>+ safety_margin ≤ CONTEXT_WINDOW ?"}
+    SINGLE["<b>Single-pass — lossless</b><br/>whole payload sent in one call"]
+    CHUNK["<b>Chunked extraction — lossy</b><br/>solve_extraction_budget()<br/>chunk ≤ (window − margin − fixed) / 1.5"]
+    EX["N sequential extract calls<br/>split on section boundaries<br/>each labelled with sections covered<br/>+ 400-token steering extract of prior passes"]
+    LADDER["Consolidation ladder<br/>≤ 4 rounds · each must cut ≥ 10%<br/>then deterministic truncation"]
+    MERGE["solve_merge_budget()<br/>answer reserved first (≥ 1024)<br/>facts take the remainder"]
+    OUT["Pass document → .cline_context/distill_*.md"]
+    FAIL["<b>BudgetInfeasible</b><br/>names the window you need<br/>never clamps and lies"]
+
+    P --> Q
+    Q -->|yes| SINGLE --> OUT
+    Q -->|no| CHUNK --> EX --> LADDER --> MERGE --> OUT
+    CHUNK -->|"chunk &lt; MIN_VIABLE_CHUNK (768)"| FAIL
+
+    style SINGLE fill:#3d8b6b,color:#fff
+    style CHUNK fill:#8a6d3b,color:#fff
+    style FAIL fill:#a33,color:#fff
+```
+
+Two consequences worth internalising:
+
+- **Keep the payload single-pass if you can.** The whole-payload path loses nothing; the
+  chunked path reaches the merge as capped bullet records. This is why `solve_kb_budget()`
+  refuses to let a large `.knowledge_base/` displace the codebase facts it was added to inform.
+- **`context_window` is resolved once, with precedence.** `EXPERT_CTX` (injected by the
+  orchestrator) > `agent_config.json` `context_window` > module default. `docker-compose.yml`
+  deliberately leaves `EXPERT_CTX` unset so the config file is the single source of truth.
+
+---
+
+## 3. The KV cache
+
+The KV cache is what actually decides whether a model fits. Weights are fixed; the cache grows
+linearly with context and will quietly push layers off the GPU if you let it.
+
+```mermaid
+flowchart TB
+    subgraph budget["24 GB card"]
+        direction TB
+        OS["OS / display ≈ 0.5–2.5 GB<br/>headless WSL or KILL_GUI_ON_WAKE saves ~2.5 GB"]
+        RES["Resident router qwen2.5:1.5b ≈ 1.2 GB"]
+        W["Expert weights (GGUF quant)"]
+        C["<b>KV cache</b><br/>≈ 2 × layers × kv_heads × head_dim × ctx × bytes"]
+    end
+
+    LEVERS["Levers, in order of effect"]
+    L1["<b>ctx</b> — linear.<br/>EXPERT_CTX 65536 is the shipped default;<br/>128k crowds weights off a 24 GB card"]
+    L2["<b>KV quantisation</b> — halves the cache.<br/>llama.cpp: --cache-type-k/-v q8_0<br/>Ollama: OLLAMA_KV_CACHE_TYPE=q8_0"]
+    L3["<b>Flash attention</b> — required for both.<br/>llama.cpp: LLAMA_ARG_FLASH_ATTN=on (forced)<br/>Ollama: OLLAMA_FLASH_ATTENTION=1"]
+    L4["<b>GQA</b> — a property of the model.<br/>MoE / grouped-query models pay far less<br/>per token of context"]
+    L5["<b>-np 1</b> — one slot.<br/>parallel slots divide the cache n ways"]
+
+    GUARD{"Does weights + cache fit?"}
+    GOOD["<b>-ngl all</b> · fully offloaded<br/>30+ tok/s"]
+    BAD["<b>-ngl auto</b> would spill layers to RAM.<br/>Prompt eval still looks fine;<br/>generation drops to PCIe speed.<br/>'all' fails loudly instead."]
+
+    budget --> LEVERS
+    LEVERS --> L1 --> GUARD
+    LEVERS --> L2 --> GUARD
+    LEVERS --> L3 --> GUARD
+    LEVERS --> L4 --> GUARD
+    LEVERS --> L5 --> GUARD
+    GUARD -->|yes| GOOD
+    GUARD -->|no| BAD
+
+    style C fill:#2d6a9f,color:#fff
+    style GOOD fill:#3d8b6b,color:#fff
+    style BAD fill:#a33,color:#fff
+```
+
+**Lifecycle.** Ollama caches are torn down per request — the orchestrator sends
+`keep_alive: 0` for the router and one-shot turns, `10m` for a warm Expert session, and `-1`
+while `!lock` is held. llama-server caches persist for the life of the managed process, which
+is why `--context-shift` and `--slot-prompt-similarity 0.95` are set: the slot is reused
+linearly across a long agentic turn instead of being re-evaluated from scratch.
+
+> [!NOTE]
+> `ARCHITECTURE.md` quotes a 35B-A3B MoE at 256k context in ~21.1 GB. That is a *different*
+> configuration (llama.cpp + MoE GGUF + Q8_0 KV), not the shipped default, and it depends on
+> the low KV cost of that model's GQA. Do not expect those figures from a dense 27B.
+
+---
+
+## 4. How a build works, end to end
+
+```mermaid
+sequenceDiagram
+    participant U as You (Open WebUI)
+    participant O as orchestrator.py
+    participant D as distill.py
+    participant C as Cline agent
+    participant W as Workspace conversations/PROJECT/
+
+    U->>O: !clone URL or !move
+    O->>W: bind project · sanitise paths · bootstrap .gitignore
+    U->>O: discuss design, @file mentions
+    O->>U: Expert replies with tree + symbol skeleton in context
+
+    U->>O: !architect
+    O->>D: PIPELINE_MODE=distill_only, DISTILL_PASSES=architect
+    D->>W: .cline_context/distill_architect.md
+    D-->>U: ⏸ review gate — no code written
+    Note over U,W: Read it. Edit it by hand if needed.<br/>What is on disk is authoritative.
+
+    U->>O: !approve
+    O->>D: DISTILL_RESUME=1 (reuses your edited architecture)
+    D->>D: engineer → test engineer → safety
+    D->>W: .clinerules
+
+    loop iteration 1..max_build_iterations
+        Note over D,C: iteration > 1 and < last → --replan against .build_issues.md
+        C->>W: build (reads .session_state.md first)
+        C->>W: review — only the files build wrote → quality_audit.md
+        C->>W: verify — run tests, write README, update .build_issues.md
+        C->>W: safety audit — fix what it finds
+        C->>W: .build_complete = VERIFIED + SAFE
+        W->>W: <b>test gate</b> — the project's own suite must exit 0
+        Note over W: gate fails → .build_complete deleted,<br/>failure appended to .build_issues.md,<br/>next iteration steers on it
+    end
+
+    Note over C,W: final iteration switches directive to STABILIZATION<br/>and gets final_build_timeout_secs
+    C-->>U: !logs / !status while it runs
+```
+
+**Why iteration 2 differs from iteration 1.** Each round regenerates
+`.cline_context/.session_state.md` from what is actually on disk — known issues, the quality
+audit, agent discovery notes, and byte-capped summaries of the previous step logs ordered by
+mtime. The distillation payload is re-assembled in `ITERATIVE_REBUILD` mode, carrying
+`PROJECT_HISTORY`, the live `DIRECTORY_STRUCTURE`, `SYMBOL_SKELETON`, the project's own README
+as `PROJECT_OVERVIEW`, and `KNOWN_BUILD_ISSUES`. If `.build_issues.md` has grown by
+`replan_issue_growth_bytes` since the plan was written, the architect and engineer passes run
+again against that evidence — up to `max_replans` times. The plan chases reality rather than
+reality chasing a stale plan.
+
+**The review phase reads only what the build phase just wrote.** It sits between build and
+verify because neither of those asks the question it asks. Verify's job is "does it run and do
+the tests pass"; safety's is "is it dangerous". Neither asks whether the code is *correct*
+beyond what its own tests happen to assert, or whether it is fast, or whether it is clean. The
+review phase assesses the changed files on four axes — correctness, security, performance,
+code quality — and it is the thing that finally *produces* `.cline_context/quality_audit.md`.
+That file has always been read (the verify phase reconciles it), but until now nothing filled
+it systematically; the build agent appended to it only when it happened to notice something
+mid-task.
+
+Scope is the whole trick. `entrypoint.sh` touches `.cline_context/.review_marker` immediately
+before Cline starts building, so `find -newer` afterwards yields exactly the files that
+iteration wrote — capped at 25, with `node_modules`, `.git`, `dist`, caches, lockfiles and logs
+pruned. A review prompt that just says "review the code" hands a 27B model on a 64k window an
+unbounded exploration, which is the same failure the STABILITY PROTOCOL fights everywhere else.
+Findings are written down *before* anything is fixed, and only **correctness and security**
+findings are fixed in place — performance and quality findings stay in the audit file for a
+later iteration to pick up, because a review pass with edit rights will otherwise drift into
+refactoring working code. If the build phase wrote nothing (timed out mid-read, exhausted its
+retries) the phase is skipped rather than burning a full timeout on an empty scope, and the
+phase's exit code is deliberately not captured — a failed review degrades the round, it does
+not fail the build.
+
+> **On `/review`.** Qwen Code's `/review --effort low|medium|high` is the same idea, but it
+> belongs to *that CLI*, not to the `qwen3.8` model — sending the literal string `/review` to
+> Ollama gets you "what would you like me to review?". This image installs `cline` and nothing
+> else, so reasoning effort is expressed as Cline's `--thinking` flag, configured by
+> `review_thinking_level`. Set `review_enabled: false` to drop the phase entirely.
+
+**The test gate is the only objective signal.** Everything else in the loop is the model's
+opinion of its own work. `.build_complete` containing `VERIFIED` and `SAFE` is necessary but
+not sufficient; the project's detected test command must also exit 0. A missing runner is
+skipped loudly (completion reverts to self-reported), a real failure is recorded and fed
+forward.
+
+---
+
+## 5. Recommended workflow — arriving at an architecture you actually understand
+
+The single highest-leverage habit: **never start with a bare `!build`.** It commits four
+design passes and every build iteration in one shot, and you find out what it decided by
+reading the code it already wrote.
+
+Do this instead:
+
+| Step | Command | Why |
+|---|---|---|
+| 1. Bind first | `!clone <url>` or `!move` | Nothing else works without a bound project. `--kb <url>` attaches a second repo as `.knowledge_base/`. |
+| 2. Interrogate | plain chat, `@path/to/file` | The Expert already has the tree and symbol skeleton. Use `!code` for precision. Cheap, fast, and it is where you discover the design is wrong. |
+| 3. Design only | `!architect` | Pass 1, then a hard stop. No code is written. Costs one pass, not a build. |
+| 4. **Read and edit** | open `.cline_context/distill_architect.md` | The step everyone skips and the one that pays. `!approve` resumes with `DISTILL_RESUME=1`, so your hand edits survive verbatim into the build. |
+| 5. Re-run if wrong | `!architect` again, with steering text | *"!architect — the queue must be durable, not in-memory."* Regenerating a document is minutes; regenerating a repo is hours. |
+| 6. Commit | `!approve` | Engineer → test → safety → implementation. |
+| 7. Watch | `!logs`, `!status` | `!stop` force-stops everything and clears VRAM. |
+| 8. Iterate narrowly | `!build` with a focused request | The next round reads what round 1 actually produced. Ask for one thing. |
+
+Corollaries worth stating plainly:
+
+- **Blockers are a feature.** If a design pass reports something it cannot resolve from the
+  workspace, distillation exits 3 and writes nothing. Answer it in chat and re-run — do not
+  work around it.
+- **Keep the payload single-pass.** A tighter request and a smaller knowledge base keep the
+  architect on the lossless path (§2). Vague, sprawling briefs force chunked extraction and
+  you get a plan built from bullet records.
+- **A steering sentence in the same message is the cheapest control you have.**
+  *"Lets !build, we must add authentication and a login page."*
+- **`!write` for surgery, `!build` for construction.** Small, well-understood changes are
+  faster and safer through the Expert's own edit tools with `!diff` / `!undo` / `!pr`, which
+  snapshot bytes and never touch `.git/`, `.env*` or keys.
+
+### 5.4 Fixing a bug: `!bugfix`
+
+`!architect` designs. Handed a bug report it will design its way around one — you asked what
+the code should become, and "become correct" is a refactor. `!bugfix` swaps pass 1 for a
+diagnostician with the opposite discipline: find one defect, prove it, change nothing else.
+
+The two are alternatives, never stages. Both feed the same review gate and the same
+`!approve`:
+
+```
+!build                        one shot, no gate
+!architect <request>  → !approve      new functionality
+!bugfix <symptom>     → !approve      an existing defect
+```
+
+Whichever gate you ran last is recorded in `.cline_context/.design_pass`, so `!review` shows
+the right document and `!approve` resumes the right pass. `!build` neither reads nor writes
+it. There is no mode to get stuck in.
+
+**Why the diagnosis is checked, not trusted.** A distillation pass is a stateless call with
+no tools — it cannot run anything, so "I verified this is reproducible" is, from a pass,
+an opinion. That is the exact failure the test gate (§4) exists to stop the pipeline
+accepting about its own output.
+
+So the pass does not assert reproducibility, it *declares* it: one `COMMAND` and one
+`SIGNATURE`. The harness then runs it, in the workspace, before the gate returns.
+
+- Verified means three things together: the command ran, it exited non-zero, **and** the
+  declared signature is in its output. A non-zero exit from an uninstalled runner is exactly
+  the case this rejects.
+- If it does not reproduce, what actually happened is fed back to the pass as evidence and
+  it tries again — up to `limits.bugfix_max_repro_attempts` (default 3).
+- If it never reproduces, the document is still written and shown to you, carrying an
+  **UNVERIFIED** banner. `!approve` refuses it, and a full run aborts with exit 4 before
+  `.clinerules` is written. Delete the banner by hand to override.
+
+The command is never given to a shell. Its first token must be a project runner (`npm`,
+`npx`, `node`, `python3`, `pytest`, `go`, `cargo`, `mvn`, `gradle`) and it is executed as
+argv, so `&&` is an argument the runner rejects rather than a second command.
+
+**Expect the gate to time out.** Three attempts is 15–25 minutes of GPU against a 680s wait,
+so `!bugfix` will usually reply *"still running"*. That is the designed behaviour — the
+container keeps working; come back with `!review`.
+
+Two things it will refuse outright: an empty workspace (there is no bug in a project that
+does not exist — use `!architect`), and a symptom it cannot trace to a file, which comes back
+as a blocker naming the file it needs.
+
+**Reporting two bugs at once.** Do it — the pass is built for it, and the answer is worth
+having either way. It first checks whether the symptoms trace to a single defect. If they do,
+that is one bug and the most valuable result available: both symptoms in section 1, one site
+in section 4. If they do not, it diagnoses the first one reported and lists the rest in
+section 7 as `DEFERRED:` bullets, quoted in your words, which the chat reply repeats as your
+next action. One `!bugfix` fixes one bug, so run it again for each.
+
+What it will not do is merge unrelated defects into an invented shared cause. That is the
+specific hazard here: the single-site rule pressures a model toward exactly that, and a
+fabricated common cause is undetectable by anyone reading the fix — so the prompt makes
+deferral the explicit safe answer whenever the trace does not actually reach both.
+
+---
+
+## 6. Chat commands
+
+### VRAM & model control
 
 | Command | Effect | Notes |
 |---|---|---|
-| `!lock` | Pins the Expert in VRAM indefinitely (`keep_alive: -1`). | Returns immediately. Persists until `!unlock`. |
-| `!unlock` | Releases the lock, unloads Expert + Router, frees ComfyUI. | Returns immediately. |
-| `!code` | Switches the Expert to Coding Mode parameters (temp 0.6, repeat_penalty 1.15). | **Falls through** — the rest of your message is still answered. Also forces routing to the Expert. |
-| `!general` | Switches the Expert to General Mode parameters (temp 1.0, presence_penalty 1.5). | **Falls through**, same as above. |
-| `!dave` / `hey dave` | Forces the turn onto the small Router model and clears the Expert warm timer. | The "stay fast, stay local" escape hatch. Note that `hey dave` fires on any message containing that phrase. |
-| `!expert` / `hey expert` | Forces the turn onto the Expert model, warm for 10 minutes. | |
+| `!lock` | Pins the Expert in VRAM (`keep_alive: -1`). | Persists until `!unlock`. |
+| `!unlock` | Releases the lock, unloads Expert + router, frees ComfyUI. | |
+| `!code` | Coding params (temp 0.6, repeat_penalty 1.15). | **Falls through** — your message is still answered. Forces the Expert. |
+| `!general` | General params (temp 1.0, presence_penalty 1.5). | **Falls through.** |
+| `!dave` / `hey dave` | Forces the small router model; clears the warm timer. | `hey dave` fires on any message containing the phrase. |
+| `!expert` / `hey expert` | Forces the Expert, warm for 10 minutes. | |
 
-### 🏭 Project Binding & Build Pipeline
-
-| Command | Effect | Notes |
-|---|---|---|
-| `!move` | Scans the conversation for code blocks and file trees and reconstructs them into `conversations/<name>_<conv_id>/`. | Binds the project to the conversation. Skips extraction if `.clinerules` already exists, to protect manual edits. |
-| `!clone <url>` | Clones a Git repo into the conversation's workspace and binds it. Add `--kb <url>` to attach a second repo as `.knowledge_base/`. | **Must be at the start of the message.** Re-running on a bound project just reports the existing binding. |
-| `!build` | Kicks off the full 4-pass autonomous pipeline (Architect → Engineer → Test → Safety) plus implementation, in the `cline-builder` container. | Extra text in the same message steers it, e.g. *"Lets !build, we must add authentication."* |
-| `!architect` | Runs **Pass 1 only** and stops at a review gate. | The safe way in — no code is written. |
-| `!review` | Re-displays the architecture document from the last `!architect`. | Read-only. |
-| `!approve` | Accepts the reviewed architecture and resumes the remaining passes plus implementation. | Requires a prior `!architect`, otherwise it refuses. |
-| `!status` | Reports the status of active and recent build containers. | |
-| `!logs` | Fetches the last 200 lines from the active `cline-builder` container. | Also exposed to the Expert as a tool. |
-| `!stop` | Force-stops all running build pipelines and clears VRAM. | |
-
-### ✏️ Repository Editing & Pull Requests
+### Project binding & build pipeline
 
 | Command | Effect | Notes |
 |---|---|---|
-| `!write` | Enables write mode for this conversation, granting the Expert edit / write / delete / list-changes tools. | Requires a bound project. Off by default and resets to off when the orchestrator restarts. |
-| `!readonly` | Revokes write mode. | Changes already on disk are left untouched. |
-| `!diff` | Shows the full diff of everything the Expert has changed in this conversation. | Review this before `!pr`. |
-| `!undo` | Restores every touched file to its exact pre-session bytes. | Untracked files restore correctly; your pre-existing uncommitted work is unaffected. |
-| `!pr <title>` | Commits the session's changes to `brain/<conv_id>`, pushes, and opens a pull request against the bound repo's `origin`. | **Must be at the start of the message.** Only files this conversation touched are staged. |
+| `!move` | Rebuilds code blocks and file trees into `conversations/<name>_<conv_id>/`. | Skips extraction if `.clinerules` exists, protecting manual edits. `--open` opens an editor. |
+| `!clone <url>` | Clones a repo into the workspace and binds it. `--kb <url>` attaches a knowledge base. | **Must open the message.** |
+| `!architect` | Pass 1 only, then a review gate. | The safe way in, for new functionality. |
+| `!bugfix <symptom>` | Pass 1 as a diagnostician, then the same review gate. | For an existing defect. Its diagnosis is not accepted until the reproduction it declares actually fails — see §5.4. |
+| `!review` | Re-displays the last design document. | Read-only. Shows whichever of `!architect` / `!bugfix` ran last. |
+| `!approve` | Accepts the reviewed document, resumes the remaining passes plus implementation. | Requires a prior `!architect` or `!bugfix`. Refuses an unverified diagnosis. |
+| `!build` | Full 4-pass pipeline plus implementation. | Extra text in the same message steers it. |
+| `!status` / `!logs` | Container status / last 200 lines of the active build. | `!logs` is also an Expert tool. |
+| `!stop` | Force-stops all pipelines and clears VRAM. | |
 
-### ⚙️ How Command Matching Works
+### Repository editing & pull requests
 
-| Rule | Detail |
+| Command | Effect | Notes |
+|---|---|---|
+| `!write` | Grants the Expert `orchestrator_edit_file`, `_write_file`, `_delete_file`, `_list_changes`. | Requires a bound project. Off by default; resets on restart. |
+| `!readonly` | Revokes write mode. | Changes on disk are untouched. |
+| `!diff` | Full diff of this conversation's changes. | Review before `!pr`. |
+| `!undo` | Restores every touched file to its exact pre-session bytes. | Byte snapshots, so untracked files restore correctly. |
+| `!pr <title>` | Commits to `brain/<conv_id>`, pushes, opens a PR against `origin`. | **Must open the message.** Only files this conversation touched are staged. |
+
+**How write mode stays safe.** The Expert must read a file before editing or deleting it — it
+cannot act on something it has only seen in the symbol skeleton. Edits are anchor-based and
+must match exactly once, so a wrong anchor fails loudly. Paths are realpath-resolved and
+containment-checked, blocking `../` and symlinks pointing out of the project. `.git/`,
+`.env*`, keys and certificates are never writable. The Expert has **no** commit or PR tool:
+raising a PR is outward-facing, so it happens only when you run `!pr`.
+
+**Matching rules.** Substring match, first wins, in a fixed `if/elif` order:
+`!lock` → `!unlock` → `!code` → `!general` → `!move` → `!architect` → `!bugfix` → `!approve` →
+`!review` → `!build` → `!clone` → `!write`/`!readonly` → `!undo` → `!diff` → `!pr` → `!stop` →
+`!status` →
+`!logs`. So *"Should I run !build or !status?"* triggers `!build`, and *"!code let's !build
+this"* runs `!code` only. `!clone` and `!pr` are prefix-matched. Background title/tag/summary
+pings from Open WebUI never trigger commands.
+
+---
+
+## 7. Configuration
+
+### 7.1 Orchestrator constants — `orchestrator.py` (code, not env)
+
+| Constant | Shipped default | Meaning |
+|---|---|---|
+| `EXPERT_CONFIG` | `{"model": "qwen3.8:27b", "provider": "ollama", "base_url": "http://localhost:11434"}` | The Expert. `provider` ∈ `ollama` \| `llamacpp` \| `lmstudio`. |
+| `ROUTER_CONFIG` | `qwen2.5:1.5b` on Ollama | Resident triage model. |
+| `DEFAULT_EXPERT_MODEL` | `qwen3.8:27b` | Any other Expert falls back to that model's native sampling defaults. |
+| `EXPERT_CTX` | `65536` | Expert window. **Every budget below derives from this.** |
+| `DISTILL_CTX` | `65536` | Distillation window. |
+| `CLINE_CTX` | `65536` | Window the build agent is **expected** to run at. An assertion, not a setting — the real window comes from `OLLAMA_CONTEXT_LENGTH`, and the build aborts if the two disagree. See §7.6. |
+| `AGENT_MAX_HOPS` | `8` | Tool hops on a read-only turn. Each hop is a full inference over the conversation. |
+| `AGENT_MAX_HOPS_WRITE` | `12` | Write turns: read → edit → verify is three hops per file. |
+| `CHARS_PER_TOKEN_DENSE` | `3` | Pessimistic on purpose. |
+| `HISTORY_BUDGET_FRACTION` | `0.45` | Raw conversation history. |
+| `MENTION_BUDGET_FRACTION` | `0.08` | `@file` mentions. |
+| `TOOL_RESULT_BUDGET_FRACTION` | `0.22` | All tool results across one turn. |
+| `TOOL_RESULT_MIN_CHARS` | `512` | Below this, suppress rather than truncate. |
+| `LLAMACPP_BINARY` | `/home/jonathan/.local/bin/llama` | ⚠️ Absolute path from the author's machine — **change this**. Unified `llama` binary, invoked as `llama serve`. |
+| `LLAMACPP_DEFAULT_ARGS` | `[]` | Extra spawn args. KV quant is commented out here — see §7.6. |
+| `COMFYUI_URL` | `http://localhost:8188` | |
+| `PARAMS_GENERAL` | temp 1.0, top_p 0.95, top_k 20, presence_penalty 1.5 | `!general` |
+| `PARAMS_CODING` | temp 0.6, top_p 0.95, top_k 20, repeat_penalty 1.15 | `!code` |
+
+### 7.2 llama-server spawn flags (always applied)
+
+| Flag | Why |
 |---|---|
-| **Substring match, first wins** | Every command except `!clone` and `!pr` matches anywhere in the message, in a single `if/elif` chain. *"Should I run !build or !status?"* triggers `!build`. |
-| **Order is fixed** | `!lock` → `!unlock` → `!code` → `!general` → `!move` → `!architect` → `!approve` → `!review` → `!build` → `!clone` → `!write` / `!readonly` → `!undo` → `!diff` → `!pr` → `!stop` → `!status` → `!logs`. Because `!code` sits third, *"!code let's !build this"* runs `!code` only. |
-| **Two don't return** | `!code` and `!general` set a mode and let your message continue to inference. Every other command replies and stops the turn. |
-| **Position-sensitive pair** | `!clone` and `!pr` use prefix matching, so they must open the message. The rest can appear anywhere. |
-| **Background turns are exempt** | Title/tag/summary pings from Open WebUI never trigger commands. |
-
-## 🚀 Key Features
-
--   **Autonomous Build Pipeline (`!build`):** Trigger a multi-agent distillation and implementation process for any project extracted from the conversation.
-    - **Steering:** You can add comments to the same prompt where !build exists, it will steer the autonomous build process. E.g. "Lets !build, we must add authentication and a login page."
-    -   **Context Distillation:** Automatically compresses long conversations into actionable `.clinerules` through a 4-pass expert review (Architect, Engineer, Test, Safety).
-    -   **Iterative Rebuilding:** Run `!build` on existing projects. The system uses **Situational Awareness** (reading your directory tree and README) to build on top of current progress instead of starting from scratch. You can continue to build on top of existing projects by running `!build` again in the same conversation. 
-    -   **Noise Suppression:** Automatically bootstraps a `.gitignore` to prevent agents from being distracted by `node_modules`, `.git`, or virtual environments.
--   **Project Extraction (`!move`):** Automatically reconstructs entire project structures from chat conversations. It parses folder trees and code snippets, reconstructs them in a dedicated `conversations/` directory, and opens the result in VS Code.
-    -   **Manual Tuning Safety:** If a project has already been initialized before by the build pipeline (`.clinerules` exists), `!move` will **skip** snippet extraction to protect your manual code changes/tuning from being reverted.
-    -   **Smart Conflict Management:** The extraction system only updates files that have actually changed, keeping the structure up to date.
-    -   **Clean Metadata:** Organizes logs into `.cline_logs/` and technical context into `.cline_context/`, keeping your project root clutter-free.
-    -   **Safe Path Sanitization:** Built-in safeguards prevent directory traversal (clears `..`) and automatically filters out shell/command blocks from project files.
--   **Tiered Orchestration:** Uses a resident "Fast Orchestrator" (`qwen2.5:1.5b`) for instant intent detection and simple queries.
--   **Expert Reasoning:** Dynamically loads expert models (e.g. `qwen3.8:27b`) for complex coding and logic tasks.
--   **VRAM Guardrails:** Intelligent "Orchestrator" proxy with GPU Mutex locking to prevent simultaneous heavy model loading.
--   **Flexible Expert Tuning:** High-level models can use customized "Thinking Mode" parameters, while alternative expert models automatically fall back to their native default settings for maximum compatibility.
--   **LAN Accessible:** Bridged networking for access from phones, tablets, and other laptops.
-
-## 🏗️ Architecture
-
-The system operates on an intelligent **GPU Mutex** principle managed by the **Orchestrator Proxy**:
-
-1.  **Triage:** Every query is analyzed by the resident 1.5B Router.
-2.  **Verified Lifecycle:** If Expert intent is detected, the Router is force-evicted, VRAM is swept, and the Expert is loaded with a 5-minute "warm session" timer.
-3.  **Selective Interception:** Automatically identifies and silences background "expansion" and "description" pings while preserving high-priority search results.
-4.  **Idle Sweeping:** A background loop sweeps ComfyUI RAM/VRAM every 5 minutes when no generation or chat is active.
-5.  **Thinking Modes:** Sampling parameters (temperature, penalties) are dynamically applied based on task type.
-
----
-
-### 🚀 Universal Scale: The 256k Context Milestone
-
-For users with an **NVIDIA RTX 4090 (24GB VRAM)**, br.ai.n has been optimized to support massive context windows that allow for the ingestion of entire repositories.
-
-#### How it works:
-1. **Model:** We utilize MoE architectures like `Qwen 3.6 35B A3B` (GGUF).
-2. **KV Quantization:** By forcing `--cache-type-k q8_0` and `--cache-type-v q8_0`, we halve the memory footprint of the conversation history.
-3. **Flash Attention:** Mandatory for stability and speed at scales above 64k.
-4. **Managed Slots:** The orchestrator forces `-np 1` to ensure all 24GB is dedicated to a single, deep reasoning process.
-
-**Result:** You can fit a **fully offloaded 35B model** with a **256,144 token context window** in ~21.1GB of VRAM, leaving room for the resident router and OS overhead.
-
-> [!NOTE]
-> **This is not the shipped default.** Out of the box `EXPERT_CTX` is `131072` (128k) with `qwen3.8:27b` on Ollama. To reach the figures above you need to switch `EXPERT_CONFIG` to the `llamacpp` provider with a MoE GGUF and raise `EXPERT_CTX` yourself. KV quantisation (`--cache-type-k/v q8_0`) is already on by default via `LLAMACPP_DEFAULT_ARGS`, and Flash Attention is forced on at spawn.
-
----
-
-## 🏭 Automated Software Factory
-
-Agent DAVE isn't just a chatbot; Agent DAVE is a fully autonomous software factory. By combining tiered orchestration with a dedicated build pipeline, you can turn ideas into full projects without manual intervention.
-
-### 🔄 The Autonomous Loop (Distillation & Implementation)
-
-1.  **Project Extraction (`!move`):** Agent DAVE scans your current conversation, identifies the project structure, and reconstructs the entire file tree in a dedicated workspace within `conversations/`.
-2.  **4-Pass Distillation (`!build`):** Does the same as !move and also triggers the build pipeline. The system runs four expert agents in sequence:
-    -   **Architect:** Defines business goals and directory structures.
-    -   **Engineer:** Maps logic to files and defines design patterns.
-    -   **Test Engineer:** Identifies edge cases and verification gates.
-    -   **Safety Inspector:** Audits for security vulnerabilities.
-3.  **Autonomous Implementation:** A specialized `Cline` agent takes the resulting `.clinerules` and executes the code changes, handling everything from file creation and bug fixing to testing and verification.
-
-### 🚥 Factory Management Commands
-
--   `!move`: Extract project files from the current chat.
--   `!build`: Kick off the 4-pass autonomous build pipeline.
--   `!architect`: Run **only** Pass 1 (Architect) and stop at a review gate, so you can read the proposed architecture before any code is written.
--   `!review`: Re-display the architecture document produced by `!architect`.
--   `!approve`: Accept the reviewed architecture and resume the remaining passes plus implementation. Requires a prior `!architect`.
--   `!clone`: Clone a Git repository into the conversation's workspace, e.g. `!clone https://github.com/user/repo`. Add `--kb <url>` to attach a second repo as a knowledge base.
--   `!status`: Check the status of active and recent build containers.
--   `!logs`: Fetch and display the latest console logs from the active build pipeline.
--   `!stop`: Force-stop all running build pipelines and clear VRAM.
-
-> [!TIP]
-> **Review-then-build workflow:** `!architect` → read the output → `!approve`. This is usually preferable to a bare `!build`, which commits to all four passes and implementation in one shot.
-
----
-
-### ✏️ Repository Editing & Pull Requests
-
-Once a project is bound to a conversation (via `!clone`, or by symlinking an existing checkout into `conversations/`), the Expert can read it. Run `!write` and it can change it too.
-
--   `!write`: Enable write mode for this conversation. Grants the Expert `orchestrator_edit_file`, `orchestrator_write_file`, `orchestrator_delete_file` and `orchestrator_list_changes`.
--   `!readonly`: Revoke write mode. Existing changes are left on disk.
--   `!diff`: Show the full diff of everything the Expert has changed in this conversation.
--   `!undo`: Revert every file the Expert touched back to its exact pre-session bytes.
--   `!pr <title>`: Commit this conversation's changes to a `brain/<conversation-id>` branch and open a pull request against the bound repo's own `origin`.
-
-**How it stays safe.** Write mode is off by default, so ordinary discussion turns cannot modify anything. The Expert must read a file before it can edit or delete it — it cannot act on files it has only seen in the symbol skeleton. Edits are anchor-based and must match exactly once, so a wrong anchor fails loudly instead of corrupting code. Paths are realpath-resolved and containment-checked, which blocks both `../` traversal and symlinks inside the project pointing out of it. `.git/`, `.env*`, keys and certificates are never writable.
-
-**How your existing work stays safe.** Like Claude Code, the Expert edits files in place rather than branching first — so a repo that is already dirty stays usable. The first time any file is touched, its exact bytes are snapshotted outside the repo, which is what `!undo` restores from. Because those snapshots are byte copies rather than a git stash, untracked files are restored correctly instead of being deleted. Branching happens only at `!pr`, and only the files this conversation actually changed are staged — anything else you had uncommitted is deliberately left alone.
-
-> [!IMPORTANT]
-> The Expert has no tool for committing or opening pull requests. That is deliberate: raising a PR is an outward-facing action against a real remote, so it happens only when *you* run `!pr`. Review with `!diff` first.
-
----
-
-## 📂 Project Structure
-
-A high-level overview of the **br.ai.n** workspace and its core components:
-
-```text
-.
-├── orchestrator.py          # 🧠 Central FastAPI Proxy (VRAM Manager & Router)
-├── router.py                # 🛡️ Pi Router Node (2-Device: triage + Wake-on-LAN)
-├── mover.py                 # 📂 Project Extractor (Parses chat to files)
-├── setup_workspace.sh       # 🚀 Automated Installer (Standalone/Desktop)
-├── setup_pi.sh              # 🍓 Automated Installer for Raspberry Pi
-├── start_standalone.sh      # 🚥 Launch Script (1-Device: Full Stack)
-├── start_workspace.sh       # 🚥 Launch Script (1-Device: full stack incl. ComfyUI)
-├── start_desktop.sh         # 🚥 Launch Script (2-Device: Desktop Worker Node)
-├── start_router.sh          # 🚥 Launch Script (2-Device: Pi Router Node)
-├── docker-compose.yml       # 🐳 Multi-Container Stack (1-Device)
-├── docker-compose.pi.yml    # 🐳 Lightweight Container Stack (2-Device Pi)
-├── flux2api.json            # 🎨 ComfyUI workflow for Flux.2 image generation
-├── test_intent.py           # 🧪 Intent/routing tests
-├── test_advanced_mover.py   # 🧪 Project-extraction tests
-├── cline-builder/           # 🔨 Autonomous Build Pipeline (The "Factory")
-│   ├── distill.py           #   - 4-Pass Thinking Engine (Architect -> Engineer -> etc.)
-│   ├── agent_config.json    #   - Factory Configuration (Models, Prompts, Limits)
-│   ├── prompts/             #   - Agent system prompts (architect/engineer/test/safety .md)
-│   ├── Dockerfile           #   - Pipeline Environment
-│   └── entrypoint.sh        #   - Autonomous Build Execution Flow
-├── searxng/                 # 🔍 Search Engine Configuration (git-ignored)
-├── conversations/           # 🏗️ Workspace Root (Autonomous projects live here, git-ignored)
-├── ARCHITECTURE.md          # 📜 Deep Technical documentation
-├── SETUP.md                 # 🛠️ Manual step-by-step setup guide
-└── README.md                # 📖 Main entry point & Quick Start
-```
-
-### 🧩 Core Component Breakdown
-
--   **Orchestrator Proxy (`orchestrator.py`):** The heart of the system. It handles VRAM safety, model hot-swapping, and routes requests to either the Fast Router or the Expert Model.
--   **Project Mover (`mover.py`):** Automatically reconstructs file systems from chat history, sanitizing paths and organizing code into the `conversations/` directory.
--   **Cline Builder (`cline-builder/`):** A specialized Docker environment that runs the autonomous build pipeline. It uses a 4-pass "thinking" process to generate `.clinerules` before implementing code.
--   **ComfyUI:** Handles high-performance image generation (Flux.2) with automated memory management.
--   **Open WebUI & SearXNG:** Provides the unified chat interface and live web search capabilities.
-
----
-
-## ⚙️ Model & Agent Configuration
-
-Agent DAVE supports **three LLM backends** — you can mix and match them per model role. This means your Expert can run on Ollama while a stubborn model runs on llama.cpp, all sharing one GPU lock.
-
-| Provider | How It Works | Best For |
-|----------|-------------|----------|
-| **Ollama** | Native model management, auto-loads on request | Daily driver, widest model library |
-| **LM Studio** | Managed via `lms` CLI, OpenAI-compatible API | GUI users, easy model browsing |
-| **llama.cpp** | Orchestrator spawns `llama-server` on demand | HuggingFace models, raw GGUF files, stubborn models |
-
----
-
-### 🔧 Provider Setup
-
-Before configuring models, ensure the provider you want to use is installed:
-
-<details>
-<summary><b>Ollama</b> (Default — already installed if you ran setup)</summary>
-
-```bash
-# Install (if not already)
-curl -fsSL https://ollama.com/install.sh | sh
-
-# Pull a model
-ollama pull gemma4:26b
-
-# Verify it's running
-curl http://localhost:11434/api/tags
-```
-- **Default port:** `11434`
-- **API format:** Ollama native + OpenAI-compatible (`/v1/chat/completions`)
-- **Model management:** Automatic (loads on first request, unloads via `keep_alive`)
-</details>
-
-<details>
-<summary><b>LM Studio</b></summary>
-
-```bash
-# Install LM Studio from https://lmstudio.ai
-# Then bootstrap the CLI:
-~/.lmstudio/bin/lms bootstrap
-
-# Verify CLI is working
-lms status
-
-# Start the local server (or use the GUI)
-lms server start
-```
-- **Default port:** `1234`
-- **API format:** OpenAI-compatible (`/v1/chat/completions`)
-- **Model management:** Via `lms load <model>` / `lms unload <model>` (orchestrator handles this automatically)
-
-> [!NOTE]
-> The model name in your config must match the identifier shown in `lms ls`. LM Studio uses its own naming convention (e.g., `lmstudio-community/qwen2.5-32b-GGUF`).
-</details>
-
-<details>
-<summary><b>llama.cpp</b></summary>
-
-```bash
-# Option 1: Install from package manager
-# Ubuntu/Debian:
-sudo apt install llama.cpp
-
-# Option 2: Build from source (recommended for GPU support)
-git clone https://github.com/ggml-org/llama.cpp
-cd llama.cpp
-cmake -B build -DGGML_CUDA=ON
-cmake --build build --config Release -j$(nproc)
-sudo cp build/bin/llama-server /usr/local/bin/
-
-# Verify installation
-llama-server --help
-```
-- **Default port:** `8080` (configurable per model)
-- **API format:** OpenAI-compatible (`/v1/chat/completions`)
-- **Model management:** Orchestrator spawns/kills `llama-server` processes automatically
-- **HuggingFace support:** Use `-hf` flag syntax in model names (e.g., `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q3_K_XL`)
-
-> [!TIP]
-> You do NOT need to start `llama-server` manually. The orchestrator manages the process lifecycle — it starts the server when the model is needed and stops it when switching to another model.
-</details>
-
----
-
-### 🧠 Orchestrator Models (`orchestrator.py`)
-
-At the top of `orchestrator.py`, configure which model and provider to use for the **Expert** (complex tasks) and **Router** (triage):
-
-```python
-# --- STRICT MODEL CONFIG ---
-EXPERT_CONFIG = {
-    "model": "qwen3.8:27b",       # Model name (Ollama tag, LMS identifier, or HF repo)
-    "provider": "ollama",          # "ollama", "lmstudio", or "llamacpp"
-    "base_url": "http://localhost:11434",  # API endpoint
-}
-ROUTER_CONFIG = {
-    "model": "qwen2.5:1.5b",
-    "provider": "ollama",
-    "base_url": "http://localhost:11434",
-}
-```
-
-These are the shipped defaults. `DEFAULT_EXPERT_MODEL` is also set to `qwen3.8:27b` and is what the custom sampling parameters are tuned for — point `EXPERT_CONFIG` at anything else and the orchestrator falls back to that model's native defaults.
-
-#### Example: Expert on llama.cpp with a HuggingFace model
-
-```python
-EXPERT_CONFIG = {
-    "model": "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q3_K_XL",
-    "provider": "llamacpp",
-    "base_url": "http://localhost:8080",
-}
-```
-
-The orchestrator will automatically:
-1. Start `llama-server` with the `-hf` flag pointing to the HuggingFace repo
-2. Wait for the server to download and load the model (up to 2 minutes)
-3. Route all Expert requests to `http://localhost:8080/v1/chat/completions`
-4. Kill the process when switching to another model
-
-#### Example: Expert on LM Studio
-
-```python
-EXPERT_CONFIG = {
-    "model": "lmstudio-community/qwen2.5-32b-GGUF",
-    "provider": "lmstudio",
-    "base_url": "http://localhost:1234",
-}
-```
-
-The orchestrator will call `lms load <model>` before inference and `lms unload` when switching.
-
-#### llama.cpp Advanced Settings
-
-```python
-# Path to the llama.cpp binary. This is the unified `llama` binary, which the
-# orchestrator invokes via its `serve` subcommand — not a bare `llama-server`.
-# Change this to wherever your binary actually lives.
-LLAMACPP_BINARY = "/home/jonathan/.local/bin/llama"
-
-# Extra CLI args appended to every spawn. KV-cache quantisation is on by
-# default, which roughly halves the memory cost of the context window.
-LLAMACPP_DEFAULT_ARGS = ["--cache-type-k", "q8_0", "--cache-type-v", "q8_0"]
-```
-
-> [!IMPORTANT]
-> `LLAMACPP_BINARY` ships with an absolute path from the author's machine. Set it to your own path before using the `llamacpp` provider.
-
-Flash Attention is forced on by the orchestrator via the `LLAMA_ARG_FLASH_ATTN=on` environment variable when it spawns the process — you do not need to pass `-fa` yourself.
-
-You can also add per-model args in the config dict:
-
-```python
-EXPERT_CONFIG = {
-    "model": "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q3_K_XL",
-    "provider": "llamacpp",
-    "base_url": "http://localhost:8080",
-    "args": ["-ngl", "99", "-fa"],  # Extra CLI flags
-}
-```
-
-#### Context Windows
-
-```python
-EXPERT_CTX = 131072   # Context for the expert model (128k)
-DISTILL_CTX = 131072  # Context for the distillation engine (128k)
-CLINE_CTX = 131072    # Context for the Cline agent (128k)
-```
-
----
-
-### 🏗️ Build Pipeline (`cline-builder/agent_config.json`)
-
-The autonomous factory supports the same multi-provider system. Each agent in the pipeline can use a different backend:
-
-#### Per-Model Provider Config (Recommended)
+| `-ngl all` | Never `auto` — auto silently spills layers to RAM when the KV cache leaves no room. |
+| `-c $EXPERT_CTX` | Context, from config `ctx_size` or `EXPERT_CTX`. |
+| `-np 1` | One slot; parallel slots would divide the KV cache. |
+| `--context-shift` | Sliding-window truncation instead of a hard stop. |
+| `--slot-prompt-similarity 0.95` | Linear slot persistence across a long agentic turn. |
+| `--batch-size 1024` / `--ubatch-size 1024` | Prompt-eval throughput. |
+| `--reasoning-format deepseek` | Pins thoughts to `delta.reasoning_content`; `auto` can silently deliver nothing to a client reading `delta.content`. |
+| `--no-mmproj` | Skips the 931 MB vision projector `-hf` pulls in. The Expert is text-only. |
+| `LLAMA_ARG_FLASH_ATTN=on` | Forced in the spawn env — you never pass `-fa` yourself. |
+| `HF_HUB_CACHE=/data/llama` | GGUF cache location. |
+| `--host 0.0.0.0` | Forced, so the build container can reach it via `host.docker.internal`. |
+
+Per-model overrides go in the config dict: `"args": [...]`, `"ctx_size": N`, `"binary_path": "..."`.
+Readiness is a background health poll with a 120 s timeout; requests wait on an `asyncio.Event`.
+
+### 7.3 Build pipeline — `cline-builder/agent_config.json`
 
 ```json
 {
-    "models": {
-        "architect": {
-            "model": "gemma4:26b",
-            "provider": "ollama",
-            "base_url": "http://host.docker.internal:11434"
-        },
-        "engineer": {
-            "model": "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q3_K_XL",
-            "provider": "llamacpp",
-            "base_url": "http://host.docker.internal:8080"
-        },
-        "test_engineer": {
-            "model": "gemma4:26b",
-            "provider": "ollama",
-            "base_url": "http://host.docker.internal:11434"
-        },
-        "safety": {
-            "model": "gemma4:26b",
-            "provider": "ollama",
-            "base_url": "http://host.docker.internal:11434"
-        },
-        "cline": {
-            "model": "Qwen3.6-35B-Q3-unsloth:latest",
-            "provider": "ollama",
-            "base_url": "http://host.docker.internal:11434"
-        }
-    },
-    "ollama_host": "http://host.docker.internal:11434"
+  "models": {
+    "architect":     {"model": "qwen3.8:27b", "provider": "ollama", "base_url": "http://host.docker.internal:11434"},
+    "engineer":      {"model": "qwen3.8:27b", "provider": "ollama", "base_url": "http://host.docker.internal:11434"},
+    "test_engineer": {"model": "muse-glimmer:latest", "provider": "ollama", "base_url": "http://host.docker.internal:11434"},
+    "safety":        {"model": "qwen3.8:27b", "provider": "ollama", "base_url": "http://host.docker.internal:11434"},
+    "cline":         {"model": "qwen3.8:27b", "provider": "ollama", "base_url": "http://host.docker.internal:11434"}
+  },
+  "ollama_host": "http://host.docker.internal:11434",
+  "context_window": 65536,
+  "prompts": {
+    "architect": "prompts/architect.md", "engineer": "prompts/engineer.md",
+    "test_engineer": "prompts/test_engineer.md", "safety": "prompts/safety.md"
+  },
+  "cline_startup_message": "prompts/cline_startup.md",
+  "limits": {
+    "max_project_size_mb": 8192,
+    "max_build_iterations": 6,
+    "cline_max_retries": 6,
+    "build_timeout_secs": 3600,
+    "review_enabled": true,
+    "review_timeout_secs": 2400,
+    "review_thinking_level": "medium",
+    "final_build_timeout_secs": 5400,
+    "verify_timeout_secs": 3600,
+    "safety_timeout_secs": 2400,
+    "test_gate_timeout_secs": 900,
+    "replan_issue_growth_bytes": 2000,
+    "max_replans": 2,
+    "replan_passes": ["architect", "engineer"]
+  }
 }
 ```
+
+| Key | Meaning |
+|---|---|
+| `context_window` | Top-level, **not** inside `limits`. The single place the distillation window is configured. |
+| `max_build_iterations` | Rounds of build → review → verify → safety. The last one switches to STABILIZATION. |
+| `cline_max_retries` | Consecutive-mistake budget passed to the Cline CLI `--retries`. |
+| `*_timeout_secs` | Per-phase wall clock. Scale with **task complexity**, not model speed — a run that exceeds it is killed mid-turn and the iteration is lost. |
+| `final_build_timeout_secs` | The last round inherits every deferred bug, so it gets a larger budget. |
+| `review_enabled` | Master switch for the review phase. `false` drops it and the loop runs build → verify → safety exactly as before. Override for a single build with `-e REVIEW_ENABLED=false`, no config edit needed. |
+| `review_timeout_secs` | The review phase is scoped to the files the build phase wrote, so it needs less than a whole-project sweep. Skipped entirely when the build wrote nothing. |
+| `review_thinking_level` | Reasoning effort for the review phase → Cline's `--thinking`: `none\|low\|medium\|high\|xhigh`. Qwen Code's `/review --effort` is the same idea under another name, but that CLI is not installed in this image. An unknown value warns and falls back to `medium`; `""` omits the flag and leaves the provider default. |
+| `replan_issue_growth_bytes` | Re-plan when `.build_issues.md` has grown this much since the plan was written. |
+| `max_replans` | `0` disables re-planning. |
+| `replan_passes` | Narrow to `["architect"]` to halve the GPU cost, at the price of a roadmap that no longer matches the revised architecture. |
+| `max_project_size_mb` | Checked before and after every build phase. Excludes `.git`, `node_modules`, venvs, caches. |
+
+Prompts are Markdown files mounted read-only at `/app/prompts`, resolved relative to the
+config. An inline prompt string still works. Legacy `"architect": "model-name"` strings still
+work and default to Ollama. Inside Docker, **always** use `host.docker.internal`, never
+`localhost`.
+
+### 7.4 Environment variables
+
+**`orchestrator.py`** — models are configured in code, not env. The only variable it reads:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `AGENT_CONFIG_PATH` | `cline-builder/agent_config.json` | Build pipeline config path. |
+
+**`cline-builder`** (injected by the orchestrator when it launches a build):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `EXPERT_CTX` | unset → `agent_config.json` | Distillation window. Precedence: env > config > `16384`. Deliberately unset in `docker-compose.yml`. |
+| `CLINE_CTX` | `65536` | Expected build-agent window. `entrypoint.sh` asserts it against the running Ollama server before Phase 2 and aborts on mismatch — see §7.6. |
+| `PIPELINE_MODE` | `full` | `distill_only` stops at the review gate (`!architect`, `!bugfix`). |
+| `DISTILL_PASSES` | `""` (all four) | Naming the design pass runs pass 1 only. |
+| `DISTILL_DESIGN_PASS` | `architect` | Which role occupies pass 1: `architect` designs, `bugfix` diagnoses. Set by the gate command; `!approve` reads it back from `.cline_context/.design_pass`. |
+| `DISTILL_RESUME` | unset | `1`/`true`/`yes` reuses saved pass documents — how `!approve` preserves your edits. |
+| `DISTILL_INTERMEDIATE_DIR` | `/workspace/.cline_context` | Where pass documents land. |
+| `OLLAMA_HOST` | `http://host.docker.internal:11434` | |
+| `ORCHESTRATOR_URL` | `http://host.docker.internal:8000` | Used for `/internal/model/load` and `/v1/shutdown_expert`. |
+| `CONVERSATION_FILE` | `/workspace/.cline_context/conversation.json` | |
+| `CLINERULES_PATH` | `/workspace/.clinerules` | |
+| `DISTILL_STATUS_PATH` | `/workspace/.cline_context/distill_status` | |
+| `PROJECT_NAME` | `unnamed_project` | |
+| `CLINE_DIR` | `/root/.config/Cline` | |
+
+**Tracing (`tracer.py`)** — the fastest way to understand a routing decision:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `BRAIN_TRACE` | `1` | `0` disables tracing. |
+| `BRAIN_TRACE_FULL` | `0` | `1` logs untruncated blocks. |
+| `BRAIN_TRACE_MAX` | `1200` | Per-block char cap. |
+| `BRAIN_TRACE_BG` | `1` | Trace background/automated turns too. |
+| `BRAIN_TRACE_FILE` | `./trace.log` | |
+| `BRAIN_TRACE_ROTATE_MB` | `20` | Rotation threshold. |
+
+**Extraction (`mover.py`)**: `BRAIN_OPEN_EDITOR=1` makes `!move` open an editor by default
+(otherwise use `!move --open`).
+
+**Pi router node (`router.py`, 2-device only)** — see `.env_example`:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ROUTER_PORT` | `8001` | |
+| `ROUTER_MODEL` | `qwen2.5:1.5b` | CPU triage model on the Pi. |
+| `ROUTER_OLLAMA_URL` | `http://localhost:11434` | |
+| `ROUTER_CTX` | `4096` | |
+| `COMPLEXITY_THRESHOLD` | `6` | Above this, forward to the desktop. Lower = more goes to the Expert. |
+| `DESKTOP_IP` / `DESKTOP_PORT` | — / `8000` | Where heavy requests go. |
+| `WAKER_URL` / `WAKER_TOKEN` | `http://localhost:8000` / — | Wake-on-LAN service and its `x-auth-token`. |
+| `DESKTOP_SSH_USER` / `DESKTOP_SSH_HOST` / `DESKTOP_WORKSPACE_DIR` | — | Passwordless SSH start of `start_desktop.sh`. |
+| `WOL_BOOT_WAIT` / `WOL_HEALTH_TIMEOUT` / `WOL_POLL_INTERVAL` | `35` / `90` / `5` | Boot and readiness timing, in seconds. |
+| `KILL_GUI_ON_WAKE` | `false` | Stops GDM3 to free ~2.5 GB VRAM. Headless use only. |
+
+The Pi adds `X-Forwarded-By-Router: true`; the desktop sees it and skips its own triage.
+Standalone mode simply never sees the header.
+
+**Open WebUI** (`docker-compose.yml`): points `OLLAMA_BASE_URL` and `OPENAI_API_BASE_URL` at
+`http://host.docker.internal:8000` — i.e. at the orchestrator, never at Ollama directly.
+That indirection is the whole VRAM safety story; do not bypass it.
+
+### 7.5 Distillation tuning — `cline-builder/distill.py`
+
+| Constant | Default | Meaning |
+|---|---|---|
+| `TARGET_CHUNK_SIZE` | `8192` | Ceiling on extraction chunk size; the dominant term in pass latency. Always clamped to what the window holds. |
+| `CHARS_PER_TOKEN` / `_DENSE` | `4` / `3` | Slicing vs. accounting. The gap is intentional — `slice_tokens()` converts between them. |
+| `SAFETY_FRACTION` / `SAFETY_FLOOR` | `0.05` / `256` | Headroom never spent, absorbing tokenizer drift and chat-template scaffolding. |
+| `MIN_VIABLE_CHUNK` | `768` | Below this, raise `BudgetInfeasible` rather than clamp. |
+| `MERGE_ANSWER_FRACTION` / `ANSWER_FLOOR` | `0.4` / `1024` | The deliverable is reserved first; facts take the remainder. |
+| `ANSWER_MAX_TOKENS` | `8192` | Merge / single-pass output cap. |
+| `MAX_CONSOLIDATION_ROUNDS` / `MIN_REDUCTION_RATIO` | `4` / `0.9` | A round must remove ≥ 10% or the ladder stops. |
+| `PRIOR_STEER_MAX_TOKENS` | `400` | Steering extract of prior passes given to each chunk. |
+| `KB_MAX_CHARS` | `100000` | Absolute ceiling; the real limit is solved per run. |
+| `STALL_TIMEOUT` | `45.0` | Idle timer — seconds with **no new token**, not a wall clock. A fast, verbose stream is never killed. |
+| `BUDGET_BREACH_FRACTION` / `BUDGET_DRIFT_FRACTION` | `0.95` / `0.15` | Detect server-side truncation and material under-estimates. |
+
+### 7.6 Optimum configuration for a 24 GB workstation (RTX 3090)
+
+The shipped defaults are tuned for exactly this card. The reasoning:
+
+| Setting | Value | Why on a 3090 |
+|---|---|---|
+| `EXPERT_CTX` / `DISTILL_CTX` | `65536` | 128k of KV crowds the weights off a 24 GB card. 64k is the largest window that keeps a 27B fully offloaded, and it is where the ~30+ tok/s comes from. |
+| `agent_config.json` `context_window` | `65536` | Keep it equal to `EXPERT_CTX` — a mismatch means the container silently runs at a different size. |
+| Expert | `qwen3.8:27b` on Ollama | Simplest path to a fully-offloaded 24 GB fit. Ampere has no FP8, so an fp8 quant buys you nothing here — stay on GGUF/Q-quants. |
+| llama.cpp path | `LLAMACPP_DEFAULT_ARGS = ["--cache-type-k","q8_0","--cache-type-v","q8_0"]` | Currently `[]` (commented out in code). Re-enable it when you move the Expert to `llamacpp` and want a window above 64k. |
+| `LLAMACPP_BINARY` | your own path | Ships as an absolute path from the author's machine. |
+| Display | headless, or `KILL_GUI_ON_WAKE=true` | Recovers ~2.5 GB — often the difference between `-ngl all` fitting and not. |
+| ComfyUI | `--normalvram` | Correct for 24 GB. It never coexists with the Expert; the mutex swaps them. |
+| Router | `qwen2.5:1.5b`, `keep_alive: 0` | ~1.2 GB resident. Do not enlarge it — its job is a 4-field JSON verdict at `num_ctx: 2048`. |
+| Build timeouts | as shipped (3600 / 5400 / 3600 / 2400) | Sized for a 27B at ~30 tok/s. Faster hardware can shrink these; slower must not. |
+| `max_build_iterations` | `6` | Enough rounds for the test gate to actually converge. |
+| `-np 1` / `OLLAMA_NUM_PARALLEL=1` | forced | Never raise it. Parallel slots divide the KV cache. |
+
+#### Ollama service environment
+
+Set on the Ollama systemd unit, **not** by this repo — verify with
+`systemctl show ollama --property=Environment`. This is the reference configuration:
+
+```
+OLLAMA_FLASH_ATTENTION=1
+OLLAMA_KV_CACHE_TYPE=q8_0
+OLLAMA_CONTEXT_LENGTH=65536
+OLLAMA_NUM_PARALLEL=1
+OLLAMA_MAX_LOADED_MODELS=2
+OLLAMA_KEEP_ALIVE=-1
+OLLAMA_MODELS=/data/ollama/models
+OLLAMA_HOST=0.0.0.0
+```
+
+| Variable | Why it matters here |
+|---|---|
+| `OLLAMA_FLASH_ATTENTION=1` | Prerequisite for the quantised cache. Without it, `OLLAMA_KV_CACHE_TYPE` is ignored. |
+| `OLLAMA_KV_CACHE_TYPE=q8_0` | Halves KV cost. This is what makes 64k fit alongside a fully-offloaded 27B. |
+| `OLLAMA_CONTEXT_LENGTH=65536` | **Load-bearing.** See the note below — this, not `CLINE_CTX`, is what sizes the build agent's window. Keep it equal to `EXPERT_CTX`, or the build refuses to start. |
+| `OLLAMA_NUM_PARALLEL=1` | Matches the `-np 1` reasoning: parallel slots divide the cache. |
+| `OLLAMA_MAX_LOADED_MODELS=2` | Headroom, not a dependency — see below. |
+| `OLLAMA_KEEP_ALIVE=-1` | Only applies where no per-request `keep_alive` is sent. The orchestrator always sends one (`0` / `10m` / `-1`) and `distill.py` sends `3m`, so this governs exactly one caller: the Cline CLI, which talks OpenAI-compatible `/v1` and cannot send it. That pins the build model for the whole run — desirable — and `entrypoint.sh`'s EXIT trap calls `/v1/shutdown_expert` to release it. |
+| `OLLAMA_HOST=0.0.0.0` | Required so the `cline-builder` container reaches the host via `host.docker.internal`. |
 
 > [!IMPORTANT]
-> The build pipeline runs inside Docker. Use `host.docker.internal` instead of `localhost` for all `base_url` values so the container can reach the host machine's LLM backends.
-
-The example above shows a deliberately mixed setup. **The shipped `agent_config.json` is simpler** — all five roles (`architect`, `engineer`, `test_engineer`, `safety`, `cline`) point at `qwen3.8:27b` on `http://host.docker.internal:11434`.
-
-#### Legacy String Format (Still Works)
-
-For backward compatibility, simple strings still work and default to Ollama:
-
-```json
-"models": {
-    "architect": "gemma4:26b",
-    "engineer": "Qwen3.6-35B-Q3-unsloth:latest"
-}
-```
-
-#### System Prompts & Logic
-
-Each distillation agent's system prompt lives in its own Markdown file under `cline-builder/prompts/`, referenced from `agent_config.json` by a path relative to the config file:
-
-```json
-"prompts": {
-    "architect":     "prompts/architect.md",
-    "engineer":      "prompts/engineer.md",
-    "test_engineer": "prompts/test_engineer.md",
-    "safety":        "prompts/safety.md"
-}
-```
-
-Edit those `.md` files to define strict rules, output formats, and operational constraints for each expert role. An inline prompt string is still accepted in place of a path for backwards compatibility.
-
-The Cline agent's opening instructions are the `cline_startup_message` key in `agent_config.json` — `cline-builder/entrypoint.sh` only reads that value, so edit the config rather than the shell script.
+> **`CLINE_CTX` is an assertion, not a setting.** It cannot size anything. The build agent
+> authenticates as `openai-compatible` against `/v1`, and Ollama's OpenAI-compatible endpoint
+> has no `num_ctx` option, so the agent's real window is whatever `OLLAMA_CONTEXT_LENGTH`
+> says (clamped by the model's own trained maximum). Raising `CLINE_CTX` alone still does
+> nothing — but it no longer *silently* does nothing.
+>
+> Before Phase 2, `entrypoint.sh`'s `assert_cline_ctx` sends one `max_tokens: 1` request
+> through the exact `/v1` path Cline uses — which forces Ollama to instantiate the runner at
+> its default window, rather than reporting one left over from distillation — then reads the
+> loaded window back from `/api/ps` and compares it to `CLINE_CTX`. On mismatch the build
+> aborts before the first iteration, naming both numbers and the fix. On a match the
+> confirmed figure is printed, and the run summary reports the window actually in force.
+> If the server is too old to report `context_length` on `/api/ps`, the run continues with a
+> loud `UNVERIFIED` warning rather than a false confirmation.
+>
+> So the failure this used to hide — a 27B agent quietly building at 4k against a plan
+> budgeted for 64k, looking like a stupid model rather than a config error — is now a
+> startup failure with the cause named. Same contract as `BudgetInfeasible` in `distill.py`.
+> Keep `CLINE_CTX` and `OLLAMA_CONTEXT_LENGTH` in step; the assertion tells you when you
+> haven't.
 
 > [!NOTE]
-> The prompt files are mounted read-only into the container at `/app/prompts`. If you add a new prompt file, make sure the volume mount in `docker-compose.yml` still covers it.
+> **`OLLAMA_MAX_LOADED_MODELS=2` is defensible but loose.** The whole architecture assumes one
+> tenant at a time, and both layers enforce it in code: `sweep_vram_for_expert()` +
+> `verified_unload()` evict the router before the Expert loads, and `evict_stale_models()`
+> clears the GPU before distillation pass 1. Setting it to `1` would make Ollama itself
+> enforce the invariant and close the brief window where a stale model and the Expert can
+> coexist — which matters most during distillation, where `test_engineer` uses a different
+> model (`muse-glimmer:latest`) from the other three passes. Nothing depends on `2`.
 
-#### Rounds & Limits
-Control the depth of the build process and safety guardrails:
--   **max_build_iterations**: The number of **rounds** (4-pass cycles) the pipeline will attempt to complete the project.
--   **cline_max_retries**: The consecutive-mistake budget passed to the Cline CLI's `--retries` flag.
--   **max_project_size_mb**: Upper bound on the workspace size the pipeline will operate on.
+**If you want a bigger window than 64k**, do it in this order and re-measure each time:
+confirm KV quantisation is actually active → confirm `-ngl all` still loads without spilling
+(watch `llama-server.log` and `nvidia-smi`) → move to a GQA/MoE GGUF, which pays far less per
+token of context → only then raise `EXPERT_CTX`, `agent_config.json` `context_window` **and**
+`OLLAMA_CONTEXT_LENGTH` together. Raising the window first is how you end up at PCIe
+generation speed with a prompt-eval graph that still looks healthy.
 
-```json
-"limits": {
-    "max_project_size_mb": 8192,
-    "max_build_iterations": 5,
-    "cline_max_retries": 6
-}
-```
+### 7.7 Switching providers
 
-`context_window` is a **top-level** key in `agent_config.json`, not part of `limits`:
+| Scenario | Where | Change |
+|---|---|---|
+| Different Expert, same provider | `orchestrator.py` | `EXPERT_CONFIG["model"]` |
+| Expert → llama.cpp | `orchestrator.py` | `provider: "llamacpp"`, `base_url`, set `LLAMACPP_BINARY` |
+| Expert → LM Studio | `orchestrator.py` | `provider: "lmstudio"`, `base_url: "http://localhost:1234"` |
+| A build agent's model | `agent_config.json` | that agent's object entry |
+| HuggingFace GGUF directly | either | `model: "org/repo:QUANT"` + `provider: "llamacpp"` |
 
-```json
-"context_window": 131072
-```
-
----
-
-### 🔀 Quick Reference: Switching Providers
-
-Here's a cheat sheet for common scenarios:
-
-| Scenario | Where to Edit | What to Change |
-|----------|---------------|----------------|
-| Change Expert model (same provider) | `orchestrator.py` | `EXPERT_CONFIG["model"]` |
-| Move Expert to llama.cpp | `orchestrator.py` | Set `provider: "llamacpp"`, update `base_url` |
-| Move Expert to LM Studio | `orchestrator.py` | Set `provider: "lmstudio"`, update `base_url` |
-| Change a build agent's model | `agent_config.json` | Update the agent's object entry |
-| Run build agent on llama.cpp | `agent_config.json` | Set `provider: "llamacpp"` + `base_url` |
-| Use a HuggingFace model directly | Any config | Set `model` to `org/repo:quantization` with `provider: "llamacpp"` |
+| Provider | How it works | Best for |
+|---|---|---|
+| **Ollama** | Auto-loads on request | Daily driver, widest library |
+| **llama.cpp** | Orchestrator spawns and health-polls `llama serve` | HuggingFace GGUF, KV-cache control, extreme context |
+| **LM Studio** | `lms load` / `lms unload` via CLI | GUI model browsing |
 
 > [!NOTE]
-> **Hot-Swapping Experts:** You can change `EXPERT_CONFIG` at the top of `orchestrator.py` at any time. If you use a model other than the default (`qwen3.8:27b`), the system will automatically bypass custom sampling parameters (temperature, penalties) and use that model's native default settings.
+> Any Expert other than `qwen3.8:27b` automatically bypasses `PARAMS_GENERAL` / `PARAMS_CODING`
+> and uses that model's native sampling defaults.
 
----
-
-### 🐛 Troubleshooting Providers
+### 7.8 Troubleshooting
 
 | Symptom | Cause | Fix |
-|---------|-------|-----|
-| `llama-server: command not found` | Binary not installed or not in PATH | Set `LLAMACPP_BINARY` to the full path |
-| `lms: command not found` | LM Studio CLI not bootstrapped | Run `~/.lmstudio/bin/lms bootstrap` |
-| `Connection refused` on non-Ollama port | Server not started | For llama.cpp: orchestrator starts it automatically. For LM Studio: run `lms server start` |
-| Model loads but inference is garbled | Wrong model format for provider | Ollama needs Ollama-format models. llama.cpp needs GGUF files. |
-| Docker container can't reach backend | Using `localhost` in `agent_config.json` | Use `host.docker.internal` instead |
-| VRAM conflict between providers | Two models loaded simultaneously | Check that only one model is active — the shared GPU lock should prevent this |
+|---|---|---|
+| Generation crawls, prompt eval looks fine | Layers spilled to system RAM | `-ngl all` (already forced); lower `EXPERT_CTX` or enable KV quant |
+| `BudgetInfeasible: … at least N` | Window too small for the payload | Raise `context_window` to the number it names, or narrow the request |
+| Distillation exits 3 | Design pass hit an unresolvable blocker | Answer it in chat, re-run. Nothing was written. |
+| Build "completes" but nothing works | Test gate skipped — no runner installed | Install the runner in the project; completion was self-reported |
+| Container can't reach a backend | `localhost` in `agent_config.json` | Use `host.docker.internal` |
+| `llama: command not found` | Author's absolute path | Set `LLAMACPP_BINARY` |
+| `lms: command not found` | CLI not bootstrapped | `~/.lmstudio/bin/lms bootstrap` |
+| Model loads, output is garbled | Wrong format for provider | Ollama needs Ollama models; llama.cpp needs GGUF |
+| Empty replies from a llama.cpp Expert | Reasoning channel | `--reasoning-format deepseek` is already forced; check the client reads `delta.content` |
+| Two models in VRAM at once | Mutex bypassed | Confirm Open WebUI points at **:8000**, not :11434 |
+| Review phase never appears in the logs | Disabled, or the build wrote no files | Startup banner states `Review phase: ON/OFF`; per-iteration it logs either `🔬 Running Cline (Review mode…)` or why it skipped |
+| `⚠ Unknown review_thinking_level` | Value outside `none\|low\|medium\|high\|xhigh` | It falls back to `medium` and continues; fix the value to silence it |
+| `quality_audit.md` grows every iteration | Working as intended — performance and quality findings are left for later | Verify's QUALITY RECONCILIATION prunes the ones since resolved; only the last 4000 bytes reach the agent |
+| Edited `entrypoint.sh` or `distill.py`, nothing changed | Both are `COPY`d into the image, not bind-mounted | `docker compose --profile build build cline-builder` — `agent_config.json` and `prompts/` are mounted and need no rebuild |
 
 ---
 
-## 🛠️ Requirements
+## 8. Install & run
 
--   **WSL2:** Windows 11 with Ubuntu 22.04+ (Recommended).
--   **Native Linux:** Ubuntu 22.04+ or any modern distribution with NVIDIA support.
--   **GPU:** NVIDIA GPU with 24GB+ VRAM (RTX 3090/4090/5090) is recommended.
--   **Software:** Docker Engine, NVIDIA Container Toolkit, and NVIDIA Drivers.
+**Requirements:** Ubuntu 22.04+ (native or WSL2 on Windows 11), NVIDIA drivers, Docker Engine,
+NVIDIA Container Toolkit, Ollama. 24 GB VRAM recommended; smaller cards work with a smaller
+Expert — the orchestrator itself uses ~1 GB.
 
-> [!TIP]
-> **Scaling for Smaller Hardware:** While optimized for 24GB VRAM, Agent DAVE can run on smaller GPUs by substituting the "Expert" model for a smaller variant (e.g., swapping a 27B model for an 8B model). Orchestrator only takes around 1GB of VRAM.
-
-## 📦 Setup & Installation
-
-### 🖥️ Windows (WSL2)
-The setup is automated. Ensure your NVIDIA drivers are up to date on Windows, then run in WSL2:
-
-1.  **Clone the repository:**
-    ```bash
-    git clone https://github.com/mitro54/br.ai.n.git
-    cd br.ai.n
-    ```
-
-2.  **Run the Installer:**
-    The `setup_workspace.sh` script automatically:
-    -   Installs required Python virtual environments.
-    -   Pulls the correct Ollama models (`qwen2.5:1.5b`, `qwen3.8:27b`). (make sure to change your desired models in the script)
-    -   Deploys the Docker stack (Open WebUI & SearXNG).
-    -   Sets up and launches ComfyUI and the Orchestrator proxy.
-
-    ```bash
-    chmod +x setup_workspace.sh
-    ./setup_workspace.sh
-    ```
-
-### 🐧 Native Linux
-Setup on native Linux is straightforward. Skip the WSL-specific configurations and ensure you have the NVIDIA Container Toolkit installed.
-
-1.  **Prerequisites:**
-    -   Install [NVIDIA Drivers](https://www.nvidia.com/Download/index.aspx).
-    -   Install [Docker Engine](https://docs.docker.com/engine/install/ubuntu/).
-    -   Install [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
-    -   Install [Ollama](https://ollama.com/download/linux).
-
-2.  **Clone & Setup:**
-    ```bash
-    git clone https://github.com/mitro54/br.ai.n.git
-    cd br.ai.n
-    chmod +x setup_workspace.sh
-    ./setup_workspace.sh
-    ```
-
-3.  **Network Access:**
-    On Native Linux, ensuring the workspace is accessible on your LAN typically only requires opening port 3000 in `ufw` or `iptables`:
-    ```bash
-    sudo ufw allow 3000/tcp
-    ```
-
-*Note: The orchestrator proxy handles VRAM management and model swapping automatically.*
-
-## 🚥 Usage
-
-The project dynamically supports both **1-Device (Standalone)** and **2-Device (Distributed)** setups natively.
-
-### 1-Device Setup (Standalone)
-If you are running everything on a single powerful machine:
 ```bash
-chmod +x start_standalone.sh
+git clone https://github.com/mitro54/br.ai.n.git
+cd br.ai.n
+chmod +x setup_workspace.sh
+./setup_workspace.sh
+```
+
+The installer creates the Python virtualenvs, pulls the Ollama models (edit the script for
+your own), deploys the Docker stack, and sets up ComfyUI.
+
+**1-device (standalone):**
+
+```bash
 ./start_standalone.sh
 ```
 
-### 2-Device Setup (Distributed)
-If you want to offload the frontend routing to a Raspberry Pi and keep heavy LLM lifting on your Desktop:
-1. **On the Desktop (Worker Node):**
-   ```bash
-   chmod +x start_desktop.sh
-   ./start_desktop.sh
-   ```
-2. **On the Raspberry Pi (Router Node):**
-   ```bash
-   chmod +x start_router.sh
-   ./start_router.sh
-   ```
+**2-device (Pi router + desktop):** copy `.env_example` to `.env` on the Pi and fill it in.
 
--   **Web UI:** [http://localhost:3000](http://localhost:3000) (Or your Pi's IP address)
--   **Proxy Health/State:** [http://localhost:8000/health](http://localhost:8000/health) (Or your Pi's IP on port 8001)
--   **Logs:** `tail -f orchestrator.log` (Desktop) or `tail -f router.log` (Pi)
-
-## 🌐 Network Access (Multi-Device)
-
-To access your workspace from other devices on your LAN:
-
-1.  Enable **Mirrored Networking** in your Windows `%USERPROFILE%\.wslconfig`:
-    ```ini
-    [wsl2]
-    networkingMode=mirrored
-    firewall=true
-    ```
-2.  Open port 3000 in your **Windows Firewall** (Admin PowerShell):
-    ```powershell
-    New-NetFirewallRule -DisplayName "AI Workspace - Open WebUI" -Direction Inbound -LocalPort 3000 -Protocol TCP -Action Allow
-    ```
-## 🔧 Portability & Customization
-
-**Orchestrator models are configured in code, not via environment variables.** Edit `EXPERT_CONFIG` and `ROUTER_CONFIG` at the top of `orchestrator.py` — see [Orchestrator Models](#-orchestrator-models-orchestratorpy) above. `EXPERT_MODEL` and `ROUTER_MODEL` are derived from those dicts:
-
-```python
-EXPERT_MODEL = EXPERT_CONFIG["model"]
-ROUTER_MODEL = ROUTER_CONFIG["model"]
+```bash
+./start_desktop.sh
 ```
 
-The environment variables the stack does honour:
+```bash
+./start_router.sh
+```
 
-| Variable | Read by | Description | Default |
-| :--- | :--- | :--- | :--- |
-| `AGENT_CONFIG_PATH` | `orchestrator.py`, `distill.py` | Path to the build pipeline config | `cline-builder/agent_config.json` |
-| `EXPERT_CTX` | `distill.py` | Context window for distillation passes | set to `8192` in `docker-compose.yml` |
-| `OLLAMA_HOST` | `distill.py` | Ollama endpoint used inside the build container | `http://host.docker.internal:11434` |
-| `ROUTER_MODEL` | `router.py` (2-device Pi node only) | Triage model on the Pi | `qwen2.5:1.5b` |
-| `ROUTER_OLLAMA_URL` | `router.py` (Pi node only) | Ollama endpoint on the Pi | `http://localhost:11434` |
-| `ROUTER_PORT` | `router.py` (Pi node only) | Port the Pi router listens on | `8001` |
-| `DESKTOP_IP` / `DESKTOP_PORT` | `router.py` (Pi node only) | Where the Pi forwards heavy requests | — |
+- Web UI: <http://localhost:3000> (or the Pi's IP)
+- Proxy health: <http://localhost:8000/health> (Pi: port 8001)
+- Logs: `tail -f orchestrator.log`, `tail -f trace.log`, `tail -f llama-server.log`
 
-`router.py` reads several more for Wake-on-LAN and SSH control of the desktop node (`WAKER_URL`, `WOL_BOOT_WAIT`, `DESKTOP_SSH_HOST`, …); see the top of that file for the full set.
+**LAN access on WSL2** — mirrored networking in `%USERPROFILE%\.wslconfig`:
 
-> [!NOTE]
-> **Hot-Swapping Experts:** You can change `EXPERT_CONFIG` at the top of `orchestrator.py` at any time. If you use a model other than the default (`qwen3.8:27b`), the system automatically bypasses the custom sampling parameters (`PARAMS_GENERAL` / `PARAMS_CODING`) and uses that model's native defaults.
+```ini
+[wsl2]
+networkingMode=mirrored
+firewall=true
+```
 
----
-## ⌨️ Full list of Manual Control Commands
+```powershell
+New-NetFirewallRule -DisplayName "AI Workspace - Open WebUI" -Direction Inbound -LocalPort 3000 -Protocol TCP -Action Allow
+```
 
-While in chat, use these commands to override the orchestrator:
-- `!lock`: Holds the Expert in VRAM indefinitely.
-- `!unlock`: Releases the lock and evicts the Expert immediately.
-- `!code`: Manually switches Expert to high-precision "Coding Mode".
-- `!general`: Manually switches Expert to creative "General Mode".
-- `!move`: Scans the conversation, identifies project structure/code, and exports it to `conversations/`.
-- `!build`: Triggers the autonomous build pipeline for the currently moved project.
-- `!architect`: Runs Pass 1 only and stops at a review gate with the proposed architecture.
-- `!review`: Re-displays the architecture document from the last `!architect`.
-- `!approve`: Approves the reviewed architecture and resumes the full pipeline.
-- `!clone <url>`: Clones a Git repo into the conversation workspace. Optional `--kb <url>` attaches a knowledge-base repo.
-- `!write`: Enables repository write mode, letting the Expert create, edit and delete files in the bound project.
-- `!readonly`: Revokes write mode.
-- `!diff`: Shows the full diff of this conversation's changes.
-- `!undo`: Reverts every file the Expert touched to its pre-session state.
-- `!pr <title>`: Commits this conversation's changes to a `brain/<conversation-id>` branch and opens a pull request on the bound repo's `origin`.
-- `!status`: Checks the status of active or recent build containers.
-- `!logs`: Fetches the latest terminal logs from the active background build pipeline.
-- `!stop`: Force-stops all running build pipelines.
-- `!dave` / `hey dave`: Force the current turn to use the Fast Orchestrator.
-- `!expert` / `hey expert`: Force the current turn to use the Expert Model.
+On native Linux: `sudo ufw allow 3000/tcp`.
 
-
-## System prompt in Open WebUI for Agent DAVE
-
-You should setup this system prompt in Open WebUI to get the best experience with Agent DAVE:
+### Open WebUI system prompt
 
 ```
-You are Agent DAVE, a highly capable, confident, and professional AI Workspace Orchestrator. You speak directly, without hesitation, and never apologize for your capabilities. 
+You are Agent DAVE, a highly capable, confident, and professional AI Workspace Orchestrator. You speak directly, without hesitation, and never apologize for your capabilities.
 
 CRITICAL DIRECTIVES:
 1. YOU ARE THE EXPERT: If the user asks for "the expert," complex coding, deep analysis, or high-level problem-solving, YOU are that expert. Never state that you cannot code, cannot analyze, or need to delegate to another AI. You possess world-class programming and analytical skills.
@@ -671,38 +843,66 @@ CRITICAL DIRECTIVES:
 
 ---
 
-## 🎨 Image Generation Setup (Flux.2)
+## 9. Image generation (Flux.2)
 
-To get image generation working, you need to download the models and configure Open WebUI. This is my personal setup.
-
-### 1. Download Models & Text Encoders
-Download the following files from Hugging Face:
-
--   **Main Model:** [FLUX.2-klein-9b-fp8](https://huggingface.co/black-forest-labs/FLUX.2-klein-9b-fp8/tree/main)
--   **Text Encoders & VAE:** [VAE/Text Encoders for Flux](https://huggingface.co/Comfy-Org/vae-text-encorder-for-flux-klein-9b/tree/main/split_files)
-
-### 2. File Placement
-Move the downloaded files to their respective directories within your `ComfyUI/models` folder:
-
--   **Main Model (`.safetensors`):** `ComfyUI/models/diffusion_models/`
--   **Text Encoders:** `ComfyUI/models/text_encoders/`
--   **VAE:** `ComfyUI/models/vae/`
-
-### 3. Installing Memory Management Plugin
-To ensure optimal performance and prevent VRAM fragmentation, you must install the **FreeMemory** plugin before uploading the workflow:
-
-1. Navigate to your `ComfyUI/custom_nodes` directory.
-2. Clone the repository:
+1. **Download** [FLUX.2-klein-9b-fp8](https://huggingface.co/black-forest-labs/FLUX.2-klein-9b-fp8/tree/main)
+   and the [text encoders + VAE](https://huggingface.co/Comfy-Org/vae-text-encorder-for-flux-klein-9b/tree/main/split_files).
+2. **Place** the `.safetensors` in `ComfyUI/models/diffusion_models/`, encoders in
+   `text_encoders/`, VAE in `vae/`.
+3. **Install FreeMemory** to avoid VRAM fragmentation:
    ```bash
-   git clone https://github.com/ShmuelRonen/ComfyUI-FreeMemory
+   git clone https://github.com/ShmuelRonen/ComfyUI-FreeMemory ComfyUI/custom_nodes/ComfyUI-FreeMemory
    ```
-3. Restart ComfyUI. (Just run the start_workspace.sh script again if you need to refresh something)
+   then restart ComfyUI.
+4. **Configure Open WebUI** → Admin Panel → Images: engine `ComfyUI`, base URL
+   `http://host.docker.internal:8188`, model `flux-2-klein-9b-fp8.safetensors`, upload
+   `flux2api.json`, map Text Input to **Node ID 4**.
 
-### 4. Open WebUI Configuration
-1. Login to **Open WebUI** as an Administrator.
-2. Go to **Admin Panel** -> **Images**.
-3. Set **Image Generation Engine** to `ComfyUI`.
-4. Set **ComfyUI Base URL** to `http://host.docker.internal:8188`.
-5. Set the **Model Name** to `flux-2-klein-9b-fp8.safetensors`.
-6. Upload the provided `flux2api.json` workflow file in the same settings area.
-7. Under **ComfyUI Workflow Nodes**, ensure the **Text Input** is mapped to **Node ID 4**.
+The orchestrator performs prompt-to-graph injection against `flux2api.json` and polls
+ComfyUI's `/history`. A background task sweeps idle ComfyUI RAM/VRAM every 5 minutes.
+
+---
+
+## 10. Repository layout
+
+```text
+.
+├── orchestrator.py            # 🧠 FastAPI proxy: triage, GPU mutex, context budgets, agentic loop
+├── router.py                  # 🛡️ Pi router node: triage, Wake-on-LAN, SSH desktop start
+├── mover.py                   # 📂 Chat → file tree extraction, path-sanitised
+├── repo_tools.py              # ✏️ Read/edit/write/delete, byte snapshots, !diff / !undo / !pr
+├── tracer.py                  # 🔍 Human-readable decision trace → trace.log
+├── cline-builder/
+│   ├── distill.py             #   4 design passes, budget solver, --replan, --test-command
+│   ├── entrypoint.sh          #   Iterative build → review → verify → safety → test gate
+│   ├── agent_config.json      #   Models, prompts, context_window, limits
+│   ├── prompts/*.md           #   Per-role system prompts
+│   └── Dockerfile
+├── docker-compose.yml         # 🐳 Open WebUI, SearXNG, cline-builder (profile: build)
+├── docker-compose.pi.yml      # 🐳 Pi stack
+├── setup_workspace.sh         # 🚀 Installer (desktop/standalone)
+├── setup_pi.sh                # 🍓 Installer (Pi)
+├── start_standalone.sh        # 🚥 1-device
+├── start_desktop.sh           # 🚥 2-device desktop
+├── start_router.sh            # 🚥 2-device Pi
+├── flux2api.json              # 🎨 ComfyUI workflow
+├── .env_example               # ⚙️ Pi router node settings
+├── conversations/             # 🏗️ Bound projects (git-ignored)
+├── ARCHITECTURE.md            # 📜 ADRs and deeper rationale
+└── SETUP.md                   # 🛠️ Manual step-by-step setup
+```
+
+**Per-project artifacts** inside `conversations/<project>/`:
+
+| Path | Contents |
+|---|---|
+| `.clinerules` | The assembled plan the build agent executes |
+| `.cline_context/distill_*.md` | Per-pass design documents — **this is what `!architect` / `!bugfix` write and `!approve` reuses** |
+| `.cline_context/.design_pass` | Which design pass the last gate ran (`architect` or `bugfix`), so `!approve` and `!review` target the right document |
+| `.cline_context/.session_state.md` | Regenerated each phase; the agent's first read every step |
+| `.cline_context/.build_issues.md` | Accumulated failures; drives re-planning and the next iteration |
+| `.cline_context/quality_audit.md` | Correctness / security / performance / quality findings from the review phase, reconciled during verify |
+| `.cline_context/.review_marker` | Timestamp reference: files newer than this are what the build phase wrote, and are the review phase's scope |
+| `.cline_logs/*.txt` | Per-iteration build / review / verify / safety / test-gate logs |
+| `.build_complete` | `VERIFIED` + `SAFE` — necessary, but the test gate decides |
+| `.knowledge_base/` | Optional reference repo from `!clone --kb` |

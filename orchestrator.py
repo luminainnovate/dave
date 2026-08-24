@@ -1,5 +1,6 @@
 import asyncio
 import httpx
+import inspect
 import json
 import logging
 import os
@@ -29,8 +30,21 @@ logger = logging.getLogger("Bob-Orchestrator")
 #     "provider": "llamacpp",
 #     "base_url": "http://localhost:8081",
 # }
+# PORT 8081, NOT 8080. 8080 is the default for approximately every dev HTTP
+# server, and the project this pipeline was being used to fix serves its own API
+# there (Backend/.env.example: PORT=8080). Bring that app up to test a fix while
+# a pass is running and llama-server cannot bind:
+#
+#   E srv start: couldn't bind HTTP server socket, hostname: 0.0.0.0, port: 8080
+#
+# The spawn then dies with exit code 1 and the design pass fails on a model that
+# never loaded - which looks like a GPU or model problem and is neither. Wanting
+# the app running while diagnosing it is the normal case, not an edge case, so
+# the model server keeps a port nothing else wants. Changing it here means
+# changing every base_url in cline-builder/agent_config.json too; the container
+# reaches the same process through host.docker.internal.
 EXPERT_CONFIG = {
-   "model": "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL",
+    "model": "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL",
     "provider": "llamacpp",
     "base_url": "http://localhost:8081",
 }
@@ -45,6 +59,38 @@ ROUTER_CONFIG = {
     "base_url": "http://localhost:11434",
 }
 
+# --- Router placement ---
+# The Router runs in system RAM, not VRAM. num_gpu=0 is an Ollama-native option
+# (it has no equivalent on the OpenAI-compatible /v1 path, so this only takes
+# effect while ROUTER_CONFIG stays on the ollama provider).
+#
+# Two reasons, both measured on qwen2.5:1.5b:
+#
+#  - It costs VRAM the Expert now needs. On the chat path the Router was being
+#    handed num_ctx=EXPERT_CTX, which is 1.56 GiB of weights+KV; at
+#    LLAMACPP_SERVER_CTX there are ~577 MiB spare. A simple chat query arriving
+#    during a warm build was a collision waiting to happen.
+#  - It is FASTER off the GPU. The old keep_alive=0 existed to protect VRAM, so
+#    every triage paid a full load: 2.7-3.0s per call. Resident in RAM it is
+#    0.58-0.90s, because nothing has to be evicted to make room for it.
+#
+# Long prompts will be slower on CPU than they were on GPU. Triage caps its
+# input at 1000 chars so it never notices; the chat path has no such cap, which
+# is the one place this trade is visible.
+ROUTER_ON_CPU = True
+ROUTER_KEEP_ALIVE = "30m"  # free to hold, now that holding it costs no VRAM
+ROUTER_CTX = 8192          # generous for triage-grade turns; EXPERT_CTX was not
+                           # a considered value here, just the fall-through
+
+
+def _router_options(**overrides) -> dict:
+    """Sampling/placement options for a Router call, with CPU pinning applied."""
+    options = {"temperature": 0.0, "num_ctx": ROUTER_CTX}
+    options.update(overrides)
+    if ROUTER_ON_CPU:
+        options["num_gpu"] = 0
+    return options
+
 # Shorthand names (derived from config, used in routing logic throughout)
 EXPERT_MODEL = EXPERT_CONFIG["model"]
 ROUTER_MODEL = ROUTER_CONFIG["model"]
@@ -52,13 +98,71 @@ DEFAULT_EXPERT_MODEL = "qwen3.8:27b" # Keep this as default, if you know what yo
 
 # llama.cpp managed process settings (only used when provider is "llamacpp")
 LLAMACPP_BINARY = "/home/jonathan/.local/bin/llama"  # llama.app unified binary (serves via the `serve` subcommand)
-LLAMACPP_DEFAULT_ARGS = ["--cache-type-k", "q8_0", "--cache-type-v", "q8_0"]  # Extra CLI args (KV Quant enabled)
+# KV cache quantisation. Not optional at LLAMACPP_SERVER_CTX: 128k of f16 KV
+# does not fit beside a 27B Q4 on a 24GB card, and -ngl all would fail. At q8_0
+# the whole thing loads at 23999 MiB of 24576 and still generates at 33.7 tok/s
+# (measured), against ~36 tok/s at 64k/f16.
+#
+# That leaves ~577 MiB of headroom, which is the real cost of this setting: any
+# other process that wakes up on the GPU mid-build will OOM the server. Drop
+# LLAMACPP_SERVER_CTX to 114688 if you need the margin back - Cline's compaction
+# should still fire below that, though it is closer to the line.
+LLAMACPP_DEFAULT_ARGS = ["--cache-type-k", "q8_0", "--cache-type-v", "q8_0"]
 
 COMFYUI_URL = "http://localhost:8188"
-EXPERT_CTX = 65536    # Context for the expert model (64k) - 128k of KV crowds the
-                      # weights off the GPU on a 24GB card; halve it to fit -ngl all
-DISTILL_CTX = 65536   # Context for the distillation engine (64k) - see EXPERT_CTX
-CLINE_CTX = 65536     # Context for the Cline agent (64k) - see EXPERT_CTX
+
+# The window the shared llama.cpp server is started with. This is a property of
+# the SERVER, not of whoever asked for it: distill and the Cline agent talk to
+# one process, and the larger requirement wins.
+#
+# 128k because the Cline CLI hardcodes contextWindow=128000 for every
+# openai-compatible provider (verified in its binary) and there is no flag to
+# tell it otherwise. Its context compaction fires against that figure, so on a
+# 64k server compaction never triggered before the real wall: the conversation
+# grew 25883 -> 32903 -> 38153 -> 45445 -> 53384 -> 61927 -> 65535 and the run
+# died on 'length' with a half-emitted tool call one turn earlier. Anything
+# below Cline's assumption reproduces that.
+#
+# It only fits with KV quantisation - see LLAMACPP_DEFAULT_ARGS.
+LLAMACPP_SERVER_CTX = 131072
+
+# How long a llama.cpp server gets to answer /health before the load is called
+# failed. Both the waiter and the background poller read this - they were two
+# separate 120.0 literals, which is the kind of pair that drifts.
+#
+# 120s was sized for the old 64k f16 load and is not the measured cost of this
+# one. Warm loads here are ~5s at 8k and ~20-26s at 128k with q8_0 KV, so the
+# budget is generous either way; it exists for the cold case (a 16.7GB read
+# that is not in page cache, behind a GPU lock that may already be held by
+# another load). A start that genuinely needs longer than this is not slow,
+# it is stuck, and should fail rather than hold the pipeline open.
+LLAMACPP_STARTUP_TIMEOUT = 300.0
+
+EXPERT_CTX = 65536    # Context the EXPERT's own calls are budgeted against (64k).
+                      # Deliberately below LLAMACPP_SERVER_CTX: the server offers
+                      # 128k, and using less of it is free.
+DISTILL_CTX = 131072  # Context for the distillation engine. Reaches the container
+                      # as EXPERT_CTX (see the pipeline launch below), where it is
+                      # the ceiling solve_addendum_budget divides up.
+                      #
+                      # Was 65536, and unlike EXPERT_CTX that was not free. A
+                      # bugfix pass whose payload is ~39k tokens of conversation
+                      # left ~2.9k tokens for evidence: a 4-file blocker asking
+                      # for 65678 chars got 8607, enough for one truncated file.
+                      # Matching LLAMACPP_SERVER_CTX is what makes a multi-file
+                      # blocker answerable in a single round.
+                      #
+                      # Costs no VRAM: llama.cpp allocates the KV cache for the
+                      # server's -c up front, so a smaller window here reserved
+                      # the memory and then declined to use it. Raise
+                      # LLAMACPP_SERVER_CTX first if this ever goes above it -
+                      # the server is the real ceiling and rejects an over-long
+                      # prompt outright with exceed_context_size_error.
+CLINE_CTX = 131072    # Window the Cline agent is EXPECTED to run at. This is an
+                      # assertion, not a setting - entrypoint.sh reads the window
+                      # actually in force from the server and aborts the build if
+                      # it is short of what Cline assumes. Raising this alone does
+                      # nothing; raise LLAMACPP_SERVER_CTX with it.
 
 # Tool-calling budget for one turn. Each hop is a full Expert inference over the
 # whole conversation, so this is the main lever on how long a tool-using turn
@@ -67,12 +171,37 @@ CLINE_CTX = 65536     # Context for the Cline agent (64k) - see EXPERT_CTX
 AGENT_MAX_HOPS = 8        # read-only turns
 AGENT_MAX_HOPS_WRITE = 12  # write-enabled turns
 
+# --- CONTEXT BUDGET ---
+# Everything the orchestrator puts in front of the Expert is sized against
+# EXPERT_CTX rather than against standalone literals, so halving the window
+# halves the budgets with it instead of silently overflowing.
+#
+# The divisor matches distill.py's est_tokens(): deliberately pessimistic, so a
+# budget error costs headroom rather than a truncated prompt.
+CHARS_PER_TOKEN_DENSE = 3
+
+# Raw conversation history. The remainder covers what the pruner never sees -
+# PROJECT_CONTEXT, tool schemas, tool results, and the reply itself.
+HISTORY_BUDGET_FRACTION = 0.45
+
+# @file mentions. These are read whole off disk into the system message, after
+# the pruner has already run, so nothing downstream bounds them.
+MENTION_BUDGET_FRACTION = 0.08
+
+# Tool results across one turn. A write turn is 12 hops and each hop can return
+# a full file, so the per-turn total is the figure that matters, not the
+# per-call one.
+TOOL_RESULT_BUDGET_FRACTION = 0.22
+
+# Smallest useful clipped tool result. Under this, suppress and say so.
+TOOL_RESULT_MIN_CHARS = 512
+
 # --- STATE MANAGEMENT ---
 gpu_lock = asyncio.Lock()
 http_client: httpx.AsyncClient = None
 vram_locked = False
 expert_warm_until = 0
-expert_mode = "general"  # "general" or "coding"
+expert_mode = "coding"  # "general" or "coding"
 last_comfy_history_count = 0  # Track ComfyUI history count for automated pings
 
 # --- EXPERT PARAMETERS (Thinking Modes) ---
@@ -169,11 +298,51 @@ def _adapt_body(body: dict, config: dict) -> dict:
     return adapted
 
 
-def _prune_messages(messages: list, max_chars: int = 90000) -> list:
+def _clip_text(text: str, limit: int, what: str) -> str:
+    """
+    Cut a string to a character budget, keeping both ends.
+
+    Head and tail are both kept because the two things being clipped want
+    opposite halves: a source file leads with imports and declarations, a build
+    log ends with the error. The elision is stated inline so the model knows it
+    is looking at an excerpt and can ask for the rest.
+    """
+    if limit <= 0 or len(text) <= limit:
+        return text
+    head = int(limit * 0.7)
+    tail = limit - head
+    omitted = len(text) - limit
+    return (f"{text[:head]}\n\n"
+            f"... [{omitted} characters of {what} elided to fit the context window; "
+            f"request a specific region if you need it] ...\n\n"
+            f"{text[-tail:]}")
+
+
+def _history_budget_chars() -> int:
+    """
+    How much of the Expert's window the raw conversation may occupy.
+
+    This used to be a flat 90000, a number with no relationship to EXPERT_CTX.
+    It happened to be safe at 64k and would have become an overflow the moment
+    the window was reduced - which is exactly the kind of change the context
+    accounting invites. Derived here instead, so the two move together.
+
+    HISTORY_BUDGET_FRACTION leaves the remainder for what the history does not
+    include and the pruner never sees: the injected PROJECT_CONTEXT, the tool
+    schemas, the tool results accumulated across a turn's hops, and the model's
+    own reply.
+    """
+    return int(EXPERT_CTX * CHARS_PER_TOKEN_DENSE * HISTORY_BUDGET_FRACTION)
+
+
+def _prune_messages(messages: list, max_chars: int = None) -> list:
     """
     In-place pruner that ensures the conversation remains below a safe threshold.
     Preserves the system message (first) and the most recent turns (last 4).
     """
+    if max_chars is None:
+        max_chars = _history_budget_chars()
+
     if not messages or len(messages) <= 5:
         return messages
 
@@ -273,7 +442,14 @@ async def _start_llamacpp_server(config: dict):
 
         # Parse config for startup
         base_url = config.get("base_url", "http://localhost:8081")
-        extra_args = list(config.get("args", LLAMACPP_DEFAULT_ARGS))
+        # `or`, not a .get default: distill.py normalises a config entry with no
+        # "args" into an explicit "args": [] (see _resolve_model_config), and that
+        # empty list is POSTed to /internal/model/load. A .get default never fires
+        # for a key that is present, so every pipeline pass started without the KV
+        # quantisation in LLAMACPP_DEFAULT_ARGS and OOMed at LLAMACPP_SERVER_CTX.
+        # Harmless at 64k, where f16 KV still fit. An explicitly empty args list is
+        # not a supported way to opt out of the floor those defaults represent.
+        extra_args = list(config.get("args") or LLAMACPP_DEFAULT_ARGS)
         binary = config.get("binary_path", LLAMACPP_BINARY)
 
         # Parse host/port from base_url
@@ -283,8 +459,13 @@ async def _start_llamacpp_server(config: dict):
         # via host.docker.internal, otherwise 127.0.0.1 blocks them.
         host = "0.0.0.0"
 
-        # Context window: use config override, or fall back to EXPERT_CTX
-        ctx_size = str(config.get("ctx_size", EXPERT_CTX))
+        # Context window. One server serves both distill and the Cline agent, so
+        # the largest requirement decides - a caller asking for less must not
+        # shrink the window out from under the other. distill sends
+        # ctx_size=CONTEXT_WINDOW (64k) on its preload; honouring that literally
+        # would start the server at 64k and put the agent straight back into the
+        # wall this constant exists to clear.
+        ctx_size = str(max(int(config.get("ctx_size", EXPERT_CTX)), LLAMACPP_SERVER_CTX))
 
         # Context rotation: llama-server natively supports sliding window truncation
         # Set to 0.7 to give massive breathing room and reduce rotation frequency.
@@ -303,7 +484,12 @@ async def _start_llamacpp_server(config: dict):
         # (Note: --reasoning-preserve is unrelated - it keeps traces in full history,
         #  which only inflates context for the multi-turn agent.)
         truncate_args = [
-            "--context-shift",
+            # --context-shift was here and did nothing for the failure it looked
+            # like insurance against. Measured: a request whose PROMPT exceeds
+            # the window is rejected outright with HTTP 400
+            # exceed_context_size_error, shift or no shift - it only ever applied
+            # to generation overrunning the window. Leaving it in advertised a
+            # protection that was not there.
             "--slot-prompt-similarity", "0.95",
             "--batch-size", "1024",
             "--ubatch-size", "1024",
@@ -314,7 +500,32 @@ async def _start_llamacpp_server(config: dict):
             "-ngl", "all",
             # The vision projector (mmproj-BF16.gguf, 931 MB) is pulled in
             # automatically by -hf. The Expert is text-only, so skip it.
-            "--no-mmproj"
+            "--no-mmproj",
+            # Reasoning effort. The model's own template defaults
+            # reasoning_effort to 'xhigh' whenever thinking is on, and the Cline
+            # build agent sends no chat_template_kwargs at all - so the agent ran
+            # at maximum effort with no output bound and burned a whole 64k slot
+            # on one turn (n_decoded=36937) before llama.cpp ended it on 'length'.
+            # This is the server-side default for clients that cannot set it;
+            # distill.py sends its own per-pass value, which overrides this.
+            # Only 'xhigh', 'medium' and 'low' are accepted ('high' aliases to
+            # 'xhigh'); anything else - including the 'none' the vendor docs
+            # list - hits raise_exception in the template and fails the request.
+            "--chat-template-kwargs", '{"reasoning_effort":"low"}',
+            # Never carry a thinking trace into the next turn. The flag defaults
+            # to the template default and this template declares no
+            # 'supports_preserve_reasoning', so this is belt-and-braces - but it
+            # states the intent, and preserved traces would inflate the agent's
+            # context exactly where it is already tightest.
+            "--no-reasoning-preserve",
+            # Sampling: the model card's thinking-mode figures. llama.cpp's own
+            # defaults (temp 0.80, top-k 40, min-p 0.05) are not these, and the
+            # Cline agent sends no sampler settings, so without this it inherits
+            # the wrong ones for every build turn.
+            "--temp", "1.0",
+            "--top-p", "0.95",
+            "--top-k", "20",
+            "--min-p", "0.0",
         ]
         # "--spec-type", "draft-mtp"
 
@@ -344,16 +555,29 @@ async def _start_llamacpp_server(config: dict):
     # Wait for the background task to signal readiness
     # This happens OUTSIDE the lock, so other requests can enter and 'wait' for the same event
     try:
-        await asyncio.wait_for(ready_event.wait(), timeout=120.0)
+        await asyncio.wait_for(ready_event.wait(), timeout=LLAMACPP_STARTUP_TIMEOUT)
         logger.info(f"llama.cpp: {model} is confirmed ready.")
     except asyncio.TimeoutError:
-        logger.error(f"llama.cpp: Timeout waiting for {model} readiness.")
-        raise Exception(f"Model startup timed out: {model}")
+        logger.error(f"llama.cpp: Timeout waiting for {model} readiness "
+                     f"({LLAMACPP_STARTUP_TIMEOUT:.0f}s).")
+        # Tear the half-started process down rather than orphaning it.
+        #
+        # Two reasons. It latches: the entry stays in _managed_processes with
+        # poll() is None and the event unset, so the next attempt takes the
+        # "already starting, waiting for readiness" branch and waits out the
+        # whole timeout again against a poll task that has already exited.
+        # And SIGTERM lets the server flush its stdio - the process that timed
+        # out at 15:24 wrote NOTHING to llama-server.log, because the eventual
+        # SIGKILL took its buffered startup log with it and left the one
+        # question that mattered (what was it doing for two minutes?)
+        # unanswerable.
+        await _stop_llamacpp_server({"model": model})
+        raise Exception(f"Model startup timed out after {LLAMACPP_STARTUP_TIMEOUT:.0f}s: {model}")
 
 
 async def _poll_llamacpp_health(model: str, base_url: str, ready_event: asyncio.Event):
     """Background task to poll a model's health and signal readiness."""
-    deadline = time.time() + 120
+    deadline = time.time() + LLAMACPP_STARTUP_TIMEOUT
     while time.time() < deadline:
         # Verify the process is still running
         if model in _managed_processes:
@@ -559,7 +783,13 @@ async def sweep_vram_for_expert():
     """
     Ensures the Router model is removed before loading the Expert model.
     This prevents VRAM fragmentation and avoids offloading to slower system RAM.
+
+    No-op once the Router is pinned to CPU: it holds no VRAM to reclaim, so the
+    unload would free nothing and throw away a warm model that costs 2.7-3.0s to
+    load again - the exact per-call price ROUTER_ON_CPU exists to stop paying.
     """
+    if ROUTER_ON_CPU:
+        return
     loaded = await get_loaded_models()
     if any(ROUTER_MODEL in m for m in loaded):
         logger.info("Sweeping VRAM for Expert model load.")
@@ -661,8 +891,8 @@ async def analyze_request(messages: list) -> dict:
                 {"role": "user", "content": context_text[:1000]}
             ],
             "stream": False,
-            "keep_alive": 0,
-            "options": {"temperature": 0.0, "num_ctx": 2048}
+            "keep_alive": ROUTER_KEEP_ALIVE,
+            "options": _router_options(num_ctx=2048)
         }
         url = f"{_get_base_url(router_config)}/api/chat"
     else:
@@ -1197,7 +1427,8 @@ async def proxy_ollama(request: Request):
                 asyncio.create_task(free_comfyui())
 
         # Rule E: Suppress background tasks following maintenance commands
-        maintenance_commands = ["!status", "!stop", "!move", "!build", "!lock", "!unlock",
+        maintenance_commands = ["!status", "!stop", "!move", "!build", "!architect",
+                                "!bugfix", "!approve", "!review", "!lock", "!unlock",
                                 "!write", "!readonly", "!undo", "!diff", "!pr"]
         is_maintenance_followup = False
         if is_background_task and len(messages) >= 3:
@@ -1254,31 +1485,64 @@ async def proxy_ollama(request: Request):
             logger.info("Command: Switched to General Mode.")
         elif "!move" in prompt_lower:
             logger.info("Command: Move initiated.")
-            success = mover.handle_move(messages)
+            # VS Code only opens when explicitly requested via `!move --open`.
+            success = mover.handle_move(messages, open_editor="--open" in prompt_lower)
             msg = "Files moved!" if "Moved" in success else "Files failed to move!"
             return _command_response(msg, is_streaming, is_native)
         elif "!architect" in prompt_lower:
             logger.info("Command: Architect review gate triggered.")
-            review_msg = await _run_architect_review(messages)
-            return _command_response(review_msg, is_streaming, is_native)
+            return await _maybe_await(_progress_command_response(
+                _run_design_review(messages, "architect", streaming=is_streaming),
+                is_streaming, is_native))
+        elif "!bugfix" in prompt_lower:
+            logger.info("Command: Bugfix review gate triggered.")
+            return await _maybe_await(_progress_command_response(
+                _run_design_review(messages, "bugfix", streaming=is_streaming),
+                is_streaming, is_native))
         elif "!approve" in prompt_lower:
-            logger.info("Command: Architecture approved; resuming full build.")
-            path = _architect_review_path(messages)
+            design_pass = _read_design_pass(messages)
+            ui = _DESIGN_PASS_UI[design_pass]
+            logger.info(f"Command: {design_pass} approved; resuming full build.")
+            path = _design_review_path(messages, design_pass)
             if not path or not os.path.exists(path):
                 return _command_response(
-                    "⚠️ **Nothing to approve.** Run `!architect` first to generate an architecture.",
+                    "⚠️ **Nothing to approve.** Run `!architect` or `!bugfix` first to "
+                    "generate a plan.",
+                    is_streaming, is_native
+                )
+            # Refuse here rather than letting the container discover it: the
+            # pipeline stops on the same condition, but only after a cold model
+            # load and a full re-run of the design pass.
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    unverified = UNVERIFIED_MARKER in f.read()
+            except Exception:
+                unverified = False
+            if unverified:
+                return _command_response(
+                    f"🛑 **Not approving an unverified diagnosis.**\n\n"
+                    f"The reproduction in `{path}` never failed the way the diagnosis "
+                    f"predicts, so nothing here has been confirmed against running code. "
+                    f"Building it would be a fix for a bug nobody has seen happen.\n\n"
+                    f"- **Re-run with a sharper symptom:** `!bugfix <what you observe>`\n"
+                    f"- **Override:** fix section 2 in that file and delete the "
+                    f"UNVERIFIED banner, then `!approve` again.\n"
+                    f"- **Read it first:** `!review`",
                     is_streaming, is_native
                 )
             approve_msg = await _trigger_build_pipeline_safe(
                 messages,
-                extra_env={"DISTILL_RESUME": "1"},
-                mode_label="Approved (resuming from reviewed architecture)",
+                extra_env={"DISTILL_RESUME": "1", "DISTILL_DESIGN_PASS": design_pass},
+                mode_label=f"Approved (resuming from reviewed {ui['noun']})",
                 skip_cooldown=True,
             )
             return _command_response(approve_msg, is_streaming, is_native)
         elif "!review" in prompt_lower:
-            logger.info("Command: Architecture review requested.")
-            return _command_response(_read_architect_review(messages), is_streaming, is_native)
+            design_pass = _read_design_pass(messages)
+            logger.info(f"Command: {design_pass} review requested.")
+            return _command_response(
+                _read_design_review(messages, design_pass), is_streaming, is_native
+            )
         elif "!build" in prompt_lower:
             logger.info("Command: Build pipeline triggered.")
             build_msg = await _trigger_build_pipeline_safe(messages)
@@ -1454,7 +1718,7 @@ async def proxy_ollama(request: Request):
         for m in messages:
             if m.get("role") == "system":
                 content = str(m.get("content", "")).lower()
-                if "you are cline" in content or "distillation" in content or "architect" in content or "engineer" in content:
+                if "you are cline" in content or "distillation" in content or "architect" in content or "bugfix" in content or "engineer" in content:
                     is_agent_request = True
                     break
 
@@ -1566,8 +1830,13 @@ async def proxy_ollama(request: Request):
         options = body.get("options", {})
         if is_background_task:
             options.update({"temperature": 0.0, "num_ctx": 2048})
-            # If the expert is warm or a build is active, force the Router to unload immediately
-            if expert_warm_until > time.time() or vram_locked:
+            if ROUTER_ON_CPU and target_model == ROUTER_MODEL:
+                options["num_gpu"] = 0
+            # If the expert is warm or a build is active, force the Router to unload
+            # immediately. Skipped for a CPU-pinned Router: it is not competing for
+            # the VRAM this is trying to protect, and unloading it only guarantees a
+            # cold load on the next background task.
+            elif expert_warm_until > time.time() or vram_locked:
                 keep_alive = 0
                 logger.info("Background task detected in build context: Forcing immediate Router unload.")
         elif target_model == EXPERT_MODEL:
@@ -1580,6 +1849,12 @@ async def proxy_ollama(request: Request):
                 logger.info(f"Non-default expert {EXPERT_MODEL} detected; using default model settings.")
             
             options["num_ctx"] = EXPERT_CTX
+        elif target_model == ROUTER_MODEL:
+            # EXPERT_CTX here was the fall-through, not a decision: it asked a 1.5B
+            # model for a 64k window, which Ollama clamps to its trained 32k and
+            # sizes at 1.56 GiB. ROUTER_CTX is the considered value, and num_gpu
+            # keeps the whole thing out of VRAM.
+            options.update(_router_options(temperature=options.get("temperature", 0.7)))
         else:
             options.update({"temperature": options.get("temperature", 0.7), "num_ctx": EXPERT_CTX})
 
@@ -1705,6 +1980,78 @@ def _command_response(text: str, is_streaming: bool = False, is_native: bool = F
     return StreamingResponse(_generator(), media_type="application/x-ndjson" if is_native else "text/event-stream")
 
 
+async def _maybe_await(value):
+    """
+    Await a coroutine, pass a plain value through.
+
+    _progress_command_response returns a StreamingResponse directly but a
+    coroutine on the blocking path, because the blocking path has to drain the
+    generator before it knows the body. One helper keeps both call sites a
+    single expression.
+    """
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+def _progress_command_response(agen, is_streaming: bool = False, is_native: bool = False):
+    """
+    Response for a command that reports progress while it works.
+
+    Takes the (is_final, text) generator described on _run_design_review. A
+    streaming client gets every item as it happens; a blocking one gets only the
+    final text, exactly as before. The distinction matters because the router
+    forwards with httpx.Timeout(700.0), which for a stream is the gap between
+    chunks - so a stream that keeps talking survives a 45-minute pass, and a
+    blocking call cannot and must not try.
+    """
+    if not is_streaming:
+        async def _drain() -> str:
+            final = ""
+            async for is_final, text in agen:
+                if is_final:
+                    final = text
+            return final
+
+        async def _blocking():
+            text = await _drain()
+            tracer.final(text, label="COMMAND (handled by the orchestrator, no model call)")
+            if is_native:
+                return JSONResponse(content={"model": "Bob", "message": {"role": "assistant", "content": text}, "done": True})
+            return JSONResponse(content={
+                "id": "chatcmpl-Bob", "object": "chat.completion", "created": int(time.time()), "model": "Bob",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            })
+        return _blocking()
+
+    async def _generator():
+        final = ""
+        try:
+            async for is_final, text in agen:
+                if is_final:
+                    final = text
+                if is_native:
+                    yield f"{json.dumps({'model': 'Bob', 'message': {'role': 'assistant', 'content': text}, 'done': False})}\n".encode("utf-8")
+                else:
+                    chunk = {
+                        "id": "chatcmpl-Bob", "object": "chat.completion.chunk",
+                        "created": int(time.time()), "model": "Bob",
+                        "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
+                    }
+                    yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
+        finally:
+            # In a finally so a disconnected client still closes the transcript
+            # rather than leaving the turn open in the trace.
+            tracer.final(final, label="COMMAND (handled by the orchestrator, no model call)")
+        if is_native:
+            yield f"{json.dumps({'model': 'Bob', 'done': True})}\n".encode("utf-8")
+        else:
+            yield b"data: [DONE]\n\n"
+
+    return StreamingResponse(_generator(), media_type="application/x-ndjson" if is_native else "text/event-stream")
+
+
 PATH_TOOLS = ("orchestrator_read_file", "orchestrator_expand_dir")
 
 
@@ -1817,7 +2164,20 @@ async def _handle_agentic_request(body: dict, project_dir: str, target_url: str,
     """
     MAX_HOPS = max_hops
     current_hops = 0
-    
+
+    # Tool results are the last unbounded input to the Expert. Each hop appends a
+    # full result to the message list and re-sends the whole thing, and the list
+    # never passes through _prune_messages again - so a 12-hop write turn that
+    # reads a few large files grows the prompt without limit until the server
+    # truncates it, silently, from the front.
+    #
+    # One budget for the whole turn rather than a per-call cap: hop 1 reading one
+    # big file and hop 9 reading nine small ones cost the same and both have to
+    # fit. Per call, half the turn's budget, so no single result can starve the
+    # rest of the loop.
+    tool_budget = int(EXPERT_CTX * CHARS_PER_TOKEN_DENSE * TOOL_RESULT_BUDGET_FRACTION)
+    tool_result_chars = 0
+
     original_messages = body.get("messages", [])
     # For response parsing: native Ollama format only when backend is Ollama AND client is native
     response_is_native = backend_is_ollama and is_native
@@ -1876,6 +2236,24 @@ async def _handle_agentic_request(body: dict, project_dir: str, target_url: str,
                 tool_started = time.monotonic()
                 result = await asyncio.to_thread(_execute_tool, name, args, project_dir, conv_id)
                 tracer.tool_result(name, result, time.monotonic() - tool_started)
+
+                raw_len = len(result)
+                per_call_cap = min(tool_budget // 2, max(0, tool_budget - tool_result_chars))
+                # Below the floor a clip returns a stub with two elision markers
+                # and almost no content, which reads as a broken tool rather than
+                # an exhausted budget. Say what actually happened instead.
+                if per_call_cap < TOOL_RESULT_MIN_CHARS:
+                    result = (f"[Tool result suppressed: this turn's tool-output budget "
+                              f"({tool_budget} characters) is spent. Summarise what you "
+                              f"have and answer, or narrow the request.]")
+                else:
+                    result = _clip_text(result, per_call_cap, f"{name} output")
+                tool_result_chars += min(raw_len, per_call_cap)
+                if len(result) < raw_len:
+                    logger.info(f"[Context Budget] Clipped {name} result "
+                                f"{raw_len} -> {len(result)} chars "
+                                f"({tool_result_chars}/{tool_budget} spent this turn).")
+                    tracer.note(f"tool result clipped: {name} {raw_len} → {len(result)} chars")
 
                 tool_msg = {
                     "role": "tool",
@@ -2062,11 +2440,22 @@ def _get_symbol_skeleton(project_dir: str) -> str:
 
 
 def _parse_file_mentions(text: str, project_dir: str) -> str:
-    """Detects @filename mentions and reads their content."""
+    """
+    Detects @filename mentions and reads their content.
+
+    Bounded as a group, not per file. The mentions are concatenated into the
+    system message after _prune_messages has already run, so a turn mentioning
+    four large files used to add unbounded content to a prompt nothing further
+    downstream measures. Each file is clipped to what is left of the budget, and
+    once it is spent the remaining mentions are named rather than read - the
+    model can still see they exist and ask for one with a tool call.
+    """
     mentions = re.findall(r"@([a-zA-Z0-9_\-\./\\]+\.[a-zA-Z0-9]+)", text)
     if not mentions:
         return ""
-        
+
+    remaining = int(EXPERT_CTX * CHARS_PER_TOKEN_DENSE * MENTION_BUDGET_FRACTION)
+    deferred = []
     context_blocks = ["\n[REQUESTED FILE CONTENT]"]
     for filename in mentions:
         # Search for file in project_dir
@@ -2086,14 +2475,25 @@ def _parse_file_mentions(text: str, project_dir: str) -> str:
                 break
             
         if found_path:
+            rel = os.path.relpath(found_path, project_dir)
+            if remaining <= 0:
+                deferred.append(rel)
+                continue
             try:
                 with open(found_path, "r", encoding="utf-8") as f:
                     content = f.read()
-                    # No truncation for explicit @mentions as per plan
-                    context_blocks.append(f'\n<file name="{os.path.relpath(found_path, project_dir)}">\n{content}\n</file>')
+                clipped = _clip_text(content, remaining, f"{rel}")
+                remaining -= min(len(content), remaining)
+                context_blocks.append(f'\n<file name="{rel}">\n{clipped}\n</file>')
             except Exception as e:
                 context_blocks.append(f"\n[Error reading {filename}: {e}]")
-                
+
+    if deferred:
+        context_blocks.append(
+            f"\n[Also mentioned, not read - the @mention budget was spent: "
+            f"{', '.join(deferred)}. Use orchestrator_read_file for any of these.]"
+        )
+
     return "\n".join(context_blocks) if len(context_blocks) > 1 else ""
 
 
@@ -2189,7 +2589,7 @@ async def _trigger_build_pipeline(messages: list, extra_env: Optional[dict] = No
 
         # 2. Extract files via mover
         # This creates the project folder in ./conversations/
-        status_msg = mover.handle_move(messages)
+        status_msg = mover.handle_move(messages, open_editor=False)
         target_dir = None
         if "No code snippets" in status_msg:
             # Check if we already have a bound project
@@ -2412,88 +2812,367 @@ async def _trigger_build_pipeline_safe(
 
 # Observed architect passes run 5-6 min. Kept under the router's 700s forward
 # timeout (router.py) so a slow pass reports back in chat instead of 502-ing.
-ARCHITECT_REVIEW_TIMEOUT = 680
+#
+# A bugfix pass can legitimately exceed this: it re-runs itself once per failed
+# reproduction. That degrades correctly rather than failing - the wait ends, the
+# container keeps working, and the reply says to come back with `!review`.
+DESIGN_REVIEW_TIMEOUT = 680
+
+# ...which is what a measured bugfix run then did: 130s pass 1, 21s blocker
+# resolution, 294s on the evidence re-run, then two more attempts behind failed
+# reproductions - over 20 minutes against an 11-minute wait. The gate always
+# returned "still running", so the reviewable diagnosis and its `!approve`
+# prompt never appeared in the turn that asked for them.
+#
+# The fix is not a bigger number. router.py forwards with httpx.Timeout(700.0),
+# and for a STREAMING response that is the read timeout BETWEEN CHUNKS, not a
+# total duration - so a stream that says something every few seconds can run as
+# long as it likes, while a silent one dies at 700s however large this constant
+# is. A non-streaming client has no such escape and must stay under it.
+#
+# Hence two budgets. The streaming path is bounded by how long a bugfix pass can
+# honestly take; the blocking path is bounded by the router.
+DESIGN_REVIEW_TIMEOUT_STREAMING = {
+    "architect": 1800,   # one call, but a cold 27B load and a long context
+    "bugfix": 2700,      # up to 3 repro attempts, each a full pass plus a 300s run
+}
+
+# How often the document is checked for. Bounds how promptly a finished pass is
+# noticed, and is the granularity of everything else in the loop - nothing can be
+# emitted more often than this.
+DESIGN_REVIEW_POLL_SECS = 2
+
+# How often the streaming gate emits something. Only has to beat the smallest
+# read timeout in the chain (700s at the router, less in some browsers), so this
+# is deliberately far below it - the cost of a keepalive is one empty chunk.
+DESIGN_REVIEW_HEARTBEAT_SECS = 10
+
+# How often the container is asked whether it is still alive. `docker inspect`
+# is a subprocess, so this is slower than the file poll it accompanies.
+DESIGN_REVIEW_LIVENESS_SECS = 10
+
+# A container that has exited without writing its document is finished, and no
+# amount of further waiting changes that. The old loop polled for the file only,
+# so a pass that died in the first 30 seconds still held the turn for the full
+# 680s and then reported "still running" - a wrong answer, slowly. Death is now
+# a reason to stop, with one caveat handled at the call site: a container can
+# exit microseconds AFTER writing the document, so the file is always re-checked
+# before a dead container is called a failure.
+DESIGN_REVIEW_DEATH_GRACE_SECS = 3
+
+# Pass 1 of distillation, and the two ways to ask for it. `!architect` designs
+# new structure; `!bugfix` removes one defect. Must match distill.py's
+# DESIGN_PASSES - the orchestrator picks the value, distill.py validates it.
+DESIGN_PASSES = ("architect", "bugfix")
+DEFAULT_DESIGN_PASS = "architect"
+
+# distill.py's UNVERIFIED_MARKER. A bugfix document wearing it is a diagnosis of
+# something nothing was observed to do, so `!approve` refuses it.
+UNVERIFIED_MARKER = "## ⚠ UNVERIFIED — the declared reproduction did not fail as described"
+
+_DESIGN_PASS_UI = {
+    "architect": {
+        "command": "!architect",
+        "title": "🏗️ **Proposed Architecture**",
+        "subtitle": "*review before building*",
+        "noun": "architecture",
+        "label": "Architect",
+    },
+    "bugfix": {
+        "command": "!bugfix",
+        "title": "🩺 **Diagnosis & Fix Plan**",
+        "subtitle": "*review before fixing*",
+        "noun": "diagnosis",
+        "label": "Bugfix",
+    },
+}
 
 
-def _architect_review_path(messages: list) -> Optional[str]:
-    """Path to the architect pass output for the conversation's bound project."""
+def _design_pass_marker_path(messages: list) -> Optional[str]:
+    """Path to the record of which design pass this project's last gate ran."""
     project_dir = _get_bound_project_dir(messages)
     if not project_dir:
         return None
-    return os.path.join(os.path.abspath(project_dir), ".cline_context", "distill_architect.md")
+    return os.path.join(os.path.abspath(project_dir), ".cline_context", ".design_pass")
 
 
-def _read_architect_review(messages: list) -> str:
-    """Return the saved architecture document for review in chat."""
-    path = _architect_review_path(messages)
+def _write_design_pass(messages: list, pass_key: str) -> None:
+    """
+    Record the design pass a gate just ran, for `!approve` and `!review` to read.
+
+    `!approve` runs in a separate container invocation and has to know which pass
+    1 to resume. Every gate writes this, not just the new one: a marker only
+    `!bugfix` maintained would go stale the moment you ran `!architect` next, and
+    `!approve` would resume last week's diagnosis instead of today's design.
+    """
+    path = _design_pass_marker_path(messages)
     if not path:
-        return "⚠️ **No project bound to this conversation.** Run `!architect` first."
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(pass_key)
+    except Exception as e:
+        logger.warning(f"Could not record the design pass: {e}")
+
+
+def _read_design_pass(messages: list) -> str:
+    """The design pass the last gate ran, defaulting to the architect."""
+    path = _design_pass_marker_path(messages)
+    if not path or not os.path.exists(path):
+        return DEFAULT_DESIGN_PASS
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            value = f.read().strip().lower()
+    except Exception:
+        return DEFAULT_DESIGN_PASS
+    return value if value in DESIGN_PASSES else DEFAULT_DESIGN_PASS
+
+
+def _design_review_path(messages: list, pass_key: str) -> Optional[str]:
+    """Path to a design pass's output for the conversation's bound project."""
+    project_dir = _get_bound_project_dir(messages)
+    if not project_dir:
+        return None
+    return os.path.join(os.path.abspath(project_dir), ".cline_context",
+                        f"distill_{pass_key}.md")
+
+
+def _distill_status_path(messages: list) -> Optional[str]:
+    """Path to the progress line distill.py rewrites at each phase boundary."""
+    project_dir = _get_bound_project_dir(messages)
+    if not project_dir:
+        return None
+    return os.path.join(os.path.abspath(project_dir), ".cline_context", "distill_status")
+
+
+def _read_distill_status(messages: list) -> str:
+    """
+    The pass's current phase, or "" if it has not written one yet.
+
+    Reported to the user, never used to decide whether the pass is alive.
+    update_status() is called at phase boundaries only - never during inference -
+    so the longest HEALTHY silence is a reproduction timeout (300s) followed by a
+    full re-run (~560s at 16k tokens). An idle timer over this file would need to
+    tolerate ~860s of nothing to avoid killing a working pass, which is worse
+    than the fixed wait it would replace. Liveness comes from the container.
+    """
+    path = _distill_status_path(messages)
+    if not path:
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+async def _container_is_running(container_name: str) -> bool:
+    """
+    True while the build container is alive.
+
+    A `--rm` container is removed on exit, so `docker inspect` failing is itself
+    the answer. Errors other than a clean "false" are treated as ALIVE: a docker
+    hiccup must not be read as a dead pass and end a wait that is working.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "inspect", "-f", "{{.State.Running}}", container_name,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+    except Exception as e:
+        logger.warning(f"Liveness check for {container_name} failed ({e}); assuming alive.")
+        return True
+    out = stdout.decode(errors="replace").strip().lower()
+    if out == "true":
+        return True
+    if out == "false":
+        return False
+    # Not found: the container exited and --rm removed it.
+    return proc.returncode == 0
+
+
+def _read_design_review(messages: list, pass_key: str) -> str:
+    """Return the saved design document for review in chat."""
+    ui = _DESIGN_PASS_UI[pass_key]
+    path = _design_review_path(messages, pass_key)
+    if not path:
+        return f"⚠️ **No project bound to this conversation.** Run `{ui['command']}` first."
     if not os.path.exists(path):
         return (
-            "📭 **No architecture to review yet.**\n\n"
-            "Run `!architect` to generate one. If you just started it, give it a few "
-            "seconds and try `!review` again."
+            f"📭 **No {ui['noun']} to review yet.**\n\n"
+            f"Run `{ui['command']}` to generate one. If you just started it, give it a "
+            f"few seconds and try `!review` again."
         )
     try:
         with open(path, "r", encoding="utf-8") as f:
             content = f.read().strip()
     except Exception as e:
-        return f"❌ **Could not read the architecture document:** {e}"
+        return f"❌ **Could not read the {ui['noun']} document:** {e}"
 
     if not content:
-        return "⚠️ **The architecture document is empty.** Re-run `!architect`."
+        return f"⚠️ **The {ui['noun']} document is empty.** Re-run `{ui['command']}`."
+
+    # A report naming two failures gets one of them diagnosed and the rest listed
+    # as DEFERRED (bugfix.md B13). Those bullets are the whole reason deferring is
+    # safe rather than lossy, and they sit at the bottom of a long document where
+    # they will not be read - so they are repeated as the next action.
+    deferred = re.findall(r"^\s*[-*]\s*DEFERRED:\s*(.+?)\s*$", content, re.MULTILINE)
+    deferred_note = ""
+    if deferred:
+        items = "\n".join(f"  - {d}" for d in deferred)
+        deferred_note = (
+            f"\n\n⏭️ **{len(deferred)} other symptom(s) in your report were not "
+            f"diagnosed** — they are separate bugs, not part of this fix:\n{items}\n\n"
+            f"Run `!bugfix <symptom>` for each once this one is done.\n"
+        )
+
+    if UNVERIFIED_MARKER in content:
+        # Say it before the document rather than after. The diagnosis below reads
+        # exactly as confidently as a verified one; the only thing distinguishing
+        # them is this banner, so it goes where it will be read first.
+        approve_line = (
+            f"- **`!approve` will refuse this.** Fix section 2 and delete the "
+            f"UNVERIFIED banner in `{path}` to override, or re-run `{ui['command']}`."
+        )
+    else:
+        approve_line = f"- **Accept and build:** `!approve`"
 
     return (
-        f"🏗️ **Proposed Architecture** — *review before building*\n\n"
-        f"---\n\n{content}\n\n---\n\n"
-        f"- **Accept and build:** `!approve`\n"
-        f"- **Regenerate:** `!architect`\n"
+        f"{ui['title']} — {ui['subtitle']}\n\n"
+        f"---\n\n{content}\n\n---\n"
+        f"{deferred_note}\n"
+        f"{approve_line}\n"
+        f"- **Regenerate:** `{ui['command']}`\n"
         f"- **Edit by hand:** `{path}` — your edits are used as-is by `!approve`."
     )
 
 
-async def _run_architect_review(messages: list) -> str:
+async def _run_design_review(messages: list, pass_key: str, streaming: bool = False):
     """
-    Run distillation pass 1 only, then return the architecture for review.
+    Run distillation pass 1 only, then yield the design for review.
 
     Launches detached and polls for the output rather than blocking on the
     container, so a slow cold-start cannot hang the chat turn indefinitely.
+
+    Yields (is_final, text). Non-final items are progress for a streaming client
+    and are dropped by a blocking one; exactly one final item is always yielded,
+    and nothing follows it. An empty non-final text is a keepalive: it renders as
+    nothing and exists only to reset the read timeouts between here and the
+    browser.
     """
-    path = _architect_review_path(messages)
-    # Clear any previous document so we never present a stale one as new.
-    if path and os.path.exists(path):
-        try:
-            os.remove(path)
-        except Exception as e:
-            logger.warning(f"Could not clear previous architecture document: {e}")
+    ui = _DESIGN_PASS_UI[pass_key]
+
+    # Clear every design document, not just this pass's. entrypoint.sh keeps
+    # distill_*.md on a resume run precisely so `!approve` can reuse them, so a
+    # sibling left from the other gate would sit on disk indefinitely and be one
+    # mis-read marker away from being built.
+    for key in DESIGN_PASSES:
+        stale = _design_review_path(messages, key)
+        if stale and os.path.exists(stale):
+            try:
+                os.remove(stale)
+            except Exception as e:
+                logger.warning(f"Could not clear previous {key} document: {e}")
+
+    _write_design_pass(messages, pass_key)
 
     result = await _trigger_build_pipeline_safe(
         messages,
-        extra_env={"PIPELINE_MODE": "distill_only", "DISTILL_PASSES": "architect"},
-        mode_label="Review Gate",
+        extra_env={
+            "PIPELINE_MODE": "distill_only",
+            "DISTILL_PASSES": pass_key,
+            "DISTILL_DESIGN_PASS": pass_key,
+        },
+        mode_label=f"Review Gate ({ui['label']})",
         skip_cooldown=True,
     )
 
     # A non-container-name result means the trigger failed or was aborted.
     if not result.startswith("cline-builder-"):
-        return result
+        yield True, result
+        return
 
     container_name = result
-    path = path or _architect_review_path(messages)
+    path = _design_review_path(messages, pass_key)
     if not path:
-        return f"⚠️ **Architect pass started** (`{container_name}`) but no project directory is bound to this conversation."
+        yield True, (f"⚠️ **{ui['label']} pass started** (`{container_name}`) but no "
+                     f"project directory is bound to this conversation.")
+        return
 
-    deadline = time.time() + ARCHITECT_REVIEW_TIMEOUT
+    # Streaming buys a far longer wait, because the router's 700s is a gap
+    # between chunks rather than a total. A blocking caller has no heartbeat to
+    # offer and stays under it.
+    budget = (DESIGN_REVIEW_TIMEOUT_STREAMING.get(pass_key, DESIGN_REVIEW_TIMEOUT)
+              if streaming else DESIGN_REVIEW_TIMEOUT)
+
+    started = time.time()
+    deadline = started + budget
+    last_status = ""
+    last_liveness = 0.0
+    last_emit = started
+
+    def _elapsed() -> str:
+        secs = int(time.time() - started)
+        return f"{secs // 60}:{secs % 60:02d}"
+
+    if streaming:
+        yield False, (f"🩺 **{ui['label']} pass running** (`{container_name}`)\n\n"
+                      if pass_key == "bugfix" else
+                      f"🏗️ **{ui['label']} pass running** (`{container_name}`)\n\n")
+
     while time.time() < deadline:
-        await asyncio.sleep(2)
+        await asyncio.sleep(DESIGN_REVIEW_POLL_SECS)
+
         if os.path.exists(path) and os.path.getsize(path) > 0:
             # Let the writer finish flushing before reading.
             await asyncio.sleep(1)
-            return _read_architect_review(messages)
+            yield True, _read_design_review(messages, pass_key)
+            return
 
-    return (
-        f"⏳ **Architect pass is still running** (`{container_name}`).\n\n"
-        f"It exceeded the {ARCHITECT_REVIEW_TIMEOUT}s wait — usually a cold model load.\n"
+        # Report progress as it changes. Purely informational - see
+        # _read_distill_status on why this must not gate the wait.
+        if streaming:
+            status = _read_distill_status(messages)
+            if status and status != last_status:
+                last_status = status
+                last_emit = time.time()
+                yield False, f"`{_elapsed()}` · {status}\n"
+            elif time.time() - last_emit >= DESIGN_REVIEW_HEARTBEAT_SECS:
+                # Empty content renders as nothing and resets every read timeout
+                # between here and the browser. This is the whole reason a
+                # 45-minute pass can report back in the turn that asked for it.
+                last_emit = time.time()
+                yield False, ""
+
+        if time.time() - last_liveness >= DESIGN_REVIEW_LIVENESS_SECS:
+            last_liveness = time.time()
+            if not await _container_is_running(container_name):
+                # The document is re-checked because a container can exit
+                # immediately after writing it; without this the race turns a
+                # successful pass into a reported failure.
+                await asyncio.sleep(DESIGN_REVIEW_DEATH_GRACE_SECS)
+                if os.path.exists(path) and os.path.getsize(path) > 0:
+                    yield True, _read_design_review(messages, pass_key)
+                    return
+                yield True, (
+                    f"❌ **{ui['label']} pass stopped without producing a {ui['noun']}.**\n\n"
+                    f"The container (`{container_name}`) exited after {_elapsed()}.\n"
+                    f"Run `!logs` for the reason — a failed model load and an aborted "
+                    f"pass both land here.\n"
+                )
+                return
+
+    extra = ""
+    if pass_key == "bugfix":
+        extra = (" A bugfix pass re-runs itself once per failed reproduction, so "
+                 "this is normal on a hard bug.")
+    status = _read_distill_status(messages)
+    where = f"\nIt was last seen at: *{status}*.\n" if status else ""
+    yield True, (
+        f"⏳ **{ui['label']} pass is still running** (`{container_name}`).\n\n"
+        f"It exceeded the {budget}s wait.{extra}\n{where}"
         f"Type `!review` in a moment to see the result, or `!logs` to watch progress."
     )
 
