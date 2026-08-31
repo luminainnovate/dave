@@ -49,9 +49,12 @@ BINDING RULES — violating any of these makes the output invalid:
    Whichever runner applies, section 4 has a command that invokes it.
 8. RESUMABILITY. Each task states an observable end-state, so a resumed run can
    determine whether it is already done by inspection.
-9. BLOCK, DO NOT INVENT. If A§4 omits a type, A§5 names a component absent from A§2,
-   A§2 and A§4 disagree, or the required toolchain is missing: emit section 1 only
-   and stop. Never fill a gap with an assumption.
+9. BLOCK, DO NOT INVENT. If A§4 omits a type, A§4 names a type that resolves to more
+   than one symbol in CONTEXT, a [LOGIC] task would write a value to an enum or
+   status column whose legal values A§0 does not record, A§5 names a component absent
+   from A§2, A§2 and A§4 disagree, or the required toolchain is missing: emit section
+   1 only and stop. Never fill a gap with an assumption. A value the architect never
+   enumerated is a value you are guessing, and the database is where that guess fails.
 10. [NEW] MEANS ABSENT. A path marked [NEW] in A§2 is a file this build creates. It
    is SUPPOSED to be missing from DIRECTORY_STRUCTURE and SYMBOL_SKELETON, and its
    symbols are supposed to be undefined. That absence is never a blocker — it is
@@ -64,6 +67,22 @@ BINDING RULES — violating any of these makes the output invalid:
 12. ABSENCE IS EVIDENCE. If REQUESTED_EVIDENCE contains an <ABSENT> list, those paths
    were checked and do not exist. Plan them as new files. Re-blocking on a fact
    already supplied there makes the output invalid.
+13. CONSTRAINT CONFLICT. If a NEW_REQUEST constraint makes an A§1 business goal
+   unreachable, that is a section 1 BLOCKER naming both the constraint and the goal
+   it defeats. It is not a section 3 decision and not an A§7 deferral. Planning the
+   reachable fraction of a goal and recording the rest as out of scope produces a
+   build that passes every gate and does not work, and the gates will report it as
+   success. Surfacing the conflict costs one run; hiding it costs the run and the
+   trust in the result.
+14. PERSISTENCE PROOF. Where an A§1 goal is stated in terms of stored state
+   surviving a refresh, restart or new session, at least one section 4 command must
+   observe that state through a path that does not run the code under test — a
+   direct query, a separate read endpoint, a fresh process. A [VERIFY] whose
+   observable is produced by the same module its [LOGIC] task wrote proves the code
+   ran, never that anything was stored. If no such command can reach the datastore,
+   that is a section 1 BLOCKER naming the service: a gate that cannot run is not a
+   gate that passed, and reporting it as done is the failure this rule exists to
+   prevent.
 </operational_constraints>
 
 <expected_output_format>
@@ -118,5 +137,9 @@ Before emitting, confirm each of the following. If any fails, fix and re-emit.
 - No section 5 task touches anything named in A§7.
 - Every [VERIFY] cites a C<n> defined in section 4.
 - No install command exists unless A§3 lists a NEW entry.
+- No [LOGIC] task writes a status or enum value that A§0 does not record as legal.
+  Where A§0 is silent on a value your task writes, that is a blocker, not a guess.
+- No A§1 goal is left partly planned because a NEW_REQUEST constraint forbids the
+  rest of it. Either the goal is reachable as planned, or section 1 says so (rule 13).
 - No section exceeds its [max N].
 </self_check>

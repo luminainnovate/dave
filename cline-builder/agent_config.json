@@ -11,7 +11,7 @@
             "provider": "llamacpp",
             "base_url": "http://host.docker.internal:8081",
             "_reasoning_help": "medium, not xhigh. At xhigh on a ~70k-token evidence payload this pass spent its ENTIRE output cap on thinking - measured at exactly 12288 tokens, the cap - and was cut off before it finished writing the document. Section 2 sits near the top, so the harness reported 'section 2 declared no COMMAND' and burned every retry on the same wall. The reserve now scales with the level, which makes xhigh survivable, but medium is what this pass actually needs: it is tracing a payload through four files, not solving a research problem.",
-            "reasoning": "medium"
+            "reasoning": "low"
         },
         "engineer": {
             "model": "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL",

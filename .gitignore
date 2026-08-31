@@ -64,3 +64,5 @@ workflow_api.json
 .build_complete
 .build_issues.md
 cline-builder/staging/
+
+*.tar.gz

@@ -917,23 +917,80 @@ _DEFINITION_RE_TMPL = (
 )
 
 
+# Everything a blocker wraps in backticks. The prompts mark paths AND symbols
+# this way, so the two are separated below by shape rather than by delimiter.
+_BLOCKER_TICKED_RE = re.compile(r"`([^`\n]{1,120})`")
+_LOOKS_LIKE_PATH_RE = re.compile(r"[/\\]|\.[A-Za-z0-9]{1,5}$")
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_]\w*$")
+
+
 def blocker_symbol_hints(blockers: list) -> dict:
-    """Map path -> [symbol] for every `<path>::<symbol>` a blocker named."""
+    """
+    Map path -> [symbol] for the symbols a blocker asked about.
+
+    Two forms, because the model uses both and only one was handled at first.
+    B2 asks for `<path>::<symbol>` and sometimes that is what arrives:
+
+        `src/types/domain.ts::DomainControlChallenge` — need its full field definition
+
+    and sometimes the same request arrives as prose:
+
+        `src/types/domain.ts` — need the `AttestationRequest` interface to find ...
+
+    The second form produced no hints at all, so the slice fell back to the head
+    of the file and cut `AttestationRequest` off at byte 24000 of a 34636-byte
+    file - the exact failure the symbol-aware slice was built to prevent, missed
+    on a punctuation difference. A pass then blocked for a file it had been
+    given, twice.
+
+    In the prose form there is nothing tying a symbol to a particular path, so
+    every symbol in a statement is offered to every path in that same statement.
+    A wrong pairing costs nothing: a symbol that is not defined in a file simply
+    does not match, and the slice falls back to the head as before.
+    """
     hints = {}
     for b in blockers or []:
-        for path, symbol in _BLOCKER_SYMBOL_RE.findall(b or ""):
+        text = b or ""
+        # Precise form first, so an explicit pairing leads the list.
+        paired = _BLOCKER_SYMBOL_RE.findall(text)
+        for path, symbol in paired:
             hints.setdefault(path.lstrip("./"), []).append(symbol)
+
+        ticked = _BLOCKER_TICKED_RE.findall(text)
+        paths = [t.lstrip("./") for t in ticked if _LOOKS_LIKE_PATH_RE.search(t)]
+        symbols = [t for t in ticked
+                   if not _LOOKS_LIKE_PATH_RE.search(t) and _IDENTIFIER_RE.match(t)]
+        for path in paths:
+            # `path::symbol` also matches the ticked-path pattern; strip the
+            # suffix so both forms key the same entry.
+            key = path.split("::", 1)[0]
+            for symbol in symbols:
+                if symbol not in hints.setdefault(key, []):
+                    hints[key].append(symbol)
     return hints
 
 
 def _find_definition(content: str, symbols) -> "int | None":
-    """Offset of the earliest definition of any named symbol, else any mention."""
+    """
+    Offset of the earliest DEFINITION of any named symbol, else any mention.
+
+    Two passes, not one per symbol. Hints are now gathered loosely from prose, so
+    a statement can offer several symbols for one file and only one of them will
+    be defined there. Falling back to a bare-name match per symbol let a passing
+    mention of an unrelated hint - an import, a type reference - outrank a real
+    definition further down, and aim the slice at the wrong part of the file.
+    Every definition is considered before any mention is.
+    """
     best = None
     for sym in symbols or []:
         m = re.search(_DEFINITION_RE_TMPL.format(re.escape(sym)), content,
                       re.MULTILINE)
-        if not m:
-            m = re.search(rf"\b{re.escape(sym)}\b", content)
+        if m and (best is None or m.start() < best):
+            best = m.start()
+    if best is not None:
+        return best
+    for sym in symbols or []:
+        m = re.search(rf"\b{re.escape(sym)}\b", content)
         if m and (best is None or m.start() < best):
             best = m.start()
     return best

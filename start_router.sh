@@ -34,7 +34,11 @@ if command -v ollama &> /dev/null; then
         sleep 2
     else
         echo "🤖 Starting Ollama manually..."
-        ollama serve > /dev/null 2>&1 &
+        # Pin to the 3090 (see GPU_3090_UUID in orchestrator.py). The systemd
+        # unit sets this itself; this manual fallback path bypasses it, so the
+        # 1650 would otherwise be visible to a hand-started ollama.
+        CUDA_VISIBLE_DEVICES=GPU-e37b46d3-a978-4dcf-90d7-11733a101f8f \
+            ollama serve > /dev/null 2>&1 &
         sleep 3
     fi
 else

@@ -84,12 +84,15 @@ services:
       #     bash -c 'timeout 5 bash -c "</dev/null >/dev/tcp/host.docker.internal/5432"'
       #
       # To actually reach a loopback-published DB, join its compose network instead
-      # of going via the host, and point the URL at the container name:
-      #   DATABASE_URL=postgres://vif:vif@veriform-postgres:5432/veriform
-      # plus, under this service:  networks: [ai-workspace-net, backend_default]
-      # and at the bottom of the file:  backend_default: {external: true}
-      # That is left OFF by default because an `external` network that does not
-      # exist fails EVERY build, including ones with no database at all.
+      # of going via the host, and point the URL at the container name. That is now
+      # available as an opt-in override rather than something to hand-edit here:
+      #   docker compose -f docker-compose.yml -f docker-compose.veriform.yml run cline-builder
+      # It stays OUT of this file because an `external` network that does not exist
+      # fails EVERY build, including ones with no database at all.
+      #
+      # Without that override a DB-backed gate cannot pass honestly: entrypoint.sh
+      # classifies a refused connection as an environment fault, skips the gate and
+      # self-reports completion. Any claim that data persisted needs the override.
       #
       # None of this affects `!bugfix`: its reproduction is required to run with
       # no database, server or network (bugfix.md B5), and distill.py classifies a

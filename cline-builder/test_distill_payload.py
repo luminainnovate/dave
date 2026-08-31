@@ -2160,6 +2160,48 @@ def test_a_blockers_symbol_is_carried_into_the_evidence_read():
     assert distill.blocker_symbol_hints([]) == {}
 
 
+def test_a_symbol_named_in_prose_is_a_hint_too():
+    """
+    B2 asks for `<path>::<symbol>` and the model sometimes writes that, and
+    sometimes writes the same request as prose. Only the first form was handled,
+    so this blocker produced no hints at all, the slice fell back to the head of
+    the file, and `AttestationRequest` was cut off at byte 24000 of 34636 — the
+    exact failure the symbol-aware slice exists to prevent, missed on a
+    punctuation difference. The pass then blocked for a file it had been given.
+    """
+    prose = ("`src/services/user.service.ts` — need its full method list, and "
+             "`src/types/domain.ts` — need the `AttestationRequest` interface to "
+             "find the field that links a request to its claim ID for the PATCH URL.")
+    hints = distill.blocker_symbol_hints([prose])
+    assert hints.get("src/types/domain.ts") == ["AttestationRequest"], hints
+    # Nothing ties a symbol to a path in prose, so it is offered to both. A file
+    # that does not define it simply does not match.
+    assert hints.get("src/services/user.service.ts") == ["AttestationRequest"]
+
+    # Paths are never mistaken for symbols, and prose words are not invented.
+    for junk in hints.values():
+        assert not any("/" in s or s.endswith(".ts") for s in junk), junk
+        assert "PATCH" not in junk and "URL" not in junk, junk
+
+    # The explicit form still leads, and both forms key the same entry.
+    both = distill.blocker_symbol_hints([
+        "`src/types/domain.ts::DomainControlChallenge` and `AttestationRequest`"])
+    assert both["src/types/domain.ts"][0] == "DomainControlChallenge", both
+
+
+def test_a_real_definition_outranks_a_passing_mention_of_another_hint():
+    """
+    Hints are gathered loosely from prose, so one file can be offered several
+    symbols and define only one. A per-symbol fallback to a bare-name match let
+    an unrelated import outrank the real definition further down and aim the
+    slice at the wrong part of the file.
+    """
+    content = ('import { AttestationRequest } from "./x";\n' + ("pad\n" * 4000) +
+               "export interface ClaimLink {\n  claimId: string;\n}\n")
+    hit = distill._find_definition(content, ["AttestationRequest", "ClaimLink"])
+    assert content[hit:].startswith("export interface ClaimLink"), content[hit:hit + 40]
+
+
 def test_evidence_is_sliced_around_the_symbol_not_the_top_of_the_file():
     """
     The failure this exists for: an architect asked for

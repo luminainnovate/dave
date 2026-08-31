@@ -29,9 +29,32 @@ BINDING RULES — violating any of these makes the output invalid:
 6. NO TAUTOLOGIES. Do not mock, stub or spy the unit under test. Do not assert
    only on mock call counts. Every assertion compares an observed value against an
    expected literal or a value derived independently of the code under test.
-7. DETERMINISM. No wall clock, no live network, no randomness, no ambient
-   filesystem or environment state, no inter-test ordering dependency. Freeze or
+   PERSISTENCE BOUNDARY. Where the behaviour under test is that something is stored
+   or sent, the transport and storage layers are part of the unit under test.
+   Stubbing fetch, the HTTP client, the database driver or the repository and
+   asserting on the request that was issued proves a call was constructed; it can
+   never prove anything was written, and it passes just as green when the receiving
+   end rejects the payload or does not exist. Assert on the stored row read back, or
+   on the response of a real round trip. A test whose only witness is a spy it
+   installed itself is a tautology however precise its assertions look.
+7. DETERMINISM. No wall clock, no randomness, no ambient filesystem or environment
+   state, no inter-test ordering dependency, no live third-party network. Freeze or
    inject each and name the injection point in the test case.
+   A datastore the project itself owns and provisions is NOT third-party and is not
+   banned here. A persistence test connects to it, writes, and reads back. Where it
+   may be absent, guard by skipping the whole test file on a connection failure —
+   never by stubbing the driver, which converts a missing database into a green
+   test.
+   THE GUARD MUST REPORT SKIPPED, NOT PASSED. Use the runner's own skip mechanism
+   (`describe.skipIf` / `it.skipIf`, `pytest.mark.skipif`, `t.Skip()`). An early
+   `return` at the top of a test body is NOT a skip: the body no-ops, the runner
+   counts it as PASSED, and a suite asserting nothing reports full green against a
+   database that is not running. Copy the guard from an existing test only after
+   checking it fails this way — the pattern is a common one and it is wrong.
+   Determinism means the same input yields the same result, not that nothing is
+   ever written. Rule 6's persistence boundary outranks this rule where they meet:
+   if honouring determinism would force you to stub the storage layer, the test
+   belongs against the real store with a skip guard.
 8. EXISTING HARNESS. Use the runner and assertion library already in the project
    manifest. No new test dependencies. Bootstrapping a harness is permitted only
    when MODE=NEW_BUILD.
@@ -103,6 +126,11 @@ Before emitting, confirm each. If any fails, fix and re-emit.
 - Every E§5 [TEST] task id is the target of at least one TC.
 - Every TC has a RED that describes wrong or missing behaviour, not a missing file.
 - No TC mocks its own unit under test or asserts solely on call counts.
+- Take every TC whose behaviour is that something is stored or sent. Its witness is
+  a value read back from the real store or a real round trip, not a spy the test
+  installed. A stubbed transport asserting on the request it captured is the
+  tautology rule 6 names, and it goes green against a backend that rejects the
+  payload or does not exist.
 - Every section 3 path is an E§2 [TEST] path or a declared FIXTURE/PROBE.
   No source path appears.
 - Every TC is COVERS-cited by at least one gate.

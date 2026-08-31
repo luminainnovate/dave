@@ -1,0 +1,66 @@
+# Opt-in override: joins cline-builder to veriform's Postgres network so that
+# DB-backed verification gates can actually reach the database.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.veriform.yml run cline-builder
+#
+# WHY THIS IS AN OVERRIDE AND NOT IN docker-compose.yml
+# `backend_default` is an external network. Declaring it in the base file makes
+# EVERY build fail whenever it does not exist, including builds with no database
+# at all. As an override it applies only when asked for, so the default path is
+# unchanged.
+#
+# WHY host.docker.internal CANNOT WORK INSTEAD
+# veriform's Backend/docker-compose.yml publishes Postgres as `127.0.0.1:5432:5432`
+# — loopback only, deliberately. The builder reaches the host at the bridge address
+# (172.17.0.1), where nothing is listening, so every DB-backed test dies
+# ECONNREFUSED. Joining the container network and addressing the container by name
+# is the only route that works without exposing the DB off the box.
+#
+# PREREQUISITES
+# 1. veriform's stack must be up — it is what creates `backend_default`:
+#      docker compose -f <veriform-ui>/Backend/docker-compose.yml up -d
+# 2. The build agent's own database must exist and be migrated. Created once:
+#      docker exec veriform-postgres psql -U vif -d postgres \
+#        -c 'CREATE DATABASE veriform_build OWNER vif'
+#      cd <veriform-ui>/Backend && \
+#        DATABASE_URL=postgres://vif:vif@localhost:5432/veriform_build \
+#        npx drizzle-kit migrate
+#    Re-run the migrate step whenever new migrations land, or the agent's gates
+#    will fail against a schema older than the code under test.
+#
+# VERIFY REACHABILITY BEFORE TRUSTING A GREEN GATE
+#   docker compose -f docker-compose.yml -f docker-compose.veriform.yml \
+#     run --rm cline-builder \
+#     bash -c 'timeout 5 bash -c "</dev/null >/dev/tcp/veriform-postgres/5432" && echo REACHABLE'
+#
+# A skipped gate is not a passed gate: entrypoint.sh classifies a refused
+# connection as an environment fault and self-reports completion, so a build run
+# WITHOUT this override cannot prove anything about persistence.
+
+services:
+  cline-builder:
+    networks:
+      - ai-workspace-net
+      - backend_default
+    environment:
+      # BOTH default to veriform_build — never `veriform`, never `veriform_test`.
+      #
+      # `veriform`  is the dev database. The build agent runs migrations, seeds and
+      #             destructive setup unattended; pointed here it would clobber real
+      #             development data and the gates would go green on the wreckage.
+      # `veriform_test` is the DEVELOPER's test database, used by `npm run test:api`
+      #             on the host. Sharing it means an unattended build and a human
+      #             test run truncating the same tables at the same time, producing
+      #             failures in both that belong to neither.
+      # `veriform_build` is the build agent's own. Disposable, and safe to reset:
+      #             docker exec veriform-postgres psql -U vif -d postgres \
+      #               -c 'DROP DATABASE veriform_build' -c 'CREATE DATABASE veriform_build OWNER vif'
+      #             then re-apply migrations (see the header of this file).
+      #
+      # To deliberately target another database, set DATABASE_URL in the environment.
+      - DATABASE_URL=${DATABASE_URL:-postgres://vif:vif@veriform-postgres:5432/veriform_build}
+      - TEST_DATABASE_URL=${TEST_DATABASE_URL:-postgres://vif:vif@veriform-postgres:5432/veriform_build}
+
+networks:
+  backend_default:
+    external: true

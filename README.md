@@ -485,9 +485,10 @@ pings from Open WebUI never trigger commands.
 | `EXPERT_CONFIG` | `{"model": "qwen3.8:27b", "provider": "ollama", "base_url": "http://localhost:11434"}` | The Expert. `provider` ∈ `ollama` \| `llamacpp` \| `lmstudio`. |
 | `ROUTER_CONFIG` | `qwen2.5:1.5b` on Ollama | Resident triage model. |
 | `DEFAULT_EXPERT_MODEL` | `qwen3.8:27b` | Any other Expert falls back to that model's native sampling defaults. |
-| `EXPERT_CTX` | `65536` | Expert window. **Every budget below derives from this.** |
-| `DISTILL_CTX` | `65536` | Distillation window. |
-| `CLINE_CTX` | `65536` | Window the build agent is **expected** to run at. An assertion, not a setting — the real window comes from `OLLAMA_CONTEXT_LENGTH`, and the build aborts if the two disagree. See §7.6. |
+| `LLAMACPP_SERVER_CTX` | `163840` | The window the shared llama.cpp server is actually started with. The ceiling all three below sit under. |
+| `EXPERT_CTX` | `98304` | Expert window. **Every budget below derives from this.** Held below the server window so the reply (capped at 16384) always has room. |
+| `DISTILL_CTX` | `131072` | Distillation window. Sizes the prompt only; the gap to `LLAMACPP_SERVER_CTX` is reply headroom. |
+| `CLINE_CTX` | `163840` | Window the build agent is **expected** to run at. An assertion, not a setting — on the llama.cpp path a mismatch only warns; the build aborts when the server is below Cline's hardcoded `128000`. See §7.6. |
 | `AGENT_MAX_HOPS` | `8` | Tool hops on a read-only turn. Each hop is a full inference over the conversation. |
 | `AGENT_MAX_HOPS_WRITE` | `12` | Write turns: read → edit → verify is three hops per file. |
 | `CHARS_PER_TOKEN_DENSE` | `3` | Pessimistic on purpose. |
@@ -662,7 +663,8 @@ The shipped defaults are tuned for exactly this card. The reasoning:
 
 | Setting | Value | Why on a 3090 |
 |---|---|---|
-| `EXPERT_CTX` / `DISTILL_CTX` | `65536` | 128k of KV crowds the weights off a 24 GB card. 64k is the largest window that keeps a 27B fully offloaded, and it is where the ~30+ tok/s comes from. |
+| `LLAMACPP_SERVER_CTX` | `163840` | Only 16 of this model's 64 layers hold a KV cache (`full_attention_interval 4`), so a token costs 34 KiB at q8_0, not the ~136 KiB a dense 27B would. 160k of KV is 5440 MiB, which still leaves ~1.9 GiB spare beside the 16.35 GiB of weights. 256k does not fit. |
+| `EXPERT_CTX` / `DISTILL_CTX` | `98304` / `131072` | Both sit under the server window on purpose — see the constants in `orchestrator.py`. The old `65536` was a budget ceiling, not a VRAM one, and pruned conversations on a server that had the room. |
 | `agent_config.json` `context_window` | `65536` | Keep it equal to `EXPERT_CTX` — a mismatch means the container silently runs at a different size. |
 | Expert | `qwen3.8:27b` on Ollama | Simplest path to a fully-offloaded 24 GB fit. Ampere has no FP8, so an fp8 quant buys you nothing here — stay on GGUF/Q-quants. |
 | llama.cpp path | `LLAMACPP_DEFAULT_ARGS = ["--cache-type-k","q8_0","--cache-type-v","q8_0"]` | Currently `[]` (commented out in code). Re-enable it when you move the Expert to `llamacpp` and want a window above 64k. |

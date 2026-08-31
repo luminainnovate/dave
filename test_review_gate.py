@@ -7,9 +7,12 @@ polling loop, the progress emission, the death race, the SSE framing - is the
 real code.
 """
 import asyncio
+import fnmatch
 import importlib.util
 import json
 import os
+import shlex
+import subprocess
 import sys
 import tempfile
 import time
@@ -272,6 +275,142 @@ def test_native_framing_is_valid_and_terminated():
     check("last line marks done", lines[-1].get("done") is True, lines[-1])
     joined = "".join(l.get("message", {}).get("content", "") for l in lines)
     check("the document reaches the native client", "Root Cause" in joined)
+
+
+# --- Design document archive --------------------------------------------------
+
+def _archive_setup(project):
+    """Point the archive helpers at a temp project. No container involved."""
+    orch._get_bound_project_dir = lambda messages: project.tmp.name
+    written = {}
+    orch._write_design_pass = lambda messages, key: written.__setitem__("pass", key)
+    return written
+
+
+def test_a_displaced_document_is_archived_not_destroyed():
+    """
+    An !architect run used to delete a !bugfix diagnosis outright - 20 minutes of
+    GPU and a VERIFIED reproduction, with no way back. Twice.
+    """
+    p = Project()
+    _archive_setup(p)
+    p.write_doc("bugfix", "# 4. Root Cause\n- the verified one")
+
+    dest = orch._archive_design_document([], "bugfix")
+    check("the document is archived", bool(dest) and os.path.exists(dest or ""), dest)
+    check("the live path is still cleared",
+          not os.path.exists(os.path.join(p.ctx, "distill_bugfix.md")))
+    with open(dest) as f:
+        check("archived content is intact", f.read() == "# 4. Root Cause\n- the verified one")
+
+
+def test_the_archive_survives_the_containers_own_cleanup():
+    """
+    entrypoint.sh runs `rm -f /workspace/.cline_context/distill_*.md` on every
+    non-resume run. The obvious archive name, distill_bugfix.prev.md, MATCHES
+    that glob - it would review as correct and be destroyed on the next gate run.
+    This is the regression that would otherwise ship silently.
+    """
+    p = Project()
+    _archive_setup(p)
+    p.write_doc("bugfix", "# 4. Root Cause\n- keep me")
+    dest = orch._archive_design_document([], "bugfix")
+
+    subprocess.run(f'rm -f {shlex.quote(p.ctx)}/distill_*.md', shell=True, check=True)
+    check("survives rm -f distill_*.md", os.path.exists(dest), dest)
+    rel = os.path.relpath(dest, p.ctx)
+    check("and cannot match that glob by name", not fnmatch.fnmatch(rel, "distill_*.md"), rel)
+
+
+def test_archiving_falls_back_to_deleting_when_it_cannot_move():
+    """
+    Removal is a safety property; keeping a copy is a convenience. A stale
+    sibling left on disk is one mis-read marker away from being built, so the
+    convenience must never win.
+    """
+    p = Project()
+    _archive_setup(p)
+    p.write_doc("bugfix")
+    live = os.path.join(p.ctx, "distill_bugfix.md")
+
+    saved = orch.os.replace
+    orch.os.replace = lambda *a, **k: (_ for _ in ()).throw(OSError("read-only fs"))
+    try:
+        check("reports no archive", orch._archive_design_document([], "bugfix") is None)
+    finally:
+        orch.os.replace = saved
+    check("but the live document is gone either way", not os.path.exists(live))
+
+
+def test_restore_brings_back_the_document_and_the_marker():
+    """
+    Restoring the file is half the job: !approve resumes whichever pass
+    .design_pass names, so a restored diagnosis under an "architect" marker
+    builds the wrong thing. That is the half people forget.
+    """
+    p = Project()
+    written = _archive_setup(p)
+    p.write_doc("bugfix", "# 4. Root Cause\n- the verified one")
+    orch._archive_design_document([], "bugfix")
+
+    msg = orch._restore_design_document([], "bugfix")
+    check("reports a restore", "restored" in msg.lower(), msg[:60])
+    with open(os.path.join(p.ctx, "distill_bugfix.md")) as f:
+        check("the document is back", f.read() == "# 4. Root Cause\n- the verified one")
+    check("and .design_pass follows it", written.get("pass") == "bugfix", written)
+
+
+def test_restore_archives_whatever_it_replaces():
+    """Otherwise restoring bugfix beside a live architect document recreates the
+    two-live-documents state the clear step exists to prevent."""
+    p = Project()
+    _archive_setup(p)
+    p.write_doc("bugfix", "# bugfix one")
+    orch._archive_design_document([], "bugfix")
+    p.write_doc("architect", "# architect live")
+
+    orch._restore_design_document([], "bugfix")
+    check("the incumbent is not left live beside the restored one",
+          not os.path.exists(os.path.join(p.ctx, "distill_architect.md")))
+    check("it was archived rather than dropped",
+          len(orch._archived_designs([], "architect")) == 1)
+
+
+def test_restore_with_an_empty_archive_says_so_and_points_somewhere_useful():
+    p = Project()
+    _archive_setup(p)
+    msg = orch._restore_design_document([], "architect")
+    check("says nothing is archived", "Nothing archived" in msg, msg[:60])
+
+    p.write_doc("bugfix")
+    orch._archive_design_document([], "bugfix")
+    check("and points at the sibling that does have one",
+          "!restore bugfix" in orch._restore_design_document([], "architect"))
+
+
+def test_the_archive_is_bounded_and_keeps_the_newest():
+    p = Project()
+    _archive_setup(p)
+    for i in range(orch.DESIGN_ARCHIVE_KEEP + 4):
+        p.write_doc("bugfix", f"# version {i}")
+        orch._archive_design_document([], "bugfix")
+
+    kept = orch._archived_designs([], "bugfix")
+    check("pruned to the cap", len(kept) == orch.DESIGN_ARCHIVE_KEEP, len(kept))
+    with open(kept[0]) as f:
+        check("newest survives", f"version {orch.DESIGN_ARCHIVE_KEEP + 3}" in f.read())
+
+
+def test_review_offers_the_archive_when_there_is_nothing_live():
+    """The one moment it is worth mentioning; otherwise nobody finds it."""
+    p = Project()
+    _archive_setup(p)
+    p.write_doc("bugfix", "# 4. Root Cause\n- archived")
+    orch._archive_design_document([], "bugfix")
+
+    msg = orch._read_design_review([], "bugfix")
+    check("review surfaces the archive", "archived" in msg.lower(), msg[:60])
+    check("and names the restore command", "!restore bugfix" in msg, msg[:60])
 
 
 def test_a_failed_launch_short_circuits():

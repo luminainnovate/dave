@@ -338,7 +338,7 @@ def _classify_request(messages: list) -> str:
     # should - which is a coin flip standing between the user and a command they
     # typed explicitly.
     desktop_commands = [
-        "!build", "!architect", "!bugfix", "!approve", "!review",
+        "!build", "!architect", "!bugfix", "!approve", "!review", "!restore",
         "!move", "!lock", "!unlock", "!stop", "!status",
         "!logs", "!clone", "!expert", "!code", "!general",
         "hey expert", "hey code"

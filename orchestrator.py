@@ -96,17 +96,33 @@ EXPERT_MODEL = EXPERT_CONFIG["model"]
 ROUTER_MODEL = ROUTER_CONFIG["model"]
 DEFAULT_EXPERT_MODEL = "qwen3.8:27b" # Keep this as default, if you know what youre doing, you can change it with the PARAMS_GENERAL/PARAMS_CODING
 
+# The only GPU any inference process may touch. The GTX 1650 in this box is
+# desktop-UI only and must never hold model weights or KV - see the
+# CUDA_VISIBLE_DEVICES note in _ensure_llamacpp_server. Ollama is pinned to the
+# same card out-of-band, in /etc/systemd/system/ollama.service.d/override.conf.
+GPU_3090_UUID = "GPU-e37b46d3-a978-4dcf-90d7-11733a101f8f"
+
 # llama.cpp managed process settings (only used when provider is "llamacpp")
 LLAMACPP_BINARY = "/home/jonathan/.local/bin/llama"  # llama.app unified binary (serves via the `serve` subcommand)
-# KV cache quantisation. Not optional at LLAMACPP_SERVER_CTX: 128k of f16 KV
-# does not fit beside a 27B Q4 on a 24GB card, and -ngl all would fail. At q8_0
-# the whole thing loads at 23999 MiB of 24576 and still generates at 33.7 tok/s
-# (measured), against ~36 tok/s at 64k/f16.
+# KV cache quantisation. Not optional at LLAMACPP_SERVER_CTX: f16 KV does not
+# fit beside a 27B Q4 on a 24GB card at this window, and -ngl all would fail.
 #
-# That leaves ~577 MiB of headroom, which is the real cost of this setting: any
-# other process that wakes up on the GPU mid-build will OOM the server. Drop
-# LLAMACPP_SERVER_CTX to 114688 if you need the margin back - Cline's compaction
-# should still fire below that, though it is closer to the line.
+# What a token actually costs here, from the GGUF metadata (arch qwen35):
+# block_count 65 with nextn_predict_layers 1 = 64 real layers, and
+# full_attention_interval 4 means only 16 of them hold a KV cache - the rest are
+# SSM layers whose state is constant-size and context-independent. With
+# head_count_kv 4 and key/value_length 256 that is
+#   16 layers x 2 (K+V) x 1024 dims x 1.0625 B (q8_0) = 34 KiB/token
+# so 32768 tokens of window costs 1088 MiB, and the 163840 below costs 5440 MiB.
+#
+# The earlier note here said the whole thing loads at 23999 MiB of 24576 leaving
+# ~577 MiB. That measurement predates --no-mmproj in the spawn args: the BF16
+# vision tower is no longer loaded and ~2.5 GB came back. Measured at 131072 it
+# sat at 21503 MiB (16.35 GiB weights + 4.25 GiB KV + ~0.4 GiB compute/CUDA
+# context), and 163840 should land near 22591 MiB - roughly 1.9 GiB spare.
+# That spare margin is the real cost of this setting: any other process that
+# wakes up on the GPU mid-build eats into it. The desktop now lives on the
+# GTX 1650, which is what makes the margin trustworthy.
 LLAMACPP_DEFAULT_ARGS = ["--cache-type-k", "q8_0", "--cache-type-v", "q8_0"]
 
 COMFYUI_URL = "http://localhost:8188"
@@ -124,7 +140,20 @@ COMFYUI_URL = "http://localhost:8188"
 # below Cline's assumption reproduces that.
 #
 # It only fits with KV quantisation - see LLAMACPP_DEFAULT_ARGS.
-LLAMACPP_SERVER_CTX = 131072
+#
+# 160k, not 128k, and the extra 32k is deliberately NOT handed to any caller -
+# it is headroom. Cline compacts against its hardcoded 128000 and DISTILL_CTX
+# builds prompts up to 131072, so on a 131072 server a maximal prompt left ~3k
+# tokens for the reply against an n_predict of 16384. That is the same shape as
+# the failure this constant was raised to fix, one layer up: not "the prompt is
+# rejected" but "the generation runs off the end mid-tool-call". At 163840 a
+# 128k-compacted conversation has ~35k tokens of room to answer in.
+#
+# 196608 also fits (~448 MiB spare) and 262144 - the model's trained maximum per
+# qwen35.context_length - does not: it needs 8704 MiB of KV and comes up ~1.7 GiB
+# short at q8_0. Dropping to q5_1 KV would buy it, which is not a trade worth
+# making for an agent that writes code.
+LLAMACPP_SERVER_CTX = 163840
 
 # How long a llama.cpp server gets to answer /health before the load is called
 # failed. Both the waiter and the background poller read this - they were two
@@ -138,9 +167,24 @@ LLAMACPP_SERVER_CTX = 131072
 # it is stuck, and should fail rather than hold the pipeline open.
 LLAMACPP_STARTUP_TIMEOUT = 300.0
 
-EXPERT_CTX = 65536    # Context the EXPERT's own calls are budgeted against (64k).
-                      # Deliberately below LLAMACPP_SERVER_CTX: the server offers
-                      # 128k, and using less of it is free.
+EXPERT_CTX = 98304    # Context the EXPERT's own calls are budgeted against (96k).
+                      # Deliberately below LLAMACPP_SERVER_CTX, but no longer by
+                      # half. "Using less of it is free" was only true of the
+                      # VRAM: every CONTEXT BUDGET fraction below is derived from
+                      # this number, so 65536 was pruning against a 64k ceiling on
+                      # a server that had 128k idle. Measured cost of that -
+                      #   [Safety Monitor] Pruning context: 115922 chars > 88473
+                      # - is 27449 chars of conversation thrown away, where 88473
+                      # is exactly EXPERT_CTX * 3 * HISTORY_BUDGET_FRACTION. The
+                      # prompt that survived was ~29k tokens on a 131072 server.
+                      #
+                      # 96k rather than the full window on purpose. The fractions
+                      # sum to 0.75, so the remaining 25% has to cover
+                      # PROJECT_CONTEXT, the tool schemas and the reply - and the
+                      # reply alone is capped at 16384. At EXPERT_CTX ==
+                      # LLAMACPP_SERVER_CTX that remainder is the only thing
+                      # between a full history and exceed_context_size_error;
+                      # here there are ~65k tokens of server window spare.
 DISTILL_CTX = 131072  # Context for the distillation engine. Reaches the container
                       # as EXPERT_CTX (see the pipeline launch below), where it is
                       # the ceiling solve_addendum_budget divides up.
@@ -149,8 +193,15 @@ DISTILL_CTX = 131072  # Context for the distillation engine. Reaches the contain
                       # bugfix pass whose payload is ~39k tokens of conversation
                       # left ~2.9k tokens for evidence: a 4-file blocker asking
                       # for 65678 chars got 8607, enough for one truncated file.
-                      # Matching LLAMACPP_SERVER_CTX is what makes a multi-file
-                      # blocker answerable in a single round.
+                      # 128k is what makes a multi-file blocker answerable in a
+                      # single round.
+                      #
+                      # Held at 131072 while LLAMACPP_SERVER_CTX went to 163840,
+                      # so this is no longer the server's whole window - the gap
+                      # is reply headroom, not an oversight. solve_addendum_budget
+                      # divides up the PROMPT and knows nothing about what the
+                      # model then generates; at DISTILL_CTX == the server window
+                      # a maximal payload leaves the reply nowhere to go.
                       #
                       # Costs no VRAM: llama.cpp allocates the KV cache for the
                       # server's -c up front, so a smaller window here reserved
@@ -158,11 +209,41 @@ DISTILL_CTX = 131072  # Context for the distillation engine. Reaches the contain
                       # LLAMACPP_SERVER_CTX first if this ever goes above it -
                       # the server is the real ceiling and rejects an over-long
                       # prompt outright with exceed_context_size_error.
-CLINE_CTX = 131072    # Window the Cline agent is EXPECTED to run at. This is an
+CLINE_CTX = 163840    # Window the Cline agent is EXPECTED to run at. This is an
                       # assertion, not a setting - entrypoint.sh reads the window
                       # actually in force from the server and aborts the build if
                       # it is short of what Cline assumes. Raising this alone does
                       # nothing; raise LLAMACPP_SERVER_CTX with it.
+                      #
+                      # Two different checks, and only one of them is fatal:
+                      # assert_cline_ctx() aborts when the server is below
+                      # CLINE_ASSUMED_CTX (128000, hardcoded in the Cline binary),
+                      # and merely warns when the server disagrees with THIS
+                      # value. So this tracks LLAMACPP_SERVER_CTX to keep the
+                      # banner honest and the warning quiet - it is a description
+                      # of the window, not a claim about where Cline compacts.
+                      # Keep it in step with entrypoint.sh's own default.
+
+# --- BUILD CONTAINER NETWORKING ---
+# Compose override that joins cline-builder to the database's network. See the
+# header of docker-compose.veriform.yml for the full reasoning; the short version
+# is that veriform's Postgres publishes on 127.0.0.1:5432 only, so the builder
+# reaching the host at the bridge gateway finds nothing listening, and every
+# DB-backed gate dies ECONNREFUSED.
+#
+# Applied CONDITIONALLY, which is the whole reason this is not simply added to
+# the launch command. The override declares `backend_default` as an external
+# network; compose fails outright when an external network does not exist, so an
+# unconditional -f would break every build on a box where veriform's stack is
+# down - including builds that never touch a database.
+#
+# The failure this fixes was invisible rather than loud: entrypoint.sh classifies
+# a refused connection as an environment fault, skips the gate, and self-reports
+# completion. A build without this override cannot prove anything about
+# persistence, but it still finishes green.
+PIPELINE_COMPOSE_FILE = "docker-compose.yml"
+PIPELINE_COMPOSE_OVERRIDE = "docker-compose.veriform.yml"
+PIPELINE_COMPOSE_OVERRIDE_NET = "backend_default"
 
 # Tool-calling budget for one turn. Each hop is a full Expert inference over the
 # whole conversation, so this is the main lever on how long a tool-using turn
@@ -214,13 +295,48 @@ PARAMS_GENERAL = {
     "repeat_penalty": 1.0,
 }
 
+# The model card's thinking-mode preset, unmodified. The server runs in thinking
+# mode (--reasoning-format deepseek, reasoning_effort low), so thinking is the
+# preset that applies here - not instruct (0.7/0.80/20, presence 1.5).
+#
+# temperature was 0.6, which is below BOTH of the card's presets. distill.py's
+# SAMPLING_TEMPERATURE comment already makes the argument against that, about the
+# 0.3 it replaced: on this family a temperature far under the presets is a
+# repetition-loop risk, and that is the shape of the failure seen in long passes.
+# 0.6 is the same mistake with less of it.
+#
+# repeat_penalty was 1.15, and two separate things were wrong with it:
+#
+#  1. The card specifies repetition_penalty=1.0 in BOTH modes and names
+#     presence_penalty (0..2) as the lever for repetition instead. On a model
+#     writing code a repetition penalty is worse than merely off-card - code
+#     legitimately repeats tokens (indentation, closing braces, an identifier used
+#     five times in a function) and penalising that damages syntax.
+#  2. It was never reaching the model. EXPERT_CONFIG is provider "llamacpp", so
+#     every dispatch goes through _adapt_body -> the OpenAI translation, and that
+#     forwards exactly ("temperature", "top_p", "presence_penalty",
+#     "frequency_penalty"). repeat_penalty, top_k and min_p are dropped there.
+#
+# So 0.6 was live and its 1.15 mitigation was not: coding mode was carrying the
+# repetition risk without the compensation that was supposed to offset it.
+#
+# top_k and min_p are kept here despite also being dropped by that translation.
+# They currently match --top-k/--min-p in the llama-server command line, so the
+# values in force are right by coincidence rather than by this dict. Leaving them
+# stated means the dict still describes the intended preset in full if the
+# provider changes to one that reads them (Ollama takes the whole options dict).
+#
+# If you ever widen the key tuple in _adapt_to_openai, everything here goes live
+# at once. That is the reason to keep this at the card's values even where a
+# setting is currently inert: an off-card number parked in an inert slot is a
+# quality regression waiting for an unrelated refactor to arm it.
 PARAMS_CODING = {
-    "temperature": 0.6,
+    "temperature": 1.0,
     "top_p": 0.95,
     "top_k": 20,
     "min_p": 0.0,
     "presence_penalty": 0.0,
-    "repeat_penalty": 1.15,
+    "repeat_penalty": 1.0,
 }
 
 # =============================================================================
@@ -542,6 +658,23 @@ async def _start_llamacpp_server(config: dict):
             # Force Flash Attention ON to save VRAM and improve speed at 128k context
             env = os.environ.copy()
             env["LLAMA_ARG_FLASH_ATTN"] = "on"
+
+            # Pin to the 3090. The box also has a GTX 1650 driving the desktop,
+            # and ggml's default split-mode=layer spreads across EVERY visible
+            # CUDA device - so layers and a KV shard landed on a 4GB card that
+            # gnome-shell, Xwayland and the browser are already using. Open
+            # WebUI in a tab was enough to take it over the line:
+            #   allocating 272.00 MiB on device 1: cudaMalloc failed: out of memory
+            #   failed to allocate buffer for kv cache
+            # and -ngl all (below) correctly refuses to paper over it by
+            # spilling to RAM, so the server dies during startup instead.
+            #
+            # By UUID, not index: the 1650 was added to an existing single-GPU
+            # box, and enumeration order is not a stable thing to depend on.
+            # This is GPU 0, the RTX 3090. If the card is ever replaced, this
+            # value must be updated - a stale UUID exposes no GPU at all, which
+            # -ngl all will fail loudly on rather than run slowly.
+            env["CUDA_VISIBLE_DEVICES"] = GPU_3090_UUID
 
             env["HF_HUB_CACHE"] = "/data/llama"
             
@@ -1484,7 +1617,8 @@ async def proxy_ollama(request: Request):
 
         # Rule E: Suppress background tasks following maintenance commands
         maintenance_commands = ["!status", "!stop", "!move", "!build", "!architect",
-                                "!bugfix", "!approve", "!review", "!lock", "!unlock",
+                                "!bugfix", "!approve", "!review", "!restore",
+                                "!lock", "!unlock",
                                 "!write", "!readonly", "!undo", "!diff", "!pr"]
         is_maintenance_followup = False
         if is_background_task and len(messages) >= 3:
@@ -1545,6 +1679,20 @@ async def proxy_ollama(request: Request):
             success = mover.handle_move(messages, open_editor="--open" in prompt_lower)
             msg = "Files moved!" if "Moved" in success else "Files failed to move!"
             return _command_response(msg, is_streaming, is_native)
+        elif "!restore" in prompt_lower:
+            # Checked before !architect and !bugfix: "!restore bugfix" contains
+            # the substring "bugfix", and this dispatcher matches on `in`, so the
+            # bugfix gate would otherwise swallow it and launch a 20-minute pass
+            # in response to a request to undo one.
+            requested = next((k for k in DESIGN_PASSES if k in prompt_lower), None)
+            if not requested:
+                return _command_response(
+                    f"⚠️ **Which one?** `!restore " +
+                    "` or `!restore ".join(DESIGN_PASSES) + "`.",
+                    is_streaming, is_native)
+            logger.info(f"Command: Restoring archived {requested} document.")
+            return _command_response(
+                _restore_design_document(messages, requested), is_streaming, is_native)
         elif "!architect" in prompt_lower:
             logger.info("Command: Architect review gate triggered.")
             return await _maybe_await(_progress_command_response(
@@ -2621,10 +2769,66 @@ def _handle_clone_command(messages: list) -> str:
         return msg
         
     except subprocess.CalledProcessError as e:
-        logger.error(f"Failed to clone: {e.stderr.decode('utf-8', errors='ignore') if e.stderr else e}")
-        return "❌ **Clone Failed:** Process error occurred."
+        # Surface git's own stderr rather than "Process error occurred". That
+        # string sent the reader to the logs to learn anything at all, and it is
+        # the only thing the chat client shows - so a failure that names its own
+        # cause ("Could not resolve host: host.docker.internal") arrived as a
+        # generic error with no indication of WHICH url had been cloned, or that
+        # a url had been extracted from the prompt at all.
+        detail = (e.stderr.decode("utf-8", errors="ignore").strip()
+                  if e.stderr else str(e))
+        logger.error(f"Failed to clone: {detail}")
+        # Last line first: git puts the fatal: on the end, after the progress.
+        headline = detail.splitlines()[-1] if detail else "no output from git"
+        return (f"❌ **Clone Failed:** {headline}\n\n"
+                f"If you did not mean to clone anything, remove the `--repo`/`--kb` "
+                f"flag from the command.")
     except Exception as e:
         return f"❌ **Error during clone:** {e}"
+
+
+def _compose_files() -> list[str]:
+    """
+    The -f flags for the build container launch.
+
+    Adds PIPELINE_COMPOSE_OVERRIDE only when its external network is actually
+    present, so a box with veriform's stack down still builds normally instead of
+    failing on a network compose cannot resolve.
+
+    Network presence is not the same as the database being up, and this does not
+    pretend otherwise: if the network exists but Postgres is stopped, the gate
+    fails honestly on a refused connection rather than being skipped. That is the
+    outcome we want - the pathology being fixed here is a gate that never got the
+    chance to fail.
+    """
+    files = ["-f", PIPELINE_COMPOSE_FILE]
+
+    if not os.path.exists(PIPELINE_COMPOSE_OVERRIDE):
+        return files
+
+    try:
+        present = subprocess.run(
+            ["docker", "network", "inspect", PIPELINE_COMPOSE_OVERRIDE_NET],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15,
+        ).returncode == 0
+    except (subprocess.TimeoutExpired, OSError) as e:
+        # Not fatal. Falling back to the base file only costs DB-backed gates,
+        # which is strictly better than refusing to build at all because the
+        # docker CLI was slow to answer.
+        logger.warning(f"Pipeline: could not check for {PIPELINE_COMPOSE_OVERRIDE_NET} ({e}). "
+                       f"Building without {PIPELINE_COMPOSE_OVERRIDE}.")
+        return files
+
+    if present:
+        files += ["-f", PIPELINE_COMPOSE_OVERRIDE]
+        logger.info(f"Pipeline: network {PIPELINE_COMPOSE_OVERRIDE_NET} present; applying "
+                    f"{PIPELINE_COMPOSE_OVERRIDE}. DB-backed gates can reach the database.")
+    else:
+        logger.warning(f"Pipeline: network {PIPELINE_COMPOSE_OVERRIDE_NET} not found, so "
+                       f"{PIPELINE_COMPOSE_OVERRIDE} is not applied. DB-backed gates will be "
+                       f"skipped as environment faults - a green build proves nothing about "
+                       f"persistence. Start veriform's stack to change that.")
+    return files
 
 
 async def _trigger_build_pipeline(messages: list, extra_env: Optional[dict] = None, mode_label: str = "Autonomous") -> str:
@@ -2635,10 +2839,29 @@ async def _trigger_build_pipeline(messages: list, extra_env: Optional[dict] = No
     3. Launches the cline-builder Docker container.
     """
     try:
-        # 1. Handle direct cloning if repo info is provided in the build command
+        # 1. Handle direct cloning, but ONLY when the caller asked for it by flag.
+        #
+        # This used to fire on `"http" in last_msg`, which is not a test for "the
+        # user supplied a repository" - it is a test for "the user typed a URL".
+        # _handle_clone_command then took the FIRST http-prefixed token in the
+        # message as the clone target, so describing the work could abort it:
+        #
+        #   git clone http://host.docker.internal:8080/  -> Could not resolve host
+        #   git clone 'http://localhost:8025)'           -> the Mailpit UI, with
+        #                                                   the closing paren
+        #
+        # Both were mentions inside a sentence, and each one killed the run at
+        # the ❌ check below - after the GPU lock had already evicted the model.
+        # A prompt that discusses a service by URL is the normal case for this
+        # project, not an edge case.
+        #
+        # Requiring the flag costs nothing: `!clone <url>` is the explicit command
+        # for this, and `!build --repo <url>` still works. There is no way to tell
+        # a git remote from a URL the user merely referred to, so the fix is to
+        # stop guessing rather than to guess more cleverly.
         last_msg = messages[-1].get("content", "").strip()
-        if "--repo" in last_msg or "http" in last_msg or "git@" in last_msg:
-            logger.info("Direct repo/kb info detected in !build command. Triggering clone sync...")
+        if "--repo" in last_msg or "--kb" in last_msg:
+            logger.info("Explicit --repo/--kb flag in build command. Triggering clone sync...")
             clone_status = _handle_clone_command(messages)
             if "❌" in clone_status:
                 return clone_status
@@ -2682,7 +2905,8 @@ async def _trigger_build_pipeline(messages: list, extra_env: Optional[dict] = No
         container_name = f"cline-builder-{int(time.time())}"
         project_name = os.path.basename(abs_target_dir)
         cmd = [
-            "docker", "compose", "--profile", "build", "run", "-d", "--rm",
+            "docker", "compose", *_compose_files(),
+            "--profile", "build", "run", "-d", "--rm",
             "--name", container_name,
             "-v", f"{abs_target_dir}:/workspace",
             "-e", "CONVERSATION_FILE=/workspace/.cline_context/conversation.json",
@@ -2994,6 +3218,147 @@ def _design_review_path(messages: list, pass_key: str) -> Optional[str]:
                         f"distill_{pass_key}.md")
 
 
+# --- Design document archive ---------------------------------------------------
+#
+# Every gate run clears BOTH design documents before it starts, so a sibling left
+# by the other gate can never be one mis-read `.design_pass` away from being
+# built. That is a real safety property and it stays. What it also did was delete
+# things: an `!architect` run destroyed a `!bugfix` diagnosis that had cost 20
+# minutes of GPU and carried a VERIFIED reproduction, with no way back.
+#
+# So the clear step archives rather than deletes. Two constraints shape where.
+#
+# 1. entrypoint.sh runs `rm -f /workspace/.cline_context/distill_*.md` on every
+#    non-resume run — which is every !architect, !bugfix and !build. The obvious
+#    name, `distill_bugfix.prev.md`, MATCHES that glob: it would look correct in
+#    review and be silently destroyed by the container on the next gate run.
+#    Verified by running the glob against candidate names. A subdirectory cannot
+#    match it, and cannot be reached by _design_review_path either, which only
+#    ever builds `distill_<pass>.md`.
+# 2. `.cline_context/` is already gitignored, so this adds no repo noise.
+#
+# Timestamped rather than a single `.prev` so a second gate run cannot overwrite
+# the one copy that mattered.
+DESIGN_ARCHIVE_DIR = "design_archive"
+
+# Copies kept per pass. Bounded, so a run of repeated gate invocations does not
+# turn the directory into a junk drawer.
+DESIGN_ARCHIVE_KEEP = 5
+
+
+def _design_archive_dir(messages: list) -> Optional[str]:
+    """Directory holding superseded design documents, or None if unbound."""
+    project_dir = _get_bound_project_dir(messages)
+    if not project_dir:
+        return None
+    return os.path.join(os.path.abspath(project_dir), ".cline_context",
+                        DESIGN_ARCHIVE_DIR)
+
+
+def _archived_designs(messages: list, pass_key: str) -> list:
+    """Archived copies of one pass, newest first."""
+    archive = _design_archive_dir(messages)
+    if not archive or not os.path.isdir(archive):
+        return []
+    prefix = f"{pass_key}-"
+    try:
+        names = [n for n in os.listdir(archive)
+                 if n.startswith(prefix) and n.endswith(".md")]
+    except OSError:
+        return []
+    paths = [os.path.join(archive, n) for n in names]
+    return sorted(paths, key=lambda p: os.path.getmtime(p), reverse=True)
+
+
+def _archive_design_document(messages: list, pass_key: str) -> Optional[str]:
+    """
+    Move a pass's current document into the archive. Returns the archive path.
+
+    Falls back to DELETING on any failure. The caller's contract is "this file is
+    no longer live"; keeping it is a convenience and losing the safety property
+    would be a worse bug than the one this exists to fix, so recoverability is
+    never allowed to win over removal.
+    """
+    live = _design_review_path(messages, pass_key)
+    if not live or not os.path.exists(live):
+        return None
+
+    archive = _design_archive_dir(messages)
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    try:
+        os.makedirs(archive, exist_ok=True)
+        dest = os.path.join(archive, f"{pass_key}-{stamp}.md")
+        # A second archive inside the same second must not clobber the first.
+        suffix = 1
+        while os.path.exists(dest):
+            dest = os.path.join(archive, f"{pass_key}-{stamp}-{suffix}.md")
+            suffix += 1
+        os.replace(live, dest)
+    except Exception as e:
+        logger.warning(f"Could not archive previous {pass_key} document ({e}); "
+                       f"deleting it instead so it cannot be built.")
+        try:
+            os.remove(live)
+        except Exception as e2:
+            logger.warning(f"Could not remove previous {pass_key} document: {e2}")
+        return None
+
+    for stale in _archived_designs(messages, pass_key)[DESIGN_ARCHIVE_KEEP:]:
+        try:
+            os.remove(stale)
+        except OSError:
+            pass
+    return dest
+
+
+def _restore_design_document(messages: list, pass_key: str) -> str:
+    """
+    Bring the newest archived document for `pass_key` back as the live one.
+
+    Restoring the file is only half the job. `!approve` resumes whichever pass
+    `.design_pass` names, so a restored diagnosis with the marker still reading
+    "architect" builds the wrong thing - which is precisely the manual workaround
+    this replaces, and the half people forget.
+
+    Whatever is currently live is archived first. Otherwise restoring bugfix
+    while an architect document sits beside it recreates the two-live-documents
+    state the clear step exists to prevent.
+    """
+    ui = _DESIGN_PASS_UI[pass_key]
+    live = _design_review_path(messages, pass_key)
+    if not live:
+        return "⚠️ **No project bound to this conversation.**"
+
+    archives = _archived_designs(messages, pass_key)
+    if not archives:
+        others = [k for k in DESIGN_PASSES
+                  if k != pass_key and _archived_designs(messages, k)]
+        hint = (f"\n\nThere is an archived {_DESIGN_PASS_UI[others[0]]['noun']} though — "
+                f"`!restore {others[0]}`.") if others else ""
+        return (f"📭 **Nothing archived for `{pass_key}`.**\n\n"
+                f"A document is archived when a gate run displaces it. Run "
+                f"`{ui['command']}` to generate one.{hint}")
+
+    newest = archives[0]
+    for key in DESIGN_PASSES:
+        _archive_design_document(messages, key)
+
+    try:
+        os.replace(newest, live)
+    except Exception as e:
+        return f"❌ **Could not restore the {ui['noun']}:** {e}"
+
+    _write_design_pass(messages, pass_key)
+    when = time.strftime("%H:%M:%S on %d %b", time.localtime(os.path.getmtime(live)))
+    return (
+        f"♻️ **{ui['label']} {ui['noun']} restored** (archived at {when}).\n\n"
+        f"`.design_pass` is set back to `{pass_key}`, so `!approve` will build "
+        f"this one.\n"
+        f"- **Review it:** `!review`\n"
+        f"- **Build it:** `!approve`"
+    )
+
+
 def _distill_status_path(messages: list) -> Optional[str]:
     """Path to the progress line distill.py rewrites at each phase boundary."""
     project_dir = _get_bound_project_dir(messages)
@@ -3056,10 +3421,21 @@ def _read_design_review(messages: list, pass_key: str) -> str:
     if not path:
         return f"⚠️ **No project bound to this conversation.** Run `{ui['command']}` first."
     if not os.path.exists(path):
+        # The one moment the archive is worth mentioning. Without this it is a
+        # feature nobody discovers at exactly the point they need it, which is
+        # indistinguishable from not having built it.
+        archives = _archived_designs(messages, pass_key)
+        recovery = ""
+        if archives:
+            when = time.strftime("%H:%M:%S on %d %b",
+                                 time.localtime(os.path.getmtime(archives[0])))
+            recovery = (f"\n\n📦 An earlier {ui['noun']} from **{when}** was archived "
+                        f"when a later gate run displaced it. Bring it back with "
+                        f"`!restore {pass_key}`.")
         return (
             f"📭 **No {ui['noun']} to review yet.**\n\n"
             f"Run `{ui['command']}` to generate one. If you just started it, give it a "
-            f"few seconds and try `!review` again."
+            f"few seconds and try `!review` again.{recovery}"
         )
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -3124,13 +3500,14 @@ async def _run_design_review(messages: list, pass_key: str, streaming: bool = Fa
     # distill_*.md on a resume run precisely so `!approve` can reuse them, so a
     # sibling left from the other gate would sit on disk indefinitely and be one
     # mis-read marker away from being built.
+    #
+    # Archived rather than deleted - see _archive_design_document. Still removed
+    # from where anything can build it; just no longer destroyed.
+    archived = []
     for key in DESIGN_PASSES:
-        stale = _design_review_path(messages, key)
-        if stale and os.path.exists(stale):
-            try:
-                os.remove(stale)
-            except Exception as e:
-                logger.warning(f"Could not clear previous {key} document: {e}")
+        dest = _archive_design_document(messages, key)
+        if dest:
+            archived.append((key, dest))
 
     _write_design_pass(messages, pass_key)
 
@@ -3177,6 +3554,16 @@ async def _run_design_review(messages: list, pass_key: str, streaming: bool = Fa
         yield False, (f"🩺 **{ui['label']} pass running** (`{container_name}`)\n\n"
                       if pass_key == "bugfix" else
                       f"🏗️ **{ui['label']} pass running** (`{container_name}`)\n\n")
+        # Only the OTHER pass is worth reporting. Re-running `!architect` over an
+        # old architect document is the expected thing; quietly displacing a
+        # verified diagnosis from the other gate is the surprise, and is exactly
+        # what used to be unrecoverable.
+        for key, _dest in archived:
+            if key != pass_key:
+                yield False, (
+                    f"📦 Your existing **{_DESIGN_PASS_UI[key]['noun']}** was moved "
+                    f"aside, not deleted — `!restore {key}` brings it back.\n\n"
+                )
 
     while time.time() < deadline:
         await asyncio.sleep(DESIGN_REVIEW_POLL_SECS)

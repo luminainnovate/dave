@@ -59,7 +59,7 @@ CLINERULES_PATH="${CLINERULES_PATH:-/workspace/.clinerules}"
 OLLAMA_HOST="${OLLAMA_HOST:-http://host.docker.internal:11434}"
 # Must match orchestrator.py's CLINE_CTX. The two defaults drifting apart is how
 # the banner ends up reporting a window nobody is running at.
-CLINE_CTX="${CLINE_CTX:-131072}"
+CLINE_CTX="${CLINE_CTX:-163840}"
 # 'full' runs distillation then the Cline build cycle.
 # 'distill_only' stops at the review gate. Defaulted because set -u is active.
 PIPELINE_MODE="${PIPELINE_MODE:-full}"
