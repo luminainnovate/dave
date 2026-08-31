@@ -1634,6 +1634,26 @@ def test_config_sampling_block_is_resolved_for_every_phase():
         distill.SAMPLING_BY_PASS = original
 
 
+def test_an_operator_note_beside_a_preset_is_not_read_as_a_preset():
+    """
+    Underscore keys are comments throughout this config, and _modes is the one
+    place that convention was not honoured: a note next to a preset was parsed as
+    a preset and raised at startup.
+    """
+    original = distill.SAMPLING_BY_PASS
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            distill._resolve_sampling({
+                "sampling": {"_modes": {
+                    "_thinking_help": "why this is not 1.0",
+                    "thinking": {"temperature": 0.95},
+                }}
+            })
+        assert distill.SAMPLING_BY_PASS["architect"]["temperature"] == 0.95
+    finally:
+        distill.SAMPLING_BY_PASS = original
+
+
 def test_the_shipped_config_names_a_mode_for_every_phase():
     """
     The config is the source of truth for sampling, so a phase missing from it is
@@ -1644,8 +1664,12 @@ def test_the_shipped_config_names_a_mode_for_every_phase():
     for phase, mode in distill.DEFAULT_SAMPLING_MODES.items():
         assert phase in block, f"agent_config.json has no sampling entry for '{phase}'"
         assert block[phase].get("mode") == mode, phase
+    # The presets themselves are the operator's to retune - that is what _modes is
+    # for - so this checks their shape, not their values. Asserting equality with
+    # the built-in defaults would make every deliberate tune a test failure.
     for name, preset in distill.SAMPLING_MODES.items():
-        assert block["_modes"][name] == preset, name
+        assert set(block["_modes"][name]) == set(preset), name
+        assert all(isinstance(v, (int, float)) for v in block["_modes"][name].values()), name
 
 
 def test_ollama_gets_a_boolean_because_effort_levels_do_not_cross_over():

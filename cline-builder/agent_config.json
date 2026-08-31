@@ -46,8 +46,9 @@
 
     "sampling": {
         "_modes": {
+            "_thinking_temperature_help": "0.95 rather than the card's 1.0: a deliberate local tune, carried over from the SAMPLING_TEMPERATURE constant this block replaced. It sits just under the preset rather than far below it - the repetition-loop risk this family shows is at temperatures well under the card's figures, which 0.6 and 0.3 both were.",
             "thinking": {
-                "temperature": 1.0,
+                "temperature": 0.95,
                 "top_p": 0.95,
                 "top_k": 20,
                 "min_p": 0.0,

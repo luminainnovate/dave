@@ -299,11 +299,12 @@ PARAMS_GENERAL = {
 # mode (--reasoning-format deepseek, reasoning_effort low), so thinking is the
 # preset that applies here - not instruct (0.7/0.80/20, presence 1.5).
 #
-# temperature was 0.6, which is below BOTH of the card's presets. distill.py's
-# SAMPLING_TEMPERATURE comment already makes the argument against that, about the
-# 0.3 it replaced: on this family a temperature far under the presets is a
-# repetition-loop risk, and that is the shape of the failure seen in long passes.
-# 0.6 is the same mistake with less of it.
+# temperature was 0.6, which is below BOTH of the card's presets. The same
+# argument is made against the 0.3 that distill.py's sampling presets replaced:
+# on this family a temperature far under the presets is a repetition-loop risk,
+# and that is the shape of the failure seen in long passes. 0.6 is the same
+# mistake with less of it. (Those presets now live in agent_config.json under
+# `sampling._modes`; this dict is the expert chat's, and is unrelated to them.)
 #
 # repeat_penalty was 1.15, and two separate things were wrong with it:
 #

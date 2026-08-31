@@ -585,6 +585,10 @@ def _resolve_sampling(config: dict) -> None:
 
     modes = {name: dict(params) for name, params in SAMPLING_MODES.items()}
     for name, override in (block.get("_modes") or {}).items():
+        # Underscore keys are operator notes, here as everywhere else in this
+        # config. Without this a comment beside a preset is read as a preset.
+        if name.startswith("_"):
+            continue
         if not isinstance(override, dict):
             raise ValueError(f"sampling._modes.{name} must be an object.")
         unknown = [k for k in override if k not in SAMPLING_PARAMS]
