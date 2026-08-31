@@ -518,15 +518,15 @@ async def _start_llamacpp_server(config: dict):
             # states the intent, and preserved traces would inflate the agent's
             # context exactly where it is already tightest.
             "--no-reasoning-preserve",
-            # Sampling: the model card's thinking-mode figures. llama.cpp's own
-            # defaults (temp 0.80, top-k 40, min-p 0.05) are not these, and the
-            # Cline agent sends no sampler settings, so without this it inherits
-            # the wrong ones for every build turn.
-            "--temp", "1.0",
-            "--top-p", "0.95",
-            "--top-k", "20",
-            "--min-p", "0.0",
         ]
+        # Sampling for the Cline build agent. llama.cpp's own defaults (temp 0.80,
+        # top-k 40, min-p 0.05) are not the model card's, and the agent sends no
+        # sampler settings at all, so without these it inherits the wrong ones for
+        # every build turn. Read from agent_config.json's `sampling.cline_startup`
+        # so the agent's parameters live beside every other phase's rather than
+        # being the one set buried in a launch line. Server-side defaults only:
+        # distill.py sends its own per-pass values, which override these.
+        truncate_args += _cline_startup_sampling_args()
         # "--spec-type", "draft-mtp"
 
         # Build command: detect HuggingFace repo vs local path
@@ -640,6 +640,62 @@ app = FastAPI(title="Bob: AI Workspace Orchestrator", lifespan=lifespan)
 # =============================================================================
 # VRAM MANAGEMENT
 # =============================================================================
+
+# The sampling parameters the Cline build agent runs under, as llama-server
+# flags. Its phase is `cline_startup` in agent_config.json - the one phase whose
+# sampling cannot be sent per request, because Cline speaks plain
+# openai-compatible and sends no sampler settings, so the server has to carry it.
+#
+# Read fresh at launch, like _get_first_pass_model(), and degraded to the card's
+# thinking preset rather than raised on: a malformed sampling block should not
+# stop a model loading, and the values it would have supplied are the ones the
+# fallback already holds.
+CLINE_STARTUP_SAMPLING_DEFAULTS = {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 0.0,
+    "repetition_penalty": 1.0,
+}
+# Config name -> llama-server flag. The card calls it repetition_penalty; the
+# server calls the same knob --repeat-penalty.
+_SAMPLING_FLAGS = {
+    "temperature": "--temp",
+    "top_p": "--top-p",
+    "top_k": "--top-k",
+    "min_p": "--min-p",
+    "presence_penalty": "--presence-penalty",
+    "repetition_penalty": "--repeat-penalty",
+}
+
+
+def _cline_startup_sampling_args() -> list[str]:
+    """llama-server sampling flags for the Cline build agent's phase."""
+    params = dict(CLINE_STARTUP_SAMPLING_DEFAULTS)
+    path = os.environ.get("AGENT_CONFIG_PATH", "cline-builder/agent_config.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            block = json.load(f).get("sampling") or {}
+        modes = block.get("_modes") or {}
+        entry = block.get("cline_startup") or {}
+        params.update(modes.get(entry.get("mode", "thinking"), {}))
+        params.update({k: v for k, v in entry.items()
+                       if k in CLINE_STARTUP_SAMPLING_DEFAULTS})
+    except Exception as e:
+        logger.warning(
+            f"Could not read sampling.cline_startup from {path}: {e}. "
+            f"Using the model card's thinking preset."
+        )
+        params = dict(CLINE_STARTUP_SAMPLING_DEFAULTS)
+
+    args = []
+    for name, flag in _SAMPLING_FLAGS.items():
+        value = params.get(name, CLINE_STARTUP_SAMPLING_DEFAULTS[name])
+        args += [flag, str(int(value)) if name == "top_k" else f"{float(value):g}"]
+    logger.info(f"llama.cpp: Cline sampling defaults {' '.join(args)}")
+    return args
+
 
 def _get_first_pass_model() -> Optional[str]:
     """
