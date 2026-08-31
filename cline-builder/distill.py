@@ -183,16 +183,59 @@ REASONING_RESERVE_MULTIPLIER = {
 }
 
 # --- Sampling ---
-# The model card's thinking-mode figures. The previous 0.3 was set for a
-# non-thinking model and is far below both of the card's presets (thinking
-# 1.0/0.95/20, instruct 0.7/0.80/20); on this family a temperature that low is a
-# repetition-loop risk, which is the shape of the failure that has been showing
-# up in long passes. min_p 0.0 disables it, as the card specifies - llama.cpp
-# defaults it to 0.05.
-SAMPLING_TEMPERATURE = 1.0
-SAMPLING_TOP_P = 0.95
-SAMPLING_TOP_K = 20
-SAMPLING_MIN_P = 0.0
+# Per phase, read from the `sampling` block of agent_config.json. It used to be
+# four module constants, which meant every pass sampled identically: the engineer
+# - the one pass that is transcribing an architecture into a file map rather than
+# reasoning about it - ran at the thinking preset's temperature 1.0 along with
+# everything else.
+#
+# The two presets below are the model card's own, and they are not
+# interchangeable: thinking mode wants a wide, unpenalised distribution because
+# the reasoning channel needs room to explore, while instruct mode wants a
+# narrower one with a presence penalty to stop a non-thinking pass restating
+# itself. min_p 0.0 disables it, as the card specifies - llama.cpp defaults it
+# to 0.05 and Ollama to 0.0.
+SAMPLING_MODES = {
+    "thinking": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repetition_penalty": 1.0,
+    },
+    "instruct": {
+        "temperature": 0.7,
+        "top_p": 0.80,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 1.5,
+        "repetition_penalty": 1.0,
+    },
+}
+SAMPLING_PARAMS = tuple(SAMPLING_MODES["thinking"])
+
+# Which preset each phase runs in when the config names none. `engineer` is the
+# only instruct phase: it emits a file-by-file build map from an architecture
+# that has already been decided, and thinking-mode sampling on that job produces
+# invention where transcription was wanted. Every other phase, including the
+# `bugfix` design pass and the Cline build agent's own turns, is reasoning.
+DEFAULT_SAMPLING_MODES = {
+    "cline_startup": "thinking",
+    "architect": "thinking",
+    "engineer": "instruct",
+    "safety": "thinking",
+    "test_engineer": "thinking",
+    "bugfix": "thinking",
+}
+# What an unrecognised phase gets. Thinking, because every pass in the pipeline
+# except one is a thinking pass and a new one is far more likely to be another.
+FALLBACK_SAMPLING_MODE = "thinking"
+
+# pass key -> resolved parameter dict. Settled against agent_config.json in
+# _resolve_sampling() once the config is read; the built-in presets stand until
+# then, so a caller that never loads a config still samples sanely.
+SAMPLING_BY_PASS: dict = {}
 
 # Absolute ceiling on knowledge-base injection. The real limit is solved per run
 # by solve_kb_budget(); this only stops a very large window from pulling in an
@@ -468,6 +511,132 @@ def solve_kb_budget(window: int, system_tokens: int, payload_tokens: int) -> int
     has to fit single-pass too.
     """
     return min(KB_MAX_CHARS, solve_addendum_budget(window, system_tokens, payload_tokens))
+
+
+def _validate_sampling(entry, pass_key: str, modes: dict) -> dict:
+    """
+    Resolve one phase's `sampling` entry into a full parameter set.
+
+    An entry names a `mode` - one of the presets - and may override individual
+    parameters on top of it. Naming the mode is the point: it says what kind of
+    pass this is, so the six numbers stay consistent when a preset is retuned,
+    and an override is visibly a deviation from it rather than a fresh set of
+    numbers nobody can compare against anything.
+
+    Validated here rather than at the call site, because a typo in a sampler name
+    is otherwise silently dropped by every server involved and shows up only as a
+    pass that samples wrong - which looks exactly like a bad prompt.
+    """
+    mode = DEFAULT_SAMPLING_MODES.get(pass_key, FALLBACK_SAMPLING_MODE)
+    overrides = {}
+
+    if entry is not None:
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"sampling.{pass_key} must be an object, got {type(entry).__name__}."
+            )
+        if "mode" in entry:
+            mode = str(entry["mode"]).strip().lower()
+        # Leading underscores are the convention this config uses for operator
+        # notes; they are documentation, not parameters.
+        overrides = {k: v for k, v in entry.items()
+                     if k != "mode" and not k.startswith("_")}
+        unknown = [k for k in overrides if k not in SAMPLING_PARAMS]
+        if unknown:
+            raise ValueError(
+                f"Unknown sampling parameter(s) {', '.join(sorted(unknown))} in "
+                f"sampling.{pass_key}. Supported: {', '.join(SAMPLING_PARAMS)}."
+            )
+
+    if mode not in modes:
+        raise ValueError(
+            f"Unknown sampling mode '{mode}' for '{pass_key}'. "
+            f"Supported: {', '.join(sorted(modes))}."
+        )
+
+    params = dict(modes[mode])
+    for key, value in overrides.items():
+        try:
+            params[key] = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"sampling.{pass_key}.{key} must be a number, got {value!r}."
+            )
+    # top_k is a count of candidates, not a probability; both servers reject a float.
+    params["top_k"] = int(params["top_k"])
+    return params
+
+
+def _resolve_sampling(config: dict) -> None:
+    """
+    Settle every phase's sampling parameters against agent_config.json.
+
+    Two levels, both optional. `sampling._modes` retunes the presets themselves,
+    which is how an operator moves every thinking pass at once; `sampling.<phase>`
+    picks a preset for one phase and overrides parameters on it. A config with no
+    `sampling` block at all gets the built-in presets under the default
+    mode-per-phase map, which is what every existing config does.
+    """
+    global SAMPLING_BY_PASS
+
+    block = config.get("sampling") or {}
+    if not isinstance(block, dict):
+        raise ValueError(f"`sampling` must be an object, got {type(block).__name__}.")
+
+    modes = {name: dict(params) for name, params in SAMPLING_MODES.items()}
+    for name, override in (block.get("_modes") or {}).items():
+        if not isinstance(override, dict):
+            raise ValueError(f"sampling._modes.{name} must be an object.")
+        unknown = [k for k in override if k not in SAMPLING_PARAMS]
+        if unknown:
+            raise ValueError(
+                f"Unknown sampling parameter(s) {', '.join(sorted(unknown))} in "
+                f"sampling._modes.{name}. Supported: {', '.join(SAMPLING_PARAMS)}."
+            )
+        modes.setdefault(name, dict(SAMPLING_MODES[FALLBACK_SAMPLING_MODE])).update(
+            {k: float(v) for k, v in override.items()}
+        )
+
+    configured = {k: v for k, v in block.items() if not k.startswith("_")}
+    resolved = {}
+    for pass_key in list(DEFAULT_SAMPLING_MODES) + list(configured):
+        if pass_key in resolved:
+            continue
+        resolved[pass_key] = _validate_sampling(configured.get(pass_key), pass_key, modes)
+
+    SAMPLING_BY_PASS = resolved
+    source = "agent_config.json" if configured or block.get("_modes") else "defaults"
+    summary = ", ".join(
+        f"{k} t={v['temperature']:g}/p={v['top_p']:g}" for k, v in resolved.items()
+    )
+    print(f"🎲 Sampling (source: {source}): {summary}", flush=True)
+
+
+def sampling_for(pass_key) -> dict:
+    """
+    The resolved sampling set for a phase, or the default for its kind.
+
+    Falls back to the built-in presets rather than raising, so a code path that
+    resolves a model config before _resolve_sampling() has run - or for a phase
+    the config never names - still sends a coherent set.
+    """
+    if pass_key in SAMPLING_BY_PASS:
+        return dict(SAMPLING_BY_PASS[pass_key])
+    mode = DEFAULT_SAMPLING_MODES.get(pass_key, FALLBACK_SAMPLING_MODE)
+    return dict(SAMPLING_MODES[mode])
+
+
+def sampling_payload(sampling: dict) -> dict:
+    """
+    Wire names for a resolved sampling set.
+
+    The config says `repetition_penalty` because that is what the model card
+    calls it; llama.cpp and Ollama both call the same knob `repeat_penalty`, and
+    a request that sends the card's name simply has it ignored.
+    """
+    wire = {k: sampling[k] for k in SAMPLING_PARAMS if k != "repetition_penalty"}
+    wire["repeat_penalty"] = sampling["repetition_penalty"]
+    return wire
 
 
 def _resolve_context_window(config: dict) -> None:
@@ -1485,15 +1654,23 @@ def mark_unverified(document: str, attempts: int) -> str:
     )
 
 
-def _resolve_model_config(model_entry, default_host: str = None) -> dict:
+def _resolve_model_config(model_entry, default_host: str = None,
+                          pass_key: str = None) -> dict:
     """
     Resolve a model entry from config into a normalized dict.
     Supports both legacy string format and new object format.
+
+    `pass_key` is which phase this config is for. Sampling is per phase and the
+    model entry does not carry it - two phases routinely share one model and want
+    different sampling - so it is attached here from the `sampling` block. A
+    caller with no phase in hand (residency checks, evictions) omits it and gets
+    the default set, which those paths never send anywhere.
     """
     if default_host is None:
         default_host = OLLAMA_HOST
     if isinstance(model_entry, str):
-        return {"model": model_entry, "provider": "ollama", "base_url": default_host}
+        return {"model": model_entry, "provider": "ollama", "base_url": default_host,
+                "sampling": sampling_for(pass_key)}
     return {
         "model": model_entry.get("model", ""),
         "provider": model_entry.get("provider", "ollama"),
@@ -1501,6 +1678,7 @@ def _resolve_model_config(model_entry, default_host: str = None) -> dict:
         "args": model_entry.get("args", []),
         "reasoning": _validate_reasoning(model_entry.get("reasoning", DEFAULT_REASONING),
                                          model_entry.get("model", "")),
+        "sampling": sampling_for(pass_key),
     }
 
 
@@ -2751,6 +2929,9 @@ def _stream_llm_once(client: httpx.Client, model_config, system_prompt: str, use
     # the addition the pass would spend its answer allowance on thought, and
     # without the subtraction the larger cap would overrun the window.
     reasoning, reserve = _reasoning_spec(cfg)
+    # Sampling is settled at config-resolution time and travels on the config, so
+    # a continuation samples exactly as the call it is continuing did.
+    sampling = cfg.get("sampling") or sampling_for(None)
     if force_no_thinking:
         # A continuation inherits the reasoning the first call already did. Left
         # on, it would spend the whole cap thinking again and return another
@@ -2779,10 +2960,7 @@ def _stream_llm_once(client: httpx.Client, model_config, system_prompt: str, use
             "think": reasoning != "off",
             "options": {
                 "num_ctx": CONTEXT_WINDOW,
-                "temperature": SAMPLING_TEMPERATURE,
-                "top_p": SAMPLING_TOP_P,
-                "top_k": SAMPLING_TOP_K,
-                "min_p": SAMPLING_MIN_P,
+                **sampling_payload(sampling),
                 "num_predict": output_cap,
             },
             "keep_alive": "3m"
@@ -2793,10 +2971,7 @@ def _stream_llm_once(client: httpx.Client, model_config, system_prompt: str, use
             "model": model_name,
             "messages": _messages(),
             "stream": True,
-            "temperature": SAMPLING_TEMPERATURE,
-            "top_p": SAMPLING_TOP_P,
-            "top_k": SAMPLING_TOP_K,
-            "min_p": SAMPLING_MIN_P,
+            **sampling_payload(sampling),
             "max_tokens": output_cap,
             # llama.cpp honours template kwargs; ignored harmlessly by servers that
             # don't. Off is enable_thinking=false rather than a reasoning_effort
@@ -3598,6 +3773,7 @@ def run_distillation():
 
     config = load_config()
     _resolve_context_window(config)
+    _resolve_sampling(config)
     models = config.get("models", {})
     prompts = load_prompts(config)
     messages = load_conversation()
@@ -3835,7 +4011,8 @@ def run_distillation():
         if keep_key:
             evict_stale_models(
                 client, models,
-                _resolve_model_config(models.get(keep_key, models.get("architect")))
+                _resolve_model_config(models.get(keep_key, models.get("architect")),
+                                      pass_key=keep_key)
             )
         else:
             print("  ↳ Every pass is resuming from disk; no model needed.", flush=True)
@@ -3854,7 +4031,7 @@ def run_distillation():
                     continue
 
             model_entry = models.get(pass_key, models.get("architect"))
-            model_config = _resolve_model_config(model_entry)
+            model_config = _resolve_model_config(model_entry, pass_key=pass_key)
             model_name = model_config.get("model", "")
             prompt = prompts.get(pass_key, "Analyze the following conversation.")
 
@@ -4350,6 +4527,7 @@ def run_replan(growth_threshold: int, max_replans: int) -> int:
 
     config = load_config()
     _resolve_context_window(config)
+    _resolve_sampling(config)
     models = config.get("models", {})
     prompts = load_prompts(config)
     # `replan_passes` is configured by name, and the name it carries is
@@ -4419,7 +4597,7 @@ def run_replan(growth_threshold: int, max_replans: int) -> int:
             print(f"\n🔄 Re-planning: {pass_key}", flush=True)
             print("-" * 40, flush=True)
             model_config = _resolve_model_config(
-                models.get(pass_key, models.get("architect")))
+                models.get(pass_key, models.get("architect")), pass_key=pass_key)
             model_name = model_config.get("model", "")
             prompt = prompts.get(pass_key, "Revise the plan.")
 

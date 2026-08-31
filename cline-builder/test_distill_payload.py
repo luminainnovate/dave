@@ -1417,7 +1417,8 @@ class _PayloadCaptured(BaseException):
     """
 
 
-def _payload_for(reasoning: str, provider: str = "llamacpp") -> dict:
+def _payload_for(reasoning: str, provider: str = "llamacpp",
+                 pass_key: str = None) -> dict:
     """
     Capture the request body _single_llm_call would send, without sending it.
 
@@ -1440,7 +1441,7 @@ def _payload_for(reasoning: str, provider: str = "llamacpp") -> dict:
     cfg = distill._resolve_model_config({
         "model": "m", "provider": provider,
         "base_url": "http://x", "reasoning": reasoning,
-    })
+    }, pass_key=pass_key)
     real_client = distill.httpx.Client
     distill.httpx.Client = FakeClient
     try:
@@ -1510,18 +1511,141 @@ def test_the_reserve_is_taken_back_out_of_the_solver_window():
     assert facts_on < facts_off, (facts_on, facts_off)
 
 
+def _sampling_in(payload: dict, provider: str) -> dict:
+    """Where a provider carries sampling: Ollama nests it, OpenAI-compatible doesn't."""
+    return payload["options"] if provider == "ollama" else payload
+
+
+_PROVIDERS = ("llamacpp", "ollama")
+
+
 def test_sampling_matches_the_model_card():
     """
     0.3 was set for a non-thinking model and sits below both of the card's
     presets; on this family that is a repetition-loop risk.
     """
-    for provider, get in (("llamacpp", lambda p: p),
-                          ("ollama", lambda p: p["options"])):
-        opts = get(_payload_for("low", provider))
-        assert opts["temperature"] == distill.SAMPLING_TEMPERATURE, provider
-        assert opts["top_p"] == distill.SAMPLING_TOP_P, provider
-        assert opts["top_k"] == distill.SAMPLING_TOP_K, provider
-        assert opts["min_p"] == distill.SAMPLING_MIN_P, provider
+    card = distill.SAMPLING_MODES["thinking"]
+    for provider in _PROVIDERS:
+        opts = _sampling_in(_payload_for("low", provider, "architect"), provider)
+        assert opts["temperature"] == card["temperature"], provider
+        assert opts["top_p"] == card["top_p"], provider
+        assert opts["top_k"] == card["top_k"], provider
+        assert opts["min_p"] == card["min_p"], provider
+
+
+def test_each_phase_samples_in_its_own_mode():
+    """
+    The whole point of per-phase sampling: the engineer is the one instruct pass
+    and must not inherit the thinking preset every other phase runs at.
+    """
+    thinking = distill.SAMPLING_MODES["thinking"]
+    instruct = distill.SAMPLING_MODES["instruct"]
+    for provider in _PROVIDERS:
+        eng = _sampling_in(_payload_for("low", provider, "engineer"), provider)
+        assert eng["temperature"] == instruct["temperature"], provider
+        assert eng["top_p"] == instruct["top_p"], provider
+        assert eng["presence_penalty"] == instruct["presence_penalty"], provider
+
+        for phase in ("architect", "safety", "test_engineer", "bugfix", "cline_startup"):
+            opts = _sampling_in(_payload_for("low", provider, phase), provider)
+            assert opts["temperature"] == thinking["temperature"], (provider, phase)
+            assert opts["top_p"] == thinking["top_p"], (provider, phase)
+            assert opts["presence_penalty"] == thinking["presence_penalty"], (provider, phase)
+
+
+def test_repetition_penalty_reaches_the_wire_under_the_name_servers_know():
+    """
+    The config says repetition_penalty because the model card does; both servers
+    call the knob repeat_penalty, and a request sending the card's name simply
+    has it dropped.
+    """
+    for provider in _PROVIDERS:
+        opts = _sampling_in(_payload_for("low", provider, "engineer"), provider)
+        assert "repeat_penalty" in opts, provider
+        assert "repetition_penalty" not in opts, provider
+        assert opts["repeat_penalty"] == \
+            distill.SAMPLING_MODES["instruct"]["repetition_penalty"], provider
+
+
+def test_a_phase_may_override_one_parameter_of_its_mode():
+    """An override is a deviation from a preset, not a replacement for it."""
+    resolved = distill._validate_sampling(
+        {"mode": "thinking", "temperature": 0.4}, "architect", distill.SAMPLING_MODES)
+    assert resolved["temperature"] == 0.4
+    assert resolved["top_p"] == distill.SAMPLING_MODES["thinking"]["top_p"]
+    assert resolved["presence_penalty"] == 0.0
+
+
+def test_a_phase_with_no_entry_gets_its_default_mode():
+    for phase, mode in distill.DEFAULT_SAMPLING_MODES.items():
+        resolved = distill._validate_sampling(None, phase, distill.SAMPLING_MODES)
+        assert resolved == distill.SAMPLING_MODES[mode], phase
+
+
+def test_a_mistyped_sampler_name_fails_at_config_time():
+    """
+    Every server silently drops an unknown sampler, so the only symptom of a typo
+    is a pass that samples wrong - which is indistinguishable from a bad prompt.
+    """
+    for bad in ({"temprature": 0.7}, {"top_kk": 20}, {"repeat_penalty": 1.1}):
+        try:
+            distill._validate_sampling(bad, "architect", distill.SAMPLING_MODES)
+        except ValueError:
+            continue
+        raise AssertionError(f"{bad} was accepted as a sampling parameter")
+
+    try:
+        distill._validate_sampling({"mode": "creative"}, "architect", distill.SAMPLING_MODES)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an unknown sampling mode was accepted")
+
+
+def test_config_sampling_block_is_resolved_for_every_phase():
+    """
+    _modes retunes a preset for everything that names it; a phase block picks the
+    preset. A config with neither leaves the built-in defaults standing.
+    """
+    original = distill.SAMPLING_BY_PASS
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            distill._resolve_sampling({
+                "sampling": {
+                    "_modes": {"thinking": {"temperature": 0.9}},
+                    "safety": {"mode": "instruct"},
+                }
+            })
+        resolved = distill.SAMPLING_BY_PASS
+        assert set(resolved) >= set(distill.DEFAULT_SAMPLING_MODES)
+        # The retuned preset reaches every thinking phase, not just one.
+        for phase in ("architect", "bugfix", "cline_startup", "test_engineer"):
+            assert resolved[phase]["temperature"] == 0.9, phase
+            # Untouched parameters still come from the preset.
+            assert resolved[phase]["top_p"] == 0.95, phase
+        # ...and not the phase that was moved off it.
+        assert resolved["safety"] == distill.SAMPLING_MODES["instruct"]
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            distill._resolve_sampling({})
+        assert distill.SAMPLING_BY_PASS["engineer"] == distill.SAMPLING_MODES["instruct"]
+        assert distill.SAMPLING_BY_PASS["architect"] == distill.SAMPLING_MODES["thinking"]
+    finally:
+        distill.SAMPLING_BY_PASS = original
+
+
+def test_the_shipped_config_names_a_mode_for_every_phase():
+    """
+    The config is the source of truth for sampling, so a phase missing from it is
+    a phase running on a default nobody chose.
+    """
+    with open(os.path.join(_HERE, "agent_config.json"), encoding="utf-8") as f:
+        block = json.load(f).get("sampling", {})
+    for phase, mode in distill.DEFAULT_SAMPLING_MODES.items():
+        assert phase in block, f"agent_config.json has no sampling entry for '{phase}'"
+        assert block[phase].get("mode") == mode, phase
+    for name, preset in distill.SAMPLING_MODES.items():
+        assert block["_modes"][name] == preset, name
 
 
 def test_ollama_gets_a_boolean_because_effort_levels_do_not_cross_over():

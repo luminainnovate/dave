@@ -41,6 +41,38 @@
     "ollama_host": "http://host.docker.internal:11434",
     
     "context_window": 65536,
+
+    "_sampling_help": "Per-phase sampling. `_modes` holds the model card's two presets - thinking wants a wide, unpenalised distribution because the reasoning channel needs room to explore; instruct wants a narrower one with a presence penalty so a non-thinking pass does not restate itself. Each phase names the mode it runs in and may override individual parameters on top of it (temperature, top_p, top_k, min_p, presence_penalty, repetition_penalty). Naming the mode rather than restating six numbers is the point: retuning a preset moves every phase that uses it, and an override reads as a deliberate deviation. An unknown parameter name is a startup error, not a silently ignored key. `cline_startup` is the Cline build agent's own turns; distill.py does not run that phase, so its values are applied by the orchestrator as llama-server defaults when it starts the shared server.",
+
+    "sampling": {
+        "_modes": {
+            "thinking": {
+                "temperature": 1.0,
+                "top_p": 0.95,
+                "top_k": 20,
+                "min_p": 0.0,
+                "presence_penalty": 0.0,
+                "repetition_penalty": 1.0
+            },
+            "instruct": {
+                "temperature": 0.7,
+                "top_p": 0.80,
+                "top_k": 20,
+                "min_p": 0.0,
+                "presence_penalty": 1.5,
+                "repetition_penalty": 1.0
+            }
+        },
+
+        "cline_startup": { "mode": "thinking" },
+        "architect": { "mode": "thinking" },
+        "_engineer_help": "The only instruct phase. It transcribes an architecture that has already been decided into a file-by-file build map, and thinking-mode sampling on that job produces invention where transcription was wanted.",
+        "engineer": { "mode": "instruct" },
+        "safety": { "mode": "thinking" },
+        "test_engineer": { "mode": "thinking" },
+        "_bugfix_sampling_help": "A discrete phase, outside the four software-factory passes: it replaces the architect in slot 1 for `!bugfix` runs and is never one stage of the same pipeline.",
+        "bugfix": { "mode": "thinking" }
+    },
     
     "_prompts_help": "Prompt bodies live in Markdown files. Values are paths resolved relative to this config file; an inline string is still accepted for backwards compatibility.",
     
