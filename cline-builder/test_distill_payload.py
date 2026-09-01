@@ -2233,13 +2233,19 @@ def test_the_design_pass_is_swapped_not_added():
 
 def test_diagnosis_gets_more_evidence_rounds_than_design():
     """
-    The architect blocks on a specification gap, and a gap that survives being
-    shown the files is one the workspace does not contain - so one round. For
-    diagnosis, reading files IS the work and each round narrows the search.
+    For diagnosis, reading files IS the work and each round narrows the search,
+    so it follows furthest. Design gets fewer but no longer gets one: this used
+    to assert architect == 1 on the reasoning that a gap surviving the files is
+    one the workspace does not contain, and a measured run refuted it - being
+    shown six files changed the question rather than answering or exhausting it.
+
+    The ordering is the invariant, not the numbers.
     """
     assert "bugfix" in distill.EVIDENCE_RETRY_PASSES
     assert distill.EVIDENCE_ROUNDS.get("bugfix", 0) > distill.EVIDENCE_ROUNDS_DEFAULT
-    assert distill.EVIDENCE_ROUNDS.get("architect", distill.EVIDENCE_ROUNDS_DEFAULT) == 1
+    assert (distill.EVIDENCE_ROUNDS.get("bugfix", 0)
+            > distill.EVIDENCE_ROUNDS.get("architect", distill.EVIDENCE_ROUNDS_DEFAULT)
+            >= distill.EVIDENCE_ROUNDS_DEFAULT)
 
 
 def test_every_gate_names_its_own_objective():
@@ -2964,6 +2970,120 @@ def test_parse_survey_claims_ignores_commentary():
            "src/a.ts::doThing\n")
     claims = distill.parse_survey_claims(raw)
     assert [(c.path, c.symbol) for c in claims] == [("src/a.ts", "doThing"), ("src/b.tsx", None)]
+
+
+def test_the_survey_runs_after_the_model_is_loaded():
+    """
+    Ordering, pinned in the source because that is where the defect lived.
+
+    The first version ran the survey before the pass loop and it failed three
+    times with ECONNREFUSED: for a llama.cpp model the server process does not
+    exist until the orchestrator is asked to spawn it, and that request is the
+    preload inside the loop. There was nothing listening on the base URL, and
+    retrying could not start it. The survey's own try/except made this soft, so
+    the run continued and blocked exactly as it would have without the feature -
+    which is why nothing but the log said anything was wrong.
+    """
+    import inspect
+    source = inspect.getsource(distill.run_distillation)
+    preload = source.index("preload_model(client, model_config)")
+    survey = source.index("survey_codebase(")
+    assert preload < survey, \
+        "the survey calls a model before anything has been asked to load one"
+
+    loop = source.index("for pass_key, pass_label in passes:")
+    assert loop < survey, "the survey must run inside the pass loop, after preload"
+
+
+def test_the_survey_placeholder_never_survives_into_a_payload():
+    """
+    Cleared on every pass that reaches the clearing point, survey or not. A run
+    whose design pass is skipped by the review gate, or resumed from disk, must
+    not ship a NUL sentinel to a model.
+    """
+    import inspect
+    source = inspect.getsource(distill.run_distillation)
+    guard = source.index("if SURVEY_PLACEHOLDER in conversation_text:")
+    clear = source.index("conversation_text.replace(\n                    SURVEY_PLACEHOLDER, survey_block)")
+    between = source[guard:clear]
+    assert "if pass_key == DISTILL_DESIGN_PASS" in between, \
+        "only the design pass surveys, but every pass must clear the placeholder"
+    assert distill.SURVEY_PLACEHOLDER not in distill.EVIDENCE_PREAMBLE
+
+
+def test_the_architect_gets_a_round_to_follow_a_trail():
+    """
+    A measured run blocked for three files, was shown six, and came back asking
+    for `config.yaml` and the job-radar install script instead - a narrower
+    question, which is a trail and not a wall. It had no round left to follow it.
+    """
+    assert distill.EVIDENCE_ROUNDS.get("architect") == 2
+    assert distill.EVIDENCE_ROUNDS.get("bugfix") == 3, "diagnosis still follows further"
+    assert distill.EVIDENCE_ROUNDS_DEFAULT == 1, "the review passes are unchanged"
+
+
+def test_config_files_are_listed_but_never_indexed():
+    """
+    A design pass cannot reason about a file it does not know exists. The run
+    that asked for `config.yaml` could name it only because the directory tree
+    happened to show it; the survey sees the index, not the tree, and could not
+    have named it at all.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        os.makedirs(os.path.join(tmp, "src"))
+        for rel, body in {
+            "config.yaml": "sources:\n  - name: x\n",
+            "package.json": '{"name":"p"}',
+            "src/thing.ts": "export function thing(): void {}\n",
+        }.items():
+            with open(os.path.join(tmp, rel), "w", encoding="utf-8") as f:
+                f.write(body)
+        configs = distill.list_config_files(tmp)
+        with contextlib.redirect_stdout(io.StringIO()):
+            index = distill.build_symbol_index(distill.scan_project_files(tmp), configs)
+
+    assert configs == ["config.yaml", "package.json"]
+    assert "config.yaml" in index, "the survey cannot request what it cannot see"
+    assert "sources:" not in index, "a config file's contents must not be indexed"
+    assert "NOT indexed" in index, "the block must say the contents are absent"
+
+
+def test_secrets_and_lockfiles_are_never_listed():
+    """
+    A path a pass can see is a path it can request, and the evidence read puts
+    whatever it is given into a payload that leaves the machine. Anything .env is
+    refused for that reason; lockfiles are refused because a request for one
+    spends the per-file cap to learn nothing a design uses.
+    """
+    assert not distill.is_listable_config(".env")
+    assert not distill.is_listable_config(".env.local")
+    assert not distill.is_listable_config(".env.production.json")
+    assert not distill.is_listable_config("package-lock.json")
+    assert not distill.is_listable_config("pnpm-lock.yaml")
+    assert distill.is_listable_config("config.yaml")
+    assert distill.is_listable_config("docker-compose.yml")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        for name in (".env", "package-lock.json", "config.yaml"):
+            with open(os.path.join(tmp, name), "w", encoding="utf-8") as f:
+                f.write("SECRET=1\n")
+        assert distill.list_config_files(tmp) == ["config.yaml"]
+
+
+def test_both_walks_agree_on_which_directories_count():
+    """
+    The hidden-directory rule was applied to one walk and not another once
+    already, and it cost 71% of the skeleton. One predicate now, used by both.
+    """
+    assert distill._skip_dir(".claude") and distill._skip_dir("node_modules")
+    assert not distill._skip_dir("src")
+    with tempfile.TemporaryDirectory() as tmp:
+        os.makedirs(os.path.join(tmp, ".claude", "worktrees"))
+        os.makedirs(os.path.join(tmp, "src"))
+        for rel in (".claude/worktrees/config.yaml", "src/config.yaml"):
+            with open(os.path.join(tmp, rel), "w", encoding="utf-8") as f:
+                f.write("a: 1\n")
+        assert distill.list_config_files(tmp) == ["src/config.yaml"]
 
 
 def test_evidence_framing_defaults_are_unchanged():
