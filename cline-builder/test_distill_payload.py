@@ -2640,7 +2640,13 @@ def test_sibling_detection_ignores_the_obvious_traps():
 
 @contextlib.contextmanager
 def _scripted_stream(rounds):
-    """Drive _single_llm_call with scripted (text, finish_reason) rounds."""
+    """
+    Drive _single_llm_call with scripted rounds.
+
+    A round is (text, finish_reason) or (text, finish_reason, reasoning); the
+    two-element form means "no thinking channel", which is what every
+    continuation test cares about.
+    """
     saved = distill._stream_llm_once
     seen = []
 
@@ -2648,7 +2654,8 @@ def _scripted_stream(rounds):
              max_output_tokens=0, assistant_prefix="", force_no_thinking=False):
         seen.append({"label": label, "prefix": assistant_prefix,
                      "no_thinking": force_no_thinking})
-        return rounds[min(len(seen) - 1, len(rounds) - 1)]
+        round_ = rounds[min(len(seen) - 1, len(rounds) - 1)]
+        return round_ if len(round_) == 3 else (round_[0], round_[1], "")
 
     distill._stream_llm_once = fake
     try:
@@ -2761,6 +2768,120 @@ def test_truncation_advice_does_not_tell_you_to_lower_the_lowest_level():
 
     # Where there IS room to drop, it still says so.
     assert "Lower this pass's reasoning level" in advice("xhigh")
+
+
+# --- The empty answer ---------------------------------------------------------
+#
+# Measured on the engineer pass: 82,435 prompt tokens in, 5,810 out, every one of
+# them on the reasoning channel, ending on a clean stop 2,382 short of the cap.
+# The build printed "Complete (0 chars)", saved an empty intermediate, and let
+# passes 3 and 4 design against it.
+
+_THOUGHTS = "Let me think about the file layout. " * 200
+
+
+def test_an_empty_answer_is_re_run_with_thinking_off():
+    """
+    The one lever that works. With enable_thinking=false there is no reasoning
+    channel for the turn to disappear into.
+    """
+    with _scripted_stream([("", "stop", _THOUGHTS),
+                           ("# 1. Overview\n- built", "stop")]) as seen:
+        out = _call()
+    assert out == "# 1. Overview\n- built", repr(out)
+    assert len(seen) == 2, seen
+    assert seen[0]["no_thinking"] is False
+    assert seen[1]["no_thinking"] is True, "the retry must have thinking off"
+
+
+def test_an_empty_answer_is_rescued_whatever_the_finish_reason():
+    """
+    The rescue is deliberately not gated on finish_reason == "length", the way
+    _report_truncation and the continuation round both are. That gate is exactly
+    what let this failure through: it arrived as a clean stop.
+
+    And the cap-length case needs it just as much - the continuation below sets
+    force_no_thinking from bool(answer), so while the answer is empty it would
+    re-run the call with thinking still ON and spend a second budget thinking.
+    """
+    for finish in ("stop", "length", None):
+        with _scripted_stream([("", finish, _THOUGHTS),
+                               ("the document", "stop")]) as seen:
+            out = _call()
+        assert out == "the document", (finish, out)
+        assert seen[1]["no_thinking"] is True, finish
+
+
+def test_an_answer_that_stays_empty_is_not_looped_over():
+    """
+    Two calls, then stop. Falling through to the continuation would re-run it a
+    third time with thinking back on, at a full prompt evaluation each.
+    """
+    with _scripted_stream([("", "length", _THOUGHTS)]) as seen:
+        out = _call()
+    assert out == "", repr(out)
+    assert len(seen) == 2, seen
+
+
+def test_a_partial_answer_survives_an_empty_continuation():
+    """The rescue must never cost text that was already written."""
+    with _scripted_stream([("# 1. Head", "length"), ("", "stop", _THOUGHTS)]) as seen:
+        out = _call()
+    assert out == "# 1. Head", repr(out)
+
+
+def test_thinking_already_off_is_not_retried():
+    """No lever left to pull; a second identical call is a wasted prompt eval."""
+    with _scripted_stream([("", "stop", _THOUGHTS)]) as seen:
+        with contextlib.redirect_stdout(io.StringIO()):
+            out = distill._single_llm_call(None, {"reasoning": "off"}, "SYS", "USER")
+    assert out == "" and len(seen) == 1, seen
+
+
+def test_the_thinking_behind_an_empty_answer_is_kept():
+    """
+    --reasoning-format deepseek routes everything before </think> into the
+    reasoning channel, so a document whose think block was never closed arrives
+    here in full. Dropping it loses the answer and the only evidence of the
+    fault at the same time.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        saved = distill.INTERMEDIATE_DIR
+        distill.INTERMEDIATE_DIR = tmp
+        try:
+            with _scripted_stream([("", "stop", _THOUGHTS), ("doc", "stop")]):
+                _call()
+            traces = [f for f in os.listdir(tmp) if f.startswith("reasoning_")]
+            assert len(traces) == 1, traces
+            body = open(os.path.join(tmp, traces[0]), encoding="utf-8").read()
+            assert _THOUGHTS.strip() in body
+            assert "trace, not a result" in body
+        finally:
+            distill.INTERMEDIATE_DIR = saved
+
+
+def test_an_empty_pass_is_an_abort_not_a_result():
+    """
+    _check_llm_result only ever matched "[ERROR:", so "" was a valid pass result
+    all the way to disk. The report has to describe THIS fault: the generic one
+    sends the operator to check an endpoint that answered perfectly well.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        saved = distill.INTERMEDIATE_DIR
+        distill.INTERMEDIATE_DIR = tmp
+        try:
+            exc = distill._empty_pass_failure("engineer", "pass output")
+            with contextlib.redirect_stdout(io.StringIO()):
+                distill._write_pass_failure("engineer", {"model": "m"}, exc)
+            body = open(os.path.join(tmp, "distill_engineer.md"), encoding="utf-8").read()
+        finally:
+            distill.INTERMEDIATE_DIR = saved
+
+    # Refused by the resume path, like any other abort report.
+    assert distill.ABORT_MARKER in body
+    assert "EMPTY document" in body
+    assert "reasoning_" in body and "</think>" in body
+    assert "Is a server actually listening" not in body
 
 
 # --- Reasoning reserve / truncation -------------------------------------------
