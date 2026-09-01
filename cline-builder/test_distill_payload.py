@@ -658,11 +658,16 @@ def test_real_conversation_reaches_the_architect_whole():
     End-to-end against the bound workspace, when one is present.
 
     This assertion is deliberately the inverse of what it used to be. A real
-    conversation payload is ~15k tokens against the container's 64k window, so
-    it must now reach the architect INTACT rather than being split and squeezed
-    through the extractor's capped bullet records. Losing the prose that way is
-    what produced the "# BLOCKED - the actual JSX content is absent" answers
-    while that very content sat in PROJECT_HISTORY.
+    conversation payload must reach the architect INTACT rather than being split
+    and squeezed through the extractor's capped bullet records. Losing the prose
+    that way is what produced the "# BLOCKED - the actual JSX content is absent"
+    answers while that very content sat in PROJECT_HISTORY.
+
+    The cap is what now makes that true rather than luck. This fixture grew to
+    100 messages and 80445 tokens on a live workspace, and the test had been
+    failing at 11 chunks: an uncapped history outgrows any window eventually.
+    HISTORY_MAX_MESSAGES is applied here because it is applied at the real call
+    site - a payload assembled differently from production tests nothing.
     """
     path = os.path.join(
         _HERE, "..", "conversations", "veriform-ui_e6b3b8906f60",
@@ -677,7 +682,7 @@ def test_real_conversation_reaches_the_architect_whole():
     payload = (
         "<SITUATIONAL_AWARENESS>\n  <MODE>ITERATIVE_REBUILD</MODE>\n"
         "</SITUATIONAL_AWARENESS>\n\n<PROJECT_DATA>\n  <PROJECT_HISTORY>\n"
-        f"{distill.conversation_to_text(messages[:-1])}\n  </PROJECT_HISTORY>\n\n"
+        f"{distill.conversation_to_text(messages[:-1], distill.HISTORY_MAX_MESSAGES)}\n  </PROJECT_HISTORY>\n\n"
         f"  <NEW_REQUEST>\n{messages[-1].get('content', '')}\n  </NEW_REQUEST>\n"
         "</PROJECT_DATA>"
     )
@@ -697,7 +702,7 @@ def test_real_conversation_reaches_the_architect_whole():
     assert request in body, "the real request did not reach the architect"
 
     # The whole point: prose from the history survives verbatim, not as bullets.
-    history = distill.conversation_to_text(messages[:-1])
+    history = distill.conversation_to_text(messages[:-1], distill.HISTORY_MAX_MESSAGES)
     if len(history) > 400:
         assert history[:400] in body, "history was summarised instead of passed through"
 
@@ -712,6 +717,99 @@ def test_real_conversation_reaches_the_architect_whole():
 # These tests pin the reductions and, more importantly, the two invariants that
 # make them safe: nothing is dropped from both the tree and the skeleton, and
 # the KB can no longer push a payload off the single-pass path.
+
+
+def test_history_is_capped_to_the_recent_turns():
+    """
+    PROJECT_HISTORY was every message. Measured on a live workspace: 100
+    messages, 80445 tokens - 61% of the window, and with the README and skeleton
+    alongside it the reason the payload overran the merge budget by 12k tokens
+    and starved blocker resolution to a budget of zero.
+    """
+    messages = [{"role": "user" if i % 2 == 0 else "assistant",
+                 "content": f"turn {i} " + "detail " * 50} for i in range(100)]
+
+    capped = distill.conversation_to_text(messages, distill.HISTORY_MAX_MESSAGES)
+
+    assert capped.count("[USER]") + capped.count("[ASSISTANT]") == distill.HISTORY_MAX_MESSAGES
+    assert "turn 99" in capped, "the newest turn must survive"
+    assert "turn 94" not in capped, "the cap was not applied"
+    assert "95 earlier message(s) elided" in capped, \
+        "an elided history must say so; a pass that thinks it read everything " \
+        "records an assumption where it should have blocked"
+
+
+def test_history_cap_is_opt_in():
+    """
+    Callers that pass no cap are unchanged. NEW_BUILD is the one that matters:
+    there is no code and no skeleton, so the conversation IS the specification
+    and the payload has no size pressure to relieve.
+    """
+    messages = [{"role": "user", "content": f"turn {i}"} for i in range(50)]
+    whole = distill.conversation_to_text(messages)
+    assert whole.count("[USER]") == 50
+    assert "elided" not in whole
+
+
+def test_readme_digest_keeps_what_the_request_is_about():
+    """
+    The README was injected whole - 62562 chars, 20855 tokens - to tell a design
+    pass what the project is. Most of a README is installation steps, badges and
+    contribution guidance: prose for a human arriving at the repository, not
+    facts a pass designs against.
+    """
+    readme = (
+        "# Project\n\nA thing that does things.\n\n"
+        "## Installation\n\n" + "npm install boilerplate. " * 200 + "\n\n"
+        "## Career matcher\n\nHow matches are scored against a voice profile.\n\n"
+        "## Contributing\n\n" + "Please sign the CLA. " * 200 + "\n"
+    )
+    digest = distill.distill_readme(readme, "wire the career matcher to job-radar",
+                                    max_chars=1200)
+
+    assert "How matches are scored" in digest, "the matching section is the request"
+    assert "npm install boilerplate" not in digest, "installation prose is not a design fact"
+    assert "A thing that does things" in digest, "the preamble says what the project is"
+
+
+def test_readme_digest_stays_within_its_cap_including_the_trailer():
+    """
+    The trailer is reserved, not appended. A README with 53 headings produced ~2k
+    characters of roll-up on its own and put the digest 35% past its cap - the
+    same unbounded-footer shape that cost the skeleton every detailed entry.
+    """
+    readme = "# P\n\nPreamble.\n\n" + "".join(
+        f"## Section number {i} with a fairly long heading\n\n" + "body " * 100 + "\n\n"
+        for i in range(60)
+    )
+    digest = distill.distill_readme(readme, "something unrelated entirely",
+                                    max_chars=2000)
+
+    assert len(digest) <= 2000, f"digest overran its cap at {len(digest)} chars"
+    assert "more -->" in digest, "a trimmed heading list must say it was trimmed"
+
+
+def test_readme_digest_names_what_it_dropped_and_is_stored():
+    """
+    A section named but not included is a fact the pass can block on and have
+    answered by the evidence read. A section deleted without trace is one it will
+    never know to ask about.
+    """
+    readme = ("# P\n\nPreamble.\n\n## Deployment\n\n" + "deploy " * 400 + "\n\n"
+              "## Telemetry\n\n" + "metrics " * 400 + "\n")
+    with tempfile.TemporaryDirectory() as tmp:
+        target = os.path.join(tmp, ".cline_context", ".readme_digest.md")
+        digest = distill.distill_readme(readme, "unrelated request",
+                                        max_chars=600, store_to=target)
+        assert "Deployment" in digest and "Telemetry" in digest, \
+            "dropped sections must still be listed by heading"
+        assert os.path.exists(target), "the digest must be stored for audit"
+        assert digest in open(target, encoding="utf-8").read()
+
+
+def test_readme_under_the_cap_is_untouched():
+    small = "# P\n\nShort and entirely sufficient.\n"
+    assert distill.distill_readme(small, "any request") == small.strip()
 
 
 def test_receipts_are_dropped_from_history():
@@ -933,6 +1031,86 @@ def test_internal_helpers_never_carry_signatures():
     assert "helper" in block and "y: string" not in block
 
 
+def test_skeleton_skips_hidden_directories():
+    """
+    DIRECTORY_STRUCTURE comes from tree(1) without -a, so it never shows hidden
+    directories. A skeleton that walked them named files the payload's own
+    structure block said did not exist.
+
+    Measured on a live workspace: `.claude/worktrees/` held two full checkouts,
+    so 1142 of 1597 scanned files - 71% of the skeleton - were second and third
+    copies of the same code, and every symbol in the project resolved three
+    times against architect.md R14.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        os.makedirs(os.path.join(tmp, "src"))
+        os.makedirs(os.path.join(tmp, ".claude", "worktrees", "copy", "src"))
+        real = "export function realThing(a: string): void {}\n"
+        for path in (os.path.join(tmp, "src", "thing.ts"),
+                     os.path.join(tmp, ".claude", "worktrees", "copy", "src", "thing.ts")):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(real)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            skeleton = distill.get_symbol_skeleton(tmp)
+
+    assert "src/thing.ts" in skeleton
+    assert "worktrees" not in skeleton, "a hidden directory reached the skeleton"
+    assert skeleton.count("realThing") == 1, "the same symbol was indexed twice"
+
+
+def test_exported_data_constants_are_scanned():
+    """
+    The shape the measured run blocked on: `export const X: T[] = [...]` is
+    neither a keyword declaration nor a function, so it scanned as no surface at
+    all and the file fell into the bare roll-up. Question banks, route manifests
+    and config tables are all declared this way.
+    """
+    source = (
+        'import type { VoiceQuestion } from "@/types/domain";\n\n'
+        "export const DEFAULT_VOICE_QUESTIONS: VoiceQuestion[] = [\n"
+        '  { id: "q1", prompt: "why" },\n'
+        "];\n"
+    )
+    exported, _internal = distill._scan_symbols(source, ".ts")
+    assert exported == [("DEFAULT_VOICE_QUESTIONS", ": VoiceQuestion[]")], exported
+
+
+def test_a_constant_signature_stops_before_its_value():
+    """
+    A constant's declared type is its interface; its value is data. Following
+    `= [` into the literal transcribes the whole table into the one part of the
+    payload with no room for it.
+    """
+    source = "export const TABLE: Row[] = [\n" + '  { a: "x" },\n' * 200 + "];\n"
+    exported, _ = distill._scan_symbols(source, ".ts")
+    name, signature = exported[0]
+    assert name == "TABLE"
+    assert signature == ": Row[]", signature
+    assert "{" not in signature and len(signature) < 40
+
+
+def test_a_const_function_keeps_its_parameters():
+    """CONST_RE runs last so ARROW_RE keeps the shapes it already matched."""
+    source = "export const useThing = (id: string): Thing => ({});\n"
+    exported, _ = distill._scan_symbols(source, ".ts")
+    name, signature = exported[0]
+    assert name == "useThing"
+    assert "id: string" in signature, f"the parameter list was lost: {signature!r}"
+
+
+def test_a_local_constant_is_not_part_of_the_surface():
+    """Anchored at column zero: a module's surface, not every const in a body."""
+    source = (
+        "export function outer(): void {\n"
+        "  const localHelper = 3;\n"
+        "}\n"
+    )
+    exported, internal = distill._scan_symbols(source, ".ts")
+    assert [n for n, _ in exported] == ["outer"]
+    assert "localHelper" not in [n for n, _ in internal]
+
+
 def test_skeleton_sheds_signatures_before_it_sheds_files():
     """
     Tier order is the whole safety argument: a project too large for signatures
@@ -948,6 +1126,54 @@ def test_skeleton_sheds_signatures_before_it_sheds_files():
     assert sum(map(len, lean)) < sum(map(len, rich)), "the lean tier must be cheaper"
     assert len(lean) == len(rich) == 200, "no tier may drop a file"
     assert "Promise<void>" not in "".join(lean), "the lean tier still carried signatures"
+
+
+def test_overflow_tier_still_carries_detail():
+    """
+    The regression: the bare-file roll-up is unbounded, and the overflow path
+    seeded its running total with it. On a real 1596-file workspace the roll-up
+    measured 50355 chars against a 30000-char cap, so `total + len(block)`
+    exceeded the cap on the FIRST entry and the skeleton went out as "0 of 837
+    detailed entries shown" - 837 filenames and not one exported symbol.
+
+    That is what the architect blocked on. Under R20 a bare name is a fact it
+    does not have, so it named the one file it needed and stopped. The skeleton
+    made the block inevitable; the model was reading its input correctly.
+    """
+    files_data = [(f"src/f{i}.ts", 10, [], [(f"Sym{i}", "(a: string): void")], [])
+                  for i in range(400)]
+    # Derived from the cap, not hardcoded: the fixture has to overflow on the
+    # roll-up alone at whatever MAX_SKELETON_CHARS currently is, and a literal
+    # count silently stops testing anything the moment the cap is raised.
+    bare_path = "src/very/deeply/nested/path/bare{}.ts"
+    bare_count = distill.MAX_SKELETON_CHARS // (len(bare_path.format(0)) - 2) + 500
+    files_data += [(bare_path.format(i), 5, [], [], ["helper"])
+                   for i in range(bare_count)]
+
+    _blocks, footer = distill._render_skeleton(files_data, distill.SKELETON_TIERS[-1])
+    assert len(footer) > distill.MAX_SKELETON_CHARS, "fixture must overflow on the roll-up"
+
+    fitted = distill._fit_bare_footer(
+        footer, int(distill.MAX_SKELETON_CHARS * distill.BARE_FOOTER_CAP_FRACTION)
+    )
+    assert len(fitted) <= int(distill.MAX_SKELETON_CHARS * distill.BARE_FOOTER_CAP_FRACTION)
+    assert "more files not listed" in fitted, "a trimmed roll-up must say it was trimmed"
+    assert distill.MAX_SKELETON_CHARS - len(fitted) > distill.MAX_SKELETON_CHARS // 2, \
+        "the roll-up must leave most of the cap for detail"
+
+
+def test_fit_bare_footer_keeps_whole_paths():
+    """A half-truncated path resolves to nothing and reads as a real filename."""
+    paths = [f"src/module{i}/component{i}.tsx" for i in range(500)]
+    footer = f"{distill.BARE_FILES_HEADING}\n{', '.join(paths)}\n"
+    fitted = distill._fit_bare_footer(footer, 2000)
+
+    assert len(fitted) <= 2000
+    listed = fitted.split(distill.BARE_FILES_HEADING.strip() + "\n", 1)[1]
+    listed = listed.split("\n... [")[0]
+    for name in (n.strip() for n in listed.split(",") if n.strip()):
+        assert name in paths, f"{name!r} is not a whole path from the input"
+    assert distill._fit_bare_footer(footer, 10) == "", "no room for the heading means no footer"
 
 
 def test_kb_budget_leaves_the_payload_on_the_single_pass_path():
@@ -1105,6 +1331,41 @@ def test_addendum_budget_keeps_a_retry_on_the_single_pass_path():
     )
     assert payload_tokens + distill.est_tokens("x" * budget) <= facts
     assert distill.solve_addendum_budget(2048, 1747, 100) == 0
+
+
+def test_evidence_keeps_a_floor_when_the_payload_fills_the_window():
+    """
+    The regression that stopped a real !architect run at the review gate.
+
+    solve_addendum_budget measures the spare window against the UNREDUCED
+    payload. A payload larger than the merge budget does not fail - call_llm
+    sends it down chunked extraction - so the pass runs, blocks, asks for nine
+    files the resolver confirms are on disk, and receives a budget of exactly 0.
+    read_evidence returned on its first line and the blocked document went
+    straight to the gate.
+
+    Measured on the workspace it happened to: window 131072, architect.md at
+    5686 tok, payload 122439 tok against a facts budget of 110635.
+    """
+    window, system_tokens, payload_tokens = 131072, 5686, 122439
+    solved = distill.solve_addendum_budget(window, system_tokens, payload_tokens)
+    assert solved == 0, "fixture must reproduce the starved budget"
+
+    budget = max(solved, distill.EVIDENCE_MIN_BUDGET_CHARS)
+    assert budget >= distill.EVIDENCE_MAX_FILE_CHARS, \
+        "the floor must carry at least one whole file"
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    evidence = distill.read_evidence(here, [os.path.basename(__file__)], budget)
+    assert evidence.included == [os.path.basename(__file__)], \
+        "a floored budget must actually attach the file"
+
+
+def test_evidence_floor_does_not_disturb_a_healthy_budget():
+    """The floor is a floor, not an override: a window with room still solves."""
+    solved = distill.solve_addendum_budget(131072, 1747, 21161)
+    assert solved > distill.EVIDENCE_MIN_BUDGET_CHARS
+    assert max(solved, distill.EVIDENCE_MIN_BUDGET_CHARS) == solved
 
 
 def test_clinerules_puts_the_plan_before_the_commentary():
@@ -2556,6 +2817,162 @@ def test_truncation_names_the_cause_it_can_actually_fix():
 
     # A clean stop is silent - the banner has to mean something when it appears.
     assert report("done", "brief", finish="stop") == ""
+
+
+# --- G. The three-block context ----------------------------------------------
+#
+# One general-purpose skeleton was carrying R17, R18 and R19 at once. They want
+# different things - a negative claim, a reverse-dependency query and real source
+# - so each now has a block built for it. These tests pin the two properties the
+# design turns on: the indexes are COMPLETE, and the survey's claims are checked
+# rather than trusted.
+
+def _fixture_project(tmp):
+    os.makedirs(os.path.join(tmp, "src", "features"))
+    os.makedirs(os.path.join(tmp, "src", "services"))
+    files = {
+        "src/services/matcher.service.ts":
+            "export function scoreMatch(a: string): number { return 1; }\n"
+            "export const MATCH_MODES: Mode[] = [];\n",
+        "src/features/page.tsx":
+            'import { scoreMatch } from "@/services/matcher.service";\n'
+            "export const Page = () => null;\n",
+        "src/features/card.tsx":
+            'import { scoreMatch } from "@/services/matcher.service";\n'
+            'import { unrelated } from "some-npm-package";\n'
+            "export const Card = () => null;\n",
+    }
+    for rel, body in files.items():
+        with open(os.path.join(tmp, rel), "w", encoding="utf-8") as f:
+            f.write(body)
+    return distill.scan_project_files(tmp)
+
+
+def test_symbol_index_is_complete_and_carries_no_signatures():
+    """
+    R18 needs a negative - "nothing already does this" - which only an exhaustive
+    list supports. Signatures are irrelevant to a negative and cost the coverage
+    that is not: the same 458 files ran 22768 tok with signatures against 14775
+    without, and the shapes are supplied from source for the files that matter.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        files_data = _fixture_project(tmp)
+        with contextlib.redirect_stdout(io.StringIO()):
+            index = distill.build_symbol_index(files_data)
+
+    for name in ("scoreMatch", "MATCH_MODES", "Page", "Card"):
+        assert name in index, f"{name} is exported and missing from the index"
+    for path in ("src/services/matcher.service.ts", "src/features/page.tsx"):
+        assert path in index
+    assert "(a: string)" not in index, "the index must not spend budget on signatures"
+    assert "COMPLETE" in index, "the block must state the property R18 relies on"
+
+
+def test_call_graph_answers_r19_exactly():
+    """
+    The tier the skeleton actually shipped renders no imports at all, so "name
+    the other consumers from CONTEXT" was unanswerable and the pass could only
+    assert "sole call site" with nothing behind it.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        files_data = _fixture_project(tmp)
+        with contextlib.redirect_stdout(io.StringIO()):
+            graph = distill.build_call_graph(files_data)
+
+    line = next(l for l in graph.splitlines()
+                if l.startswith("src/services/matcher.service.ts <-"))
+    assert "src/features/page.tsx" in line and "src/features/card.tsx" in line, line
+    assert "some-npm-package" not in graph, "an external package is not a call site"
+    # A leaf is reported as a leaf: "nothing imports this" is R19's answer for it,
+    # and it is not the same answer as "not mentioned".
+    assert "No project file imports these" in graph
+    assert "src/features/page.tsx" in graph.split("No project file imports these")[1]
+
+
+def test_import_specifiers_resolve_to_project_files():
+    by_stem = {"src/services/matcher.service": "src/services/matcher.service.ts",
+               "src/features/thing/index": "src/features/thing/index.ts"}
+    assert distill.resolve_import_target("@/services/matcher.service", by_stem) \
+        == "src/services/matcher.service.ts"
+    assert distill.resolve_import_target("./services/matcher.service.ts", by_stem) \
+        == "src/services/matcher.service.ts"
+    assert distill.resolve_import_target("@/features/thing", by_stem) \
+        == "src/features/thing/index.ts", "a package directory resolves through its index"
+    assert distill.resolve_import_target("react", by_stem) is None
+
+
+def test_survey_claims_are_verified_not_trusted():
+    """
+    A model naming a plausible file is not evidence the file contains what it
+    claims. All three verdicts are facts the design needs - REFUTED answers the
+    question the pass would otherwise have blocked on.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        _fixture_project(tmp)
+        raw = ("src/services/matcher.service.ts::scoreMatch\n"
+               "src/services/matcher.service.ts::scrapeConfig\n"
+               "src/features/page.tsx\n"
+               "src/features/invented.ts::NOTHING\n")
+        claims = distill.verify_survey_claims(tmp, distill.parse_survey_claims(raw))
+
+    verdicts = {(c.path, c.symbol): c.verdict for c in claims}
+    assert verdicts[("src/services/matcher.service.ts", "scoreMatch")] == "VERIFIED"
+    assert verdicts[("src/services/matcher.service.ts", "scrapeConfig")] == "REFUTED"
+    assert verdicts[("src/features/page.tsx", None)] == "VERIFIED"
+    assert verdicts[("src/features/invented.ts", "NOTHING")] == "ABSENT"
+
+    findings = distill.render_survey_findings(claims)
+    assert "REFUTED" in findings and "scrapeConfig" in findings, \
+        "a refuted claim must reach the pass; dropping it hides the model's error"
+
+
+def test_survey_reads_the_file_that_refutes_a_claim():
+    """
+    Withholding a refuted file sends the pass straight back to blocking for the
+    path it was just denied. The file is what settles the question.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        _fixture_project(tmp)
+        real = distill._single_llm_call
+        distill._single_llm_call = lambda *a, **k: \
+            "src/services/matcher.service.ts::scrapeConfig\n"
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                block = distill.survey_codebase(None, {"model": "stub"},
+                                                "add scraping config", "index text",
+                                                50000, tmp)
+        finally:
+            distill._single_llm_call = real
+
+    assert "<SURVEYED_SOURCE>" in block and "REQUESTED_EVIDENCE" not in block
+    assert "scoreMatch" in block, "the refuted file was not read"
+    assert "REFUTED" in block
+
+
+def test_survey_is_optional_not_a_prerequisite():
+    """An empty survey falls through to the indexes and the blocker protocol."""
+    assert distill.survey_codebase(None, {}, "", "index", 5000) == ""
+    assert distill.survey_codebase(None, {}, "req", "", 5000) == ""
+    assert distill.survey_codebase(None, {}, "req", "index", 0) == ""
+
+
+def test_parse_survey_claims_ignores_commentary():
+    raw = ("Here are the files:\n"
+           "- `src/a.ts::doThing`\n"
+           "src/b.tsx\n"
+           "NONE\n"
+           "src/a.ts::doThing\n")
+    claims = distill.parse_survey_claims(raw)
+    assert [(c.path, c.symbol) for c in claims] == [("src/a.ts", "doThing"), ("src/b.tsx", None)]
+
+
+def test_evidence_framing_defaults_are_unchanged():
+    """The blocker path keeps its own wording; only the survey overrides it."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    with contextlib.redirect_stdout(io.StringIO()):
+        blocker = distill.read_evidence(here, [os.path.basename(__file__)], 40000)
+    assert "<REQUESTED_EVIDENCE>" in blocker.text
+    assert "You previously reported these blockers" in blocker.text
 
 
 if __name__ == "__main__":

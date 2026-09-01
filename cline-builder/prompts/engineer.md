@@ -56,7 +56,7 @@ BINDING RULES — violating any of these makes the output invalid:
    1 only and stop. Never fill a gap with an assumption. A value the architect never
    enumerated is a value you are guessing, and the database is where that guess fails.
 10. [NEW] MEANS ABSENT. A path marked [NEW] in A§2 is a file this build creates. It
-   is SUPPOSED to be missing from DIRECTORY_STRUCTURE and SYMBOL_SKELETON, and its
+   is SUPPOSED to be missing from DIRECTORY_STRUCTURE and SYMBOL_INDEX, and its
    symbols are supposed to be undefined. That absence is never a blocker — it is
    the work. Nor is the state of its parent directory: an existing but empty
    directory says nothing about a [NEW] file inside it, and a directory holding
