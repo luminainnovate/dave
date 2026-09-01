@@ -61,7 +61,8 @@ TARGET_CHUNK_SIZE = 8192
 PAYLOAD_SECTIONS = (
     "SITUATIONAL_AWARENESS", "PROJECT_HISTORY", "BEST_PRACTICES_KNOWLEDGE_BASE",
     "PROJECT_OVERVIEW", "KNOWN_BUILD_ISSUES", "DIRECTORY_STRUCTURE",
-    "SYMBOL_SKELETON", "TOOLCHAIN", "NEW_REQUEST", "FINAL_BUILD_COMMAND",
+    "SYMBOL_SKELETON", "SYMBOL_INDEX", "CALL_GRAPH", "SURVEYED_SOURCE",
+    "TOOLCHAIN", "NEW_REQUEST", "FINAL_BUILD_COMMAND",
 )
 SECTION_OPEN_RE = re.compile(
     r"^[ \t]*<(" + "|".join(PAYLOAD_SECTIONS) + r")>", re.MULTILINE
@@ -245,6 +246,11 @@ KB_MAX_CHARS = 100000
 # Marks where the knowledge base goes while the rest of the payload is still
 # being assembled. Never appears in a payload that reaches a model.
 KB_PLACEHOLDER = "\x00KNOWLEDGE_BASE\x00"
+
+# Holds the surveyed source's place while the rest of the payload is built.
+# The survey needs an HTTP client and a model, which only exist inside the pass
+# loop, so the block is written long after the payload around it is assembled.
+SURVEY_PLACEHOLDER = "\x00SURVEYED_SOURCE\x00"
 
 # A server-reported prompt above this fraction of the window means it truncated.
 BUDGET_BREACH_FRACTION = 0.95
@@ -714,7 +720,22 @@ def load_conversation() -> list:
         return json.load(f)
 
 
-def conversation_to_text(messages: list) -> str:
+# How many turns of PROJECT_HISTORY a rebuild pass actually reads.
+#
+# It was every message. Measured on a live workspace: 100 messages, 241335
+# characters, 80445 tokens - 61% of the window and, with the README and the
+# skeleton alongside it, the reason the payload overran the merge budget by 12k
+# tokens and starved the blocker-resolution read to zero.
+#
+# The design pass does not need the transcript. What the project IS comes from
+# the skeleton and the directory structure; what to build comes from
+# NEW_REQUEST, which is extracted separately and never subject to this cap. The
+# history's job is the last few turns of intent around the current request, and
+# past that it is re-litigating decisions already in the code.
+HISTORY_MAX_MESSAGES = 5
+
+
+def conversation_to_text(messages: list, max_messages: int = None) -> str:
     """
     Flatten conversation messages into a readable text block.
 
@@ -735,6 +756,10 @@ def conversation_to_text(messages: list) -> str:
     """
     parts = []
     last_seen = {}
+    elided = 0
+    if max_messages is not None and len(messages) > max_messages:
+        elided = len(messages) - max_messages
+        messages = messages[-max_messages:]
     for msg in messages:
         role = msg.get("role", "unknown").upper()
         content = msg.get("content", "")
@@ -748,6 +773,13 @@ def conversation_to_text(messages: list) -> str:
                 parts[last_seen[key]] = f"[{role}]\n{SUPERSEDED_MARKER}"
             last_seen[key] = len(parts)
         parts.append(f"[{role}]\n{content}")
+    if elided:
+        # Stated, not silently dropped. A pass that believes it is reading the
+        # whole conversation will treat an absent decision as one never made,
+        # and R9 tells it to record an assumption rather than block - which is
+        # the wrong move when the answer is one turn above the window.
+        parts.insert(0, f"[HISTORY]\n... [{elided} earlier message(s) elided; "
+                        f"the {len(parts)} most recent are shown]")
     return "\n\n---\n\n".join(parts)
 
 
@@ -800,6 +832,29 @@ EVIDENCE_MAX_FILE_CHARS = 24000
 # is a floor against empty blocks, not a quality bar on the slice.
 EVIDENCE_MIN_SLICE_CHARS = 200
 BLOCKER_RESOLVE_MAX_TOKENS = 300
+
+# Evidence the retry is guaranteed, whatever solve_addendum_budget says.
+#
+# The solver measures the spare window against the UNREDUCED payload. A payload
+# larger than the merge budget does not fail - call_llm sends it down the chunked
+# extraction path instead - so the pass runs, blocks, and then asks for files
+# against a budget that has already been computed as negative and clamped to
+# zero. Measured on a 1596-file workspace: payload 122439 tok against a facts
+# budget of 110635, addendum budget exactly 0, and read_evidence returned on its
+# first line. The resolver had already confirmed all nine requested files were on
+# disk; not one byte of any of them was read.
+#
+# The perverse part is the direction. The bigger the project, the more certain
+# the architect is to block on a bare symbol name - and the more certain the
+# budget is to be zero when it does. The protocol switched itself off precisely
+# where it was needed, and reported it as "no readable evidence", which reads as
+# the files being absent.
+#
+# So evidence gets a floor rather than a share. One file's worth is ~8k tokens
+# on a payload that is already going through extraction, where it is one more
+# chunk and changes nothing structurally - against a blocked document, which
+# costs the whole run.
+EVIDENCE_MIN_BUDGET_CHARS = EVIDENCE_MAX_FILE_CHARS
 
 # How many times a pass may block, be shown files, and try again.
 #
@@ -1050,8 +1105,17 @@ def _slice_around_symbols(content: str, keep: int, symbols) -> str:
     return out
 
 
+EVIDENCE_PREAMBLE = (
+    "You previously reported these blockers. The findings below were read from "
+    "the workspace to resolve them. Design against them; do not block on facts "
+    "they now supply."
+)
+
+
 def read_evidence(project_dir: str, paths: list, budget_chars: int,
-                  absent: list = None, symbol_hints: dict = None) -> "Evidence":
+                  absent: list = None, symbol_hints: dict = None,
+                  tag: str = "REQUESTED_EVIDENCE",
+                  preamble: str = EVIDENCE_PREAMBLE) -> "Evidence":
     """
     Read the requested files into a payload block, within budget.
 
@@ -1069,7 +1133,17 @@ def read_evidence(project_dir: str, paths: list, budget_chars: int,
     must not record those as supplied or the pass can never ask for them again.
     """
     absent = absent or []
-    if (not paths and not absent) or budget_chars <= 0:
+    # Both of these used to return a bare Evidence("", []), which the caller
+    # reports as "No readable evidence identified for these blockers" - wording
+    # that reads as the files being missing, when the resolver has just confirmed
+    # they are on disk. Say which of the two it was.
+    if not paths and not absent:
+        print("  ⚠ Evidence: the resolver named no readable path.", flush=True)
+        return Evidence("", [])
+    if budget_chars <= 0:
+        print(f"  ⚠ Evidence: budget is {budget_chars} chars — the payload fills "
+              f"the window and nothing can be attached. {len(paths)} file(s) were "
+              f"found on disk and left unread.", flush=True)
         return Evidence("", [])
 
     blocks, remaining, included, skipped = [], budget_chars, [], []
@@ -1104,6 +1178,10 @@ def read_evidence(project_dir: str, paths: list, budget_chars: int,
         blocks.append(f'<file path="{rel}">\n{content}\n</file>')
 
     if not blocks and not absent:
+        # The third silent path: every file was unreadable, or every slice came
+        # out under EVIDENCE_MIN_SLICE_CHARS on a budget too small to carry one.
+        print(f"  ⚠ Evidence: {len(skipped)} file(s) named but none attached "
+              f"within {budget_chars} chars — {', '.join(skipped)}", flush=True)
         return Evidence("", [])
     note = ""
     if absent:
@@ -1119,12 +1197,9 @@ def read_evidence(project_dir: str, paths: list, budget_chars: int,
     if absent:
         print(f"  📭 Confirmed absent: {', '.join(absent)}", flush=True)
     return Evidence(
-        "\n\n  <REQUESTED_EVIDENCE>\n"
-        "  You previously reported these blockers. The findings below were read "
-        "from the workspace to resolve them. Design against them; do not block on "
-        "facts they now supply.\n"
+        f"\n\n  <{tag}>\n  {preamble}\n"
         + "\n".join(blocks) + note +
-        "  </REQUESTED_EVIDENCE>\n",
+        f"  </{tag}>\n",
         included,
     )
 
@@ -1221,10 +1296,20 @@ def resolve_pass_blockers(client, pass_key: str, model_config, prompt: str,
                   flush=True)
             return result
 
-        budget = solve_addendum_budget(
+        solved = solve_addendum_budget(
             CONTEXT_WINDOW, est_tokens(prompt),
             est_tokens(target_content) + est_tokens(prior_context) + est_tokens(evidence),
         )
+        # Never below the floor - see EVIDENCE_MIN_BUDGET_CHARS. A zero here is
+        # not "there is no room", it is "the payload was already over the merge
+        # budget", and the answer to that is extraction, not a blocked document.
+        budget = max(solved, EVIDENCE_MIN_BUDGET_CHARS)
+        if solved < EVIDENCE_MIN_BUDGET_CHARS:
+            print(f"     ↳ window has {solved} chars spare; taking the "
+                  f"{EVIDENCE_MIN_BUDGET_CHARS}-char floor. The payload "
+                  f"(~{est_tokens(target_content) + est_tokens(prior_context)} tok) "
+                  f"already exceeds the merge budget, so this call extracts either way.",
+                  flush=True)
         found_evidence = read_evidence("/workspace", fresh, budget, fresh_absent,
                                        symbol_hints=blocker_symbol_hints(blockers))
         addendum = found_evidence.text
@@ -1272,6 +1357,167 @@ def resolve_pass_blockers(client, pass_key: str, model_config, prompt: str,
     print(f"  ⚠ {pass_key} is still blocked after {max_rounds} round(s) of evidence "
           f"({len(seen)} path(s) supplied).", flush=True)
     return result
+
+
+# --- Survey protocol ----------------------------------------------------------
+#
+# The design pass had one way to see source code: block, and be shown the file it
+# named. That is a whole 27B pass spent to ask a question, and it only ever fired
+# after the pass had already failed to design.
+#
+# R17 says "survey before you design", and until now nothing could. The survey is
+# that step, run before the design rather than after its failure: read the
+# request, map it onto files, CHECK the mapping against the workspace, and put
+# the verified source in the payload.
+#
+# Verification is the part that makes it more than retrieval. A model naming a
+# plausible file is not evidence that the file contains what it claims; the
+# check is deterministic, and a refuted claim is reported rather than dropped.
+# "job-radar's scraping config is not in questions.ts" is a fact the design needs
+# - it is the answer to the question the pass would otherwise have blocked on.
+SURVEY_MAX_FILES = EVIDENCE_MAX_FILES
+SURVEY_RESOLVE_MAX_TOKENS = 400
+
+# A claim is `path::symbol`; the symbol half is optional because some requests
+# turn on a file rather than a symbol in it ("the route that renders this page").
+_SURVEY_CLAIM_RE = re.compile(r"^([\w./-]+\.[A-Za-z0-9]{1,5})(?:::([A-Za-z_]\w*))?$")
+
+SurveyClaim = collections.namedtuple("SurveyClaim", ("path", "symbol", "verdict"))
+
+
+def parse_survey_claims(raw: str) -> list:
+    """Pull `path::symbol` claims out of a model's answer, in the order given."""
+    claims, seen = [], set()
+    for line in (raw or "").splitlines():
+        candidate = line.strip().strip("-*`, \t")
+        if not candidate or candidate.upper() == "NONE" or " " in candidate:
+            continue
+        match = _SURVEY_CLAIM_RE.match(candidate.lstrip("./"))
+        if not match:
+            continue
+        key = (match.group(1), match.group(2))
+        if key in seen:
+            continue
+        seen.add(key)
+        claims.append(SurveyClaim(match.group(1), match.group(2), None))
+    return claims
+
+
+def verify_survey_claims(project_dir: str, claims: list) -> list:
+    """
+    Check each claim against the workspace. Returns claims with a verdict set.
+
+    Three verdicts, and all three are facts worth carrying:
+      VERIFIED - the file exists and defines the symbol.
+      REFUTED  - the file exists and does not. The file is still read: it is
+                 what settles the question, and withholding it would send the
+                 pass back to blocking for the file it was just denied.
+      ABSENT   - no such file. R10 answers "is X already implemented?" with this.
+    """
+    verified = []
+    for claim in claims:
+        full = os.path.join(project_dir, claim.path)
+        if not os.path.isfile(full):
+            verified.append(claim._replace(verdict="ABSENT"))
+            continue
+        if not claim.symbol:
+            verified.append(claim._replace(verdict="VERIFIED"))
+            continue
+        try:
+            with open(full, "r", encoding="utf-8") as f:
+                content = f.read()
+        except Exception:
+            verified.append(claim._replace(verdict="ABSENT"))
+            continue
+        found = _find_definition(content, [claim.symbol]) is not None
+        verified.append(claim._replace(verdict="VERIFIED" if found else "REFUTED"))
+    return verified
+
+
+def render_survey_findings(claims: list) -> str:
+    """The verification report that heads the surveyed source."""
+    lines = ["The request was mapped onto these files and every claim was checked "
+             "against the workspace before this block was written."]
+    for verdict, explain in (
+        ("VERIFIED", "defined in that file"),
+        ("REFUTED", "that file exists and does NOT define this - treat the "
+                    "symbol as not existing there"),
+        ("ABSENT", "no such file in the workspace - to be created, with nothing "
+                   "existing to reconcile"),
+    ):
+        hits = [c for c in claims if c.verdict == verdict]
+        if not hits:
+            continue
+        rendered = ", ".join(f"{c.path}::{c.symbol}" if c.symbol else c.path
+                             for c in hits)
+        lines.append(f"  {verdict} ({explain}): {rendered}")
+    return "\n  ".join(lines)
+
+
+def survey_codebase(client, model_config, instruction: str, symbol_index: str,
+                    budget_chars: int, project_dir: str = "/workspace") -> str:
+    """
+    Locate, verify and read the files this request turns on. Returns a payload block.
+
+    Returns "" when the survey finds nothing, which is not a failure: a vague
+    request maps onto nothing in particular, and the design pass still has the
+    symbol index, the call graph and - if it needs a specific file after all -
+    the blocker protocol behind it.
+    """
+    if not instruction or not symbol_index or budget_chars <= 0:
+        return ""
+
+    system = (
+        "You locate the code a change will touch. Given a change request and an "
+        "index of every exported symbol in the repository, list the files whose "
+        "CONTENTS the designer must read.\n"
+        f"Output at most {SURVEY_MAX_FILES} lines, each `path::symbol` naming the "
+        "one symbol that makes the file relevant, or a bare `path` when the file "
+        "matters as a whole. Nothing else: no commentary, no bullets, no "
+        "backticks. Output exactly NONE if the request touches no existing file.\n"
+        "Name the file the behaviour would pass through, and the file that "
+        "already does the nearest thing to it. A guess is checked against the "
+        "workspace and reported as wrong, so name what you can point to."
+    )
+    user = ("### CHANGE REQUEST\n" + instruction +
+            "\n\n### EXPORTED SYMBOL INDEX\n" + symbol_index +
+            "\n\n### CURRENT TASK\nList the paths.\n")
+
+    print("  🔍 Surveying the codebase for the files this request turns on...",
+          flush=True)
+    raw = _single_llm_call(client, model_config, system, user, "Codebase survey",
+                           max_output_tokens=SURVEY_RESOLVE_MAX_TOKENS)
+    if _check_llm_result(raw, "Codebase survey"):
+        print("  ⚠ Survey call failed; the design pass proceeds on the indexes "
+              "alone and may block.", flush=True)
+        return ""
+
+    claims = verify_survey_claims(project_dir, parse_survey_claims(raw))
+    if not claims:
+        print("  🔍 Survey named no file in the workspace; proceeding on the "
+              "indexes alone.", flush=True)
+        return ""
+
+    for claim in claims:
+        mark = {"VERIFIED": "✓", "REFUTED": "✗", "ABSENT": "∅"}[claim.verdict]
+        target = f"{claim.path}::{claim.symbol}" if claim.symbol else claim.path
+        print(f"     {mark} {claim.verdict:<8} {target}", flush=True)
+
+    # A refuted claim is still read: the file is what settles the question, and
+    # denying it sends the pass straight back to blocking for the same path.
+    readable = [c.path for c in claims if c.verdict in ("VERIFIED", "REFUTED")]
+    absent = [c.path for c in claims if c.verdict == "ABSENT"]
+    hints = {}
+    for claim in claims:
+        if claim.symbol and claim.verdict == "VERIFIED":
+            hints.setdefault(claim.path, []).append(claim.symbol)
+
+    evidence = read_evidence(
+        project_dir, list(dict.fromkeys(readable)), budget_chars, absent,
+        symbol_hints=hints, tag="SURVEYED_SOURCE",
+        preamble=render_survey_findings(claims),
+    )
+    return evidence.text
 
 
 # --- Reproduction protocol ----------------------------------------------------
@@ -3303,6 +3549,145 @@ def select_relevant_kb(kb_dir: str, instruction: str, max_chars: int = KB_MAX_CH
     return result
 
 
+# What PROJECT_OVERVIEW may cost. The README was injected whole: on a live
+# workspace that was 62KB - 20855 tokens, 17% of the entire window - to tell a
+# design pass what the project is. Most of it is installation steps, badges,
+# contribution guidance and changelog: prose written for a human arriving at the
+# repository, not facts a pass can design against.
+README_MAX_CHARS = 6000
+
+# The digest is written back to the workspace so the selection is auditable
+# after the run, and so a human can see exactly what the architect was told the
+# project is. Same directory as every other pipeline intermediate.
+README_DIGEST_PATH = ".cline_context/.readme_digest.md"
+
+_MD_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$", re.MULTILINE)
+
+
+def split_markdown_sections(text: str) -> list:
+    """
+    Split Markdown into (heading, block) pairs, preamble first.
+
+    The preamble - everything above the first heading - comes back under an
+    empty heading. It is where a README says what the project IS, so it is the
+    one part the selector never scores away.
+    """
+    matches = list(_MD_HEADING_RE.finditer(text))
+    if not matches:
+        return [("", text.strip())]
+    sections = []
+    if matches[0].start() > 0:
+        preamble = text[:matches[0].start()].strip()
+        if preamble:
+            sections.append(("", preamble))
+    for i, match in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        sections.append((match.group(2).strip(), text[match.start():end].strip()))
+    return sections
+
+
+def distill_readme(content: str, instruction: str,
+                   max_chars: int = README_MAX_CHARS,
+                   store_to: str = None) -> str:
+    """
+    Reduce a README to the sections that bear on NEW_REQUEST.
+
+    Located, extracted, stored: sections are scored against the request the same
+    way select_relevant_kb scores files, the ones that earn their place are kept
+    whole, and the result is written to README_DIGEST_PATH so the selection can
+    be read back after the run.
+
+    Two rules the scoring does not get to overrule. The preamble is always kept -
+    a pass that does not know what the project is cannot design for it - and
+    every dropped heading is still listed. A section named but not included is a
+    fact the pass can block on and have answered; a section deleted without trace
+    is one it will never know to ask about.
+    """
+    content = (content or "").strip()
+    if not content or len(content) <= max_chars:
+        return content
+
+    raw_words = re.findall(r"[a-zA-Z0-9_]+", (instruction or "").lower())
+    keywords = {w for w in raw_words if len(w) >= 3 and w not in STOP_WORDS}
+
+    sections = split_markdown_sections(content)
+    kept, omitted, used = [], [], 0
+
+    # The trailer is reserved before anything is spent, not appended after. A
+    # README with 52 headings produces ~2k characters of roll-up on its own, and
+    # adding that to a budget already spent put the digest 35% over its cap - the
+    # same unbounded-footer shape as the skeleton's bare-file list.
+    # Floored as well as fractioned: a quarter of a small cap is less than the
+    # opening text itself, which spent the whole trailer on punctuation and
+    # listed none of the headings it exists to name.
+    trailer_cap = min(max_chars // 2, max(200, max_chars // 4))
+    body_budget = max_chars - trailer_cap
+
+    # The top of the file first and unconditionally, trimmed only if it alone
+    # overruns. It is what the project IS, and it is never scored away - whether
+    # it sits above the first heading or under the H1 title, which is why this
+    # takes section zero rather than only an empty-heading preamble. A README
+    # opening with "# Project\n\nA thing that does things" has no preamble by
+    # that stricter test, so the one section saying what the project is scored 0
+    # against the request and was dropped.
+    if sections:
+        preamble = sections.pop(0)[1]
+        if len(preamble) > body_budget // 2:
+            preamble = preamble[:body_budget // 2].rsplit("\n", 1)[0]
+        kept.append(preamble)
+        used += len(preamble)
+
+    scored = []
+    for index, (heading, block) in enumerate(sections):
+        lowered_heading, lowered_block = heading.lower(), block.lower()
+        score = sum(10 for kw in keywords if kw in lowered_heading)
+        score += sum(3 for kw in keywords if kw in lowered_block)
+        # index keeps the sort stable and, among equals, keeps README order -
+        # which is the author's own ordering by importance.
+        scored.append((-score, index, heading, block))
+    scored.sort()
+
+    for negative_score, _index, heading, block in scored:
+        if negative_score < 0 and used + len(block) + 2 <= body_budget:
+            kept.append(block)
+            used += len(block) + 2
+        else:
+            omitted.append(heading or "(preamble)")
+
+    digest = "\n\n".join(kept)
+    if omitted:
+        # Terse deliberately. Every character of framing here is a heading the
+        # trailer cannot name, and the heading is the part that is actionable.
+        opening = "\n\n<!-- README sections omitted as not bearing on NEW_REQUEST: "
+        listed, spent = [], len(opening) + len(" -->")
+        for heading in omitted:
+            if spent + len(heading) + 2 > trailer_cap:
+                break
+            listed.append(heading)
+            spent += len(heading) + 2
+        trailer = "; ".join(listed)
+        if len(listed) < len(omitted):
+            trailer += f"; +{len(omitted) - len(listed)} more"
+        digest += opening + trailer + " -->"
+
+    print(f"  📄 README digest: {len(content)} → {len(digest)} chars "
+          f"(cap {max_chars}); kept {len(kept)} section(s), listed {len(omitted)} "
+          f"by heading", flush=True)
+
+    if store_to:
+        try:
+            os.makedirs(os.path.dirname(store_to), exist_ok=True)
+            with open(store_to, "w", encoding="utf-8") as f:
+                f.write(f"<!-- Extracted from README.md for: {instruction[:200]!r} -->\n\n")
+                f.write(digest + "\n")
+        except Exception as e:
+            # Storing is for the human reading the run afterwards. Failing to
+            # store must never cost the pass the digest it is about to be given.
+            print(f"  ⚠ Could not store the README digest ({e}); continuing.", flush=True)
+
+    return digest
+
+
 # npm writes this into `scripts.test` when nothing is configured. Treating it as
 # a real suite would make the gate fail every project that never set one up.
 _NPM_TEST_PLACEHOLDER = "no test specified"
@@ -3501,14 +3886,39 @@ ARROW_RE = re.compile(
     rf"(?:function\b|\([^)]*\)[^=\n]*=>|[A-Za-z0-9_]+\s*=>)",
     re.MULTILINE,
 )
+# `export const DEFAULT_VOICE_QUESTIONS: VoiceQuestion[] = [...]`. A data
+# constant is not a function and not a keyword declaration, so neither pattern
+# above saw it and the file scanned as having no exported surface at all - it
+# fell into the bare roll-up, where the architect learned only that it existed.
+#
+# That is the file the measured run blocked on. Question banks, route manifests,
+# default datasets, config tables and enum-like objects are all declared this
+# way, and they are exactly the shapes architect.md R21 requires legal values
+# for. A skeleton that cannot see them cannot answer VALUES for any of them.
+#
+# Anchored at column zero, deliberately: the module's own surface, not every
+# `const x = 5` inside a function body.
+CONST_RE = re.compile(
+    rf"^{_SYM_MODIFIERS}(?:const|let|var)\s+(?P<name>[A-Za-z0-9_]+)\s*(?=[:=])",
+    re.MULTILINE,
+)
 IMPORT_RE = re.compile(
     r"^\s*(?:import\s+.+|from\s+\S+\s+import\s+.+|#include\s+.+|require\(.+\))",
     re.MULTILINE,
 )
 
-# ~7.5k tokens at the dense rate. The old 15000 was set against an 8k window; at
-# 64k it is affordable to give the architect a map it can actually navigate.
-MAX_SKELETON_CHARS = 30000
+# 30000 chars - 7.5k tokens - was set when PROJECT_HISTORY and the README were
+# taking 101300 tokens between them and there was nothing left to give. With
+# those capped the payload runs at ~17k tokens against a 110635-token facts
+# budget, so the map the design pass navigates by is the right place to spend it.
+#
+# Measured on a 1597-file workspace, this cap buys 487 of 837 entries at the
+# exported-names tier. It does NOT buy signatures: the tier that carries them
+# needs 248693 chars, and every cap below that lands in the overflow path where
+# a symbol is a bare name. R20 turns a bare name into a blocker, so raising this
+# reduces how often the architect blocks without removing the cause. 250000 is
+# the number that removes it, at 83k tokens of payload.
+MAX_SKELETON_CHARS = 90000
 
 # How far past a symbol's name to read looking for its parameters, and how much
 # of what is found to keep. The scan has to outrun a wrapped declaration - four
@@ -3533,7 +3943,7 @@ SKELETON_EXTS = (".py", ".ts", ".js", ".tsx", ".jsx", ".go", ".rs", ".java",
 IMPLICIT_EXPORT_EXTS = (".py",)
 
 
-def _signature_tail(content: str, name_end: int) -> str:
+def _signature_tail(content: str, name_end: int, stop_at_assign: bool = False) -> str:
     """
     The declaration that follows a symbol's name: parameters and return type.
 
@@ -3558,6 +3968,12 @@ def _signature_tail(content: str, name_end: int) -> str:
         elif ch in ")]>":
             depth = max(depth - 1, 0)
         elif depth == 0 and ch in "{;\n":
+            break
+        elif depth == 0 and stop_at_assign and ch == "=":
+            # A constant's declared type is its interface; its value is data.
+            # Without this the scan follows `= [` into the array literal and
+            # spends _SIG_SCAN_CHARS transcribing a question bank into the
+            # skeleton - the one place in the payload with no room for it.
             break
         out.append(" " if ch in "\t\r" else ch)
     # "=", ":" and "=>" are the joins between a name and its value; each is the
@@ -3589,7 +4005,9 @@ def _scan_symbols(content: str, ext: str = ""):
     exported, internal = [], []
     seen = set()
     implicit = ext in IMPLICIT_EXPORT_EXTS
-    for pattern in (SIGNATURE_RE, ARROW_RE):
+    # CONST_RE runs last so a `const` that IS a function is claimed by ARROW_RE
+    # first and keeps its parameter list; `seen` makes the precedence stick.
+    for pattern, is_const in ((SIGNATURE_RE, False), (ARROW_RE, False), (CONST_RE, True)):
         for m in pattern.finditer(content):
             name = m.group("name")
             if name in seen:
@@ -3603,7 +4021,9 @@ def _scan_symbols(content: str, ext: str = ""):
                 indent = m.group(0).rpartition("\n")[2]
                 public = not indent[:1].isspace() and not name.startswith("_")
             if public:
-                exported.append((name, _signature_tail(content, m.end("name"))))
+                exported.append(
+                    (name, _signature_tail(content, m.end("name"), is_const))
+                )
             else:
                 # No tier renders an internal signature, so none is scanned for.
                 internal.append((name, ""))
@@ -3697,6 +4117,56 @@ def _render_skeleton(files_data: list, detail: SkeletonDetail) -> tuple[list, st
     return blocks, footer
 
 
+# Most of the overflow cap the bare roll-up may take before detail starts losing.
+# Navigation degrades gracefully - a partial file list still navigates, and the
+# directory tree carries the rest - while detail does not: an exported signature
+# the pass never sees is a fact it can only block on or invent.
+BARE_FOOTER_CAP_FRACTION = 0.25
+
+
+def _fit_bare_footer(footer: str, cap: int) -> str:
+    """
+    Trim the bare-file roll-up to `cap` characters, on a path boundary.
+
+    The roll-up is one comma-separated line naming every file that rendered no
+    symbols at the current tier, and it was unbounded. On a 1596-file workspace
+    it measured 50355 characters - 1.7x the whole 30000-char skeleton cap - and
+    get_symbol_skeleton's overflow path seeded its running total with it before
+    fitting a single entry. `total + len(block) > MAX_SKELETON_CHARS` was
+    therefore true on the FIRST block, the loop broke immediately, and the
+    skeleton went out as "0 of 837 detailed entries shown": 837 bare filenames,
+    not one exported symbol anywhere in the project.
+
+    That is the input the architect was handed before it blocked on
+    `src/features/voice-profile/questions.ts`. Under R20 it had no other move -
+    the file was in the roll-up, so it knew the file existed and nothing else.
+    A blocker that names a real file is the correct response to this skeleton,
+    which is why the failure looked like a model problem and was not one.
+    """
+    if not footer or len(footer) <= cap:
+        return footer
+    heading = BARE_FILES_HEADING + "\n"
+    if cap <= len(heading):
+        return ""
+    paths = [p.strip() for p in footer[len(heading):].split(",") if p.strip()]
+    # Reserved against the full count so the reservation can only over-reserve,
+    # the same defensive sizing read_evidence uses for its truncation marker.
+    marker = "\n... [+{} more files not listed]\n".format(len(paths))
+    kept, used = [], len(heading) + len(marker)
+    for path in paths:
+        if used + len(path) + 2 > cap:
+            break
+        kept.append(path)
+        used += len(path) + 2
+    if not kept:
+        return ""
+    out = heading + ", ".join(kept) + "\n"
+    omitted = len(paths) - len(kept)
+    if omitted:
+        out += f"... [+{omitted} more files not listed]\n"
+    return out
+
+
 def skeleton_paths(skeleton: str) -> set:
     """
     Every project-relative path the skeleton accounts for.
@@ -3747,23 +4217,39 @@ def prune_tree_against_skeleton(tree_output: str, covered: set) -> str:
 
     if dropped:
         kept.append(f"\n[{dropped} source files omitted here - "
-                    f"they appear in SYMBOL_SKELETON with full paths]")
+                    f"they appear in SYMBOL_INDEX with full paths]")
     return "\n".join(kept)
 
 
-def get_symbol_skeleton(project_dir: str) -> str:
+def scan_project_files(project_dir: str) -> list:
     """
-    Build a navigable map of the project's declarations.
+    Walk the project once and return (path, lines, imports, exported, internal).
 
-    Tiered under the size cap: emit the richest of SKELETON_TIERS that fits, from
-    the full map down to bare exported names. Truncating mid-walk - as this used
-    to - drops whole files off the end of the directory walk, so the architect
-    silently never learns that, say, engagement-card.tsx exists. Shedding detail
-    before shedding files keeps every file represented.
+    Extracted so the three blocks built from it - the symbol index, the call
+    graph and the skeleton - share one traversal and one definition of what
+    counts as a project file. Three walks with three filters is three chances
+    for them to disagree about which files exist.
     """
     files_data = []
     for root, dirs, files in os.walk(project_dir):
-        dirs[:] = [d for d in dirs if d not in SKELETON_SKIP_DIRS]
+        # Hidden directories are skipped, which is not a tidiness rule.
+        # DIRECTORY_STRUCTURE comes from tree(1) without -a, so it never shows
+        # them; a skeleton that walks them names files the payload's own
+        # structure block says do not exist, and prune_tree_against_skeleton can
+        # never match one.
+        #
+        # What that cost, measured on a live workspace: `.claude/worktrees/` held
+        # two full checkouts of the project, so 1142 of 1597 scanned files - 71%
+        # of the skeleton - were second and third copies of the same code. Tier 1
+        # cost 248693 chars and did not fit any affordable cap; the real project
+        # costs 57636 and fits with room to spare.
+        #
+        # The duplication was not merely wasteful. architect.md R14 requires a
+        # name that resolves twice to be path-qualified before it can be cited,
+        # and every symbol in the project resolved three times. The design pass
+        # was being asked to disambiguate its own workspace against itself.
+        dirs[:] = [d for d in dirs
+                   if d not in SKELETON_SKIP_DIRS and not d.startswith(".")]
         for file in sorted(files):
             if not file.endswith(SKELETON_EXTS):
                 continue
@@ -3778,6 +4264,127 @@ def get_symbol_skeleton(project_dir: str) -> str:
             if imports or exported or internal:
                 files_data.append((rel_path, content.count("\n") + 1,
                                    imports, exported, internal))
+    return files_data
+
+
+# --- The three blocks a design pass reads the codebase through --------------
+#
+# One general-purpose skeleton was carrying every rule at once and serving none
+# of them well. The rules want different things, so they get different blocks:
+#
+#   R18 (no duplicate symbol) needs a NEGATIVE - "nothing already does this" -
+#       which only an exhaustive list of exported names can support. Signatures
+#       are irrelevant to a negative; coverage is everything.
+#   R19 (all call sites) needs a reverse-dependency query. Similarity search
+#       cannot answer it: a caller may import a file for reasons that share no
+#       vocabulary with the request. It is computed, not retrieved.
+#   R17 (prior art) and the design facts themselves need real source, but only
+#       for the handful of files the request actually passes through - which is
+#       what the survey identifies and verifies.
+#
+# The signature skeleton was a hedge against not knowing which files mattered.
+# Once the survey knows, the hedge is replaced by the code itself.
+
+# Module specifier inside an import line: the quoted part of `from "@/x/y"`.
+_IMPORT_SPEC_RE = re.compile(r"""['"]([^'"\n]+)['"]""")
+
+# Extensions stripped when matching a specifier to a file on disk. TypeScript
+# and friends import `./questions`, never `./questions.ts`.
+_MODULE_EXT_RE = re.compile(r"\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java)$")
+
+
+def build_symbol_index(files_data: list) -> str:
+    """
+    Every file, every exported name, no signatures. The R18 authority.
+
+    Deliberately the leanest tier rather than the richest that fits: this block
+    exists to make an exhaustive claim, and an exhaustive claim it cannot afford
+    is worth less than a cheap one it can. Measured on a 458-file workspace at
+    14775 tokens against 22768 for the same files with signatures - and the
+    signatures are supplied, in full and from source, for the files the survey
+    identifies.
+    """
+    blocks, footer = _render_skeleton(files_data, SKELETON_TIERS[-1])
+    header = ("[EXPORTED SYMBOL INDEX]\nEvery file in the project and every name "
+              "it exports. COMPLETE: a name absent here is exported nowhere. "
+              "Names only - for a symbol's shape, read it in SURVEYED_SOURCE or "
+              "ask for the file.")
+    body = "\n".join([header] + blocks + ([footer] if footer else []))
+    print(f"  🗂️  Symbol index: {len(files_data)} files, {len(body)} chars", flush=True)
+    return body
+
+
+def resolve_import_target(spec: str, by_stem: dict) -> str:
+    """Map one import specifier onto a project file, or None if it leaves the project."""
+    candidate = _MODULE_EXT_RE.sub("", spec.strip())
+    candidate = candidate.lstrip("@").lstrip("./").lstrip("/")
+    if not candidate:
+        return None
+    for form in (candidate, f"src/{candidate}",
+                 f"{candidate}/index", f"src/{candidate}/index"):
+        if form in by_stem:
+            return by_stem[form]
+    return None
+
+
+def build_call_graph(files_data: list) -> str:
+    """
+    Who imports each file. The R19 authority.
+
+    R19 requires a CALLERS bullet for every [MODIFIED] file, naming its other
+    consumers "from CONTEXT". The tier the skeleton actually shipped renders no
+    imports at all, so that fact was not in CONTEXT and never had been: the pass
+    could satisfy R19 only by asserting "sole call site" with nothing behind it.
+    An uncounted consumer is, in R19's own words, the next defect.
+
+    Computed from the import lines already collected, so it is exact rather than
+    inferred, and exhaustive rather than ranked. Files nothing imports are listed
+    together: "nothing imports this" is the answer R19 wants for a leaf, and it
+    is not the same answer as "not mentioned".
+    """
+    by_stem = {}
+    for rel_path, _lines, _imports, _exported, _internal in files_data:
+        by_stem[_MODULE_EXT_RE.sub("", rel_path)] = rel_path
+
+    callers = {}
+    for rel_path, _lines, imports, _exported, _internal in files_data:
+        for line in imports:
+            match = _IMPORT_SPEC_RE.search(line)
+            if not match:
+                continue
+            target = resolve_import_target(match.group(1), by_stem)
+            # Self-imports say nothing and a file is not its own call site.
+            if target and target != rel_path:
+                callers.setdefault(target, set()).add(rel_path)
+
+    lines = [f"{path} <- {', '.join(sorted(callers[path]))}"
+             for path in sorted(callers)]
+    uncalled = sorted(p for p, *_ in files_data if p not in callers)
+
+    header = ("[CALL GRAPH]\nWho imports each file, computed from its import "
+              "statements. COMPLETE for imports this project resolves; an "
+              "external package or a dynamic import resolves to nothing and is "
+              "absent. Read `a <- b, c` as: changing a changes b and c.")
+    body = "\n".join([header] + lines)
+    if uncalled:
+        body += ("\n\nNo project file imports these (entry points, routes, "
+                 "configs and leaves):\n" + ", ".join(uncalled) + "\n")
+    print(f"  🔗 Call graph: {len(callers)} imported file(s), "
+          f"{len(uncalled)} with no project importer, {len(body)} chars", flush=True)
+    return body
+
+
+def get_symbol_skeleton(project_dir: str) -> str:
+    """
+    Build a navigable map of the project's declarations.
+
+    Tiered under the size cap: emit the richest of SKELETON_TIERS that fits, from
+    the full map down to bare exported names. Truncating mid-walk - as this used
+    to - drops whole files off the end of the directory walk, so the architect
+    silently never learns that, say, engagement-card.tsx exists. Shedding detail
+    before shedding files keeps every file represented.
+    """
+    files_data = scan_project_files(project_dir)
 
     for detail in SKELETON_TIERS:
         blocks, footer = _render_skeleton(files_data, detail)
@@ -3794,6 +4401,9 @@ def get_symbol_skeleton(project_dir: str) -> str:
     # Even the leanest tier overflows: keep as many whole files as fit, and say
     # how many were dropped rather than trailing off mid-walk.
     blocks, footer = _render_skeleton(files_data, SKELETON_TIERS[-1])
+    # Fitted, not seeded. An unbounded roll-up spent the entire cap before the
+    # first entry was considered - see _fit_bare_footer.
+    footer = _fit_bare_footer(footer, int(MAX_SKELETON_CHARS * BARE_FOOTER_CAP_FRACTION))
     skeleton, total, kept = ["[PROJECT SYMBOL SKELETON]"], len(footer), 0
     for block in blocks:
         if total + len(block) > MAX_SKELETON_CHARS:
@@ -3804,6 +4414,9 @@ def get_symbol_skeleton(project_dir: str) -> str:
     skeleton.append(f"\n... [Skeleton truncated: {kept} of {len(blocks)} detailed entries shown]")
     if footer:
         skeleton.append(footer)
+    print(f"  🦴 Skeleton: {len(files_data)} files, {total} chars, OVERFLOW tier — "
+          f"{kept} of {len(blocks)} entries carry detail, roll-up trimmed to "
+          f"{len(footer)} chars", flush=True)
     return "\n".join(skeleton)
 
 
@@ -3869,9 +4482,16 @@ def run_distillation():
         except Exception:
             tree_output = "(Could not generate directory tree)"
             
-        symbol_skeleton = get_symbol_skeleton("/workspace")
+        # One walk, three blocks - see build_symbol_index / build_call_graph.
+        # symbol_skeleton is the index: it is what the survey and the blocker
+        # protocol map a request or a blocker onto files through, and names are
+        # all either needs to do that.
+        project_files = scan_project_files("/workspace")
+        symbol_index = build_symbol_index(project_files)
+        call_graph = build_call_graph(project_files)
+        symbol_skeleton = symbol_index
         tree_output = prune_tree_against_skeleton(
-            tree_output, skeleton_paths(symbol_skeleton)
+            tree_output, skeleton_paths(symbol_index)
         )
         toolchain_info = detect_project_toolchain("/workspace")
         
@@ -3905,7 +4525,13 @@ def run_distillation():
                     latest_instruction = content
                     break
 
-        readme_content = read_workspace_file("README.md")
+        # Located and extracted against the request, not injected whole - see
+        # distill_readme. The digest is stored back into the workspace so the
+        # selection is auditable next to the pass output that used it.
+        readme_content = distill_readme(
+            read_workspace_file("README.md"), latest_instruction,
+            store_to=os.path.join("/workspace", README_DIGEST_PATH),
+        )
         issues_content = read_workspace_file(".cline_context/.build_issues.md")
 
         # The eight directives above are written for a design request. A bug
@@ -3925,12 +4551,12 @@ def run_distillation():
         conversation_text = (
             f"<SITUATIONAL_AWARENESS>\n"
             f"  <MODE>ITERATIVE_REBUILD</MODE>\n"
-            f"  <STATUS>This project is ALREADY PARTIALLY IMPLEMENTED. Use the provided DIRECTORY_STRUCTURE and SYMBOL_SKELETON to understand the current state.</STATUS>\n"
+            f"  <STATUS>This project is ALREADY PARTIALLY IMPLEMENTED. Use the provided DIRECTORY_STRUCTURE, SYMBOL_INDEX, CALL_GRAPH and SURVEYED_SOURCE to understand the current state.</STATUS>\n"
             f"  <DIRECTIVES>\n"
             f"    1. [P0] PRESERVATION: Prioritize building on top of existing code. Maintain the current file organization and design idioms. Rework is strictly prohibited.\n"
             f"    2. [P0] CONTINUITY: Read the 'PROJECT_HISTORY' to pick up exactly where the last agent left off.\n"
-            f"    3. [P0] NAVIGATION: Use the SYMBOL_SKELETON to map out dependencies before reading files.\n"
-            f"    4. [P0] ANALYZE: Carefully examine the 'DIRECTORY_STRUCTURE', 'SYMBOL_SKELETON', and 'PROJECT_OVERVIEW' blocks below before planning any code changes.\n"
+            f"    3. [P0] NAVIGATION: SYMBOL_INDEX is the complete list of exported names - a name absent there is exported nowhere. CALL_GRAPH is the complete list of importers. SURVEYED_SOURCE, when present, is real source for the files this request turns on.\n"
+            f"    4. [P0] ANALYZE: Carefully examine the 'DIRECTORY_STRUCTURE', 'SYMBOL_INDEX', 'CALL_GRAPH', 'SURVEYED_SOURCE' and 'PROJECT_OVERVIEW' blocks below before planning any code changes.\n"
             f"    5. [P0] NON-REDUNDANT_PLANNING: DO NOT plan for or recreate files that already exist in the structure unless the 'NEW_REQUEST' explicitly requires a logic change in them.\n"
             f"    6. [P0] FILE_STATUS_AWARENESS: If the 'ARCHITECTURE' section (developed by the architect) mentions a file that is NOT present in the 'DIRECTORY_STRUCTURE', it is a NEW component. You MUST create it.\n"
             f"    7. [P0] CONTEXT_ALIGNMENT: Use the 'PROJECT_HISTORY' to understand the intent and reasoning behind the current request.\n"
@@ -3942,7 +4568,7 @@ def run_distillation():
             f"<PROJECT_DATA>\n"
             f"  <NAME>{PROJECT_NAME}</NAME>\n"
             f"  <PROJECT_HISTORY>\n"
-            f"{conversation_to_text(messages[:-1])}\n"
+            f"{conversation_to_text(messages[:-1], HISTORY_MAX_MESSAGES)}\n"
             f"  </PROJECT_HISTORY>\n\n"
         )
         
@@ -3956,7 +4582,9 @@ def run_distillation():
 
         conversation_text += (
             f"  <DIRECTORY_STRUCTURE>\n```\n{tree_output}\n```\n  </DIRECTORY_STRUCTURE>\n\n"
-            f"  <SYMBOL_SKELETON>\n{symbol_skeleton}\n  </SYMBOL_SKELETON>\n\n"
+            f"  <SYMBOL_INDEX>\n{symbol_index}\n  </SYMBOL_INDEX>\n\n"
+            f"  <CALL_GRAPH>\n{call_graph}\n  </CALL_GRAPH>\n"
+            f"{SURVEY_PLACEHOLDER}\n"
         )
         if toolchain_info:
             conversation_text += f"  {toolchain_info}\n\n"
@@ -4077,6 +4705,41 @@ def run_distillation():
             )
         else:
             print("  ↳ Every pass is resuming from disk; no model needed.", flush=True)
+
+        # R17 says survey before you design, and until this ran nothing could:
+        # the design pass could see source only by blocking for it, which costs a
+        # whole pass and only fires after the design has already failed. One
+        # small call maps the request onto files, the mapping is checked against
+        # the workspace, and the verified source goes into the payload ahead of
+        # the pass that needs it.
+        #
+        # Placed here rather than in the assembly because it needs a client and a
+        # model, and both are created by this block. An empty survey is not a
+        # failure - the indexes still stand, and the blocker protocol is still
+        # behind it - so the placeholder is always cleared either way.
+        if SURVEY_PLACEHOLDER in conversation_text:
+            survey_block = ""
+            if symbol_skeleton and latest_instruction:
+                survey_budget = solve_addendum_budget(
+                    CONTEXT_WINDOW,
+                    est_tokens(prompts.get(DISTILL_DESIGN_PASS, "")),
+                    est_tokens(conversation_text.replace(SURVEY_PLACEHOLDER, "")),
+                )
+                try:
+                    survey_block = survey_codebase(
+                        client,
+                        _resolve_model_config(
+                            models.get(DISTILL_DESIGN_PASS, models.get("architect")),
+                            pass_key=DISTILL_DESIGN_PASS,
+                        ),
+                        latest_instruction, symbol_skeleton, survey_budget,
+                    )
+                except Exception as e:
+                    # The survey is an optimisation on the blocker protocol, not
+                    # a prerequisite for it. Losing it costs a round trip later,
+                    # never the run.
+                    print(f"  ⚠ Survey errored ({e}); continuing without it.", flush=True)
+            conversation_text = conversation_text.replace(SURVEY_PLACEHOLDER, survey_block)
 
         for pass_key, pass_label in passes:
             print(f"\n{pass_label}", flush=True)
