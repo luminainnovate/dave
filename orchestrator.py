@@ -608,8 +608,6 @@ async def _start_llamacpp_server(config: dict):
             # to generation overrunning the window. Leaving it in advertised a
             # protection that was not there.
             "--slot-prompt-similarity", "0.95",
-            "--batch-size", "1024",
-            "--ubatch-size", "1024",
             "--reasoning-format", "deepseek",
             # -ngl defaults to 'auto', which silently spills layers to system RAM
             # when the KV cache leaves no room. That degrades generation to PCIe
@@ -644,7 +642,12 @@ async def _start_llamacpp_server(config: dict):
         # being the one set buried in a launch line. Server-side defaults only:
         # distill.py sends its own per-pass values, which override these.
         truncate_args += _cline_startup_sampling_args()
-        # "--spec-type", "draft-mtp"
+        # Batch sizes and speculative decoding, from agent_config.json's `server`
+        # block. These used to be a hardcoded 1024/1024 above and a commented-out
+        # "--spec-type", "draft-mtp" here; both are server properties with no
+        # per-request equivalent, so they belong beside the sampling defaults
+        # rather than buried in a launch line.
+        truncate_args += _server_tuning_args()
 
         # Build command: detect HuggingFace repo vs local path
         if "/" in model and not os.path.exists(model):
@@ -828,6 +831,82 @@ def _cline_startup_sampling_args() -> list[str]:
         value = params.get(name, CLINE_STARTUP_SAMPLING_DEFAULTS[name])
         args += [flag, str(int(value)) if name == "top_k" else f"{float(value):g}"]
     logger.info(f"llama.cpp: Cline sampling defaults {' '.join(args)}")
+    return args
+
+
+# Server-process tuning, read from agent_config.json's `server` block. Same
+# reasoning as the sampling defaults above: batch sizes and speculative decoding
+# have no per-request equivalent, so the server has to carry them, and the config
+# file is a better home for a tunable than a literal in the spawn line.
+#
+# The speculative values are the interesting half, and they default to off. See
+# the `_speculative_help` in agent_config.json for the measured numbers; the short
+# version is that draft-mtp adds no weights but its draft context allocates a
+# second ~1120 MiB compute buffer and inherits the target window, which does not
+# fit at LLAMACPP_SERVER_CTX 163840. Lowering ubatch_size does not rescue it
+# (1120 -> 880 MiB, mostly fixed cost); lowering the window is the only lever, and
+# that trades against the reason 163840 was chosen. Turning this on is a two-part
+# change or it is a startup crash.
+LLAMACPP_SERVER_TUNING_DEFAULTS = {
+    "batch_size": 2048,
+    "ubatch_size": 1024,
+}
+LLAMACPP_SPECULATIVE_DEFAULTS = {
+    "type": "draft-mtp",
+    "n_max": 4,
+    "p_min": 0.75,
+    "draft_cache_type_k": "q4_0",
+    "draft_cache_type_v": "q4_0",
+}
+_SERVER_FLAGS = {
+    "batch_size": "--batch-size",
+    "ubatch_size": "--ubatch-size",
+}
+# Applied only when the drafter is on. Passing them alongside --spec-type none
+# would parse fine but advertises tuning for something that is not running.
+_SPECULATIVE_FLAGS = {
+    "n_max": "--spec-draft-n-max",
+    "p_min": "--spec-draft-p-min",
+    "draft_cache_type_k": "--spec-draft-type-k",
+    "draft_cache_type_v": "--spec-draft-type-v",
+}
+
+
+def _server_tuning_args() -> list[str]:
+    """llama-server batch and speculative-decoding flags from agent_config.json."""
+    batching = dict(LLAMACPP_SERVER_TUNING_DEFAULTS)
+    speculative = dict(LLAMACPP_SPECULATIVE_DEFAULTS)
+    path = os.environ.get("AGENT_CONFIG_PATH", "cline-builder/agent_config.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            block = json.load(f).get("server") or {}
+        batching.update({k: v for k, v in block.items() if k in batching})
+        speculative.update({k: v for k, v in (block.get("speculative") or {}).items()
+                            if k in speculative})
+        unknown = [k for k in block
+                   if not k.startswith("_") and k not in batching and k != "speculative"]
+        if unknown:
+            logger.warning(f"llama.cpp: ignoring unknown server tuning keys: {unknown}")
+    except Exception as e:
+        logger.warning(
+            f"Could not read `server` from {path}: {e}. Using built-in tuning."
+        )
+        batching = dict(LLAMACPP_SERVER_TUNING_DEFAULTS)
+        speculative = dict(LLAMACPP_SPECULATIVE_DEFAULTS)
+
+    args = []
+    for name, flag in _SERVER_FLAGS.items():
+        args += [flag, str(int(batching[name]))]
+
+    spec_type = str(speculative["type"])
+    args += ["--spec-type", spec_type]
+    if spec_type != "none":
+        for name, flag in _SPECULATIVE_FLAGS.items():
+            value = speculative[name]
+            args += [flag, f"{float(value):g}" if name == "p_min"
+                     else str(int(value)) if name == "n_max" else str(value)]
+
+    logger.info(f"llama.cpp: server tuning {' '.join(args)}")
     return args
 
 

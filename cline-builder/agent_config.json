@@ -42,13 +42,29 @@
     
     "context_window": 65536,
 
+    "_server_help": "Tuning for the shared llama-server the orchestrator spawns. A property of the SERVER process, not of any one phase, so unlike `sampling` these cannot be sent per request - the server has to be restarted to change them. Read fresh at launch; a malformed block degrades to the values below rather than stopping a model loading. `speculative.type` accepts any value llama.cpp's --spec-type does; \"none\" is the clean off switch and suppresses the four draft_* knobs rather than passing them to a disabled drafter.",
+    "server": {
+        "_batch_help": "-b is the logical batch cap and is close to VRAM-free; -ub is the physical one and is what sizes the compute buffer. These were hardcoded to 1024/1024, which put -b BELOW llama.cpp's own 2048 default for no saving. Do not reach for -ub 512 as a way to fit MTP: measured, it takes the draft compute buffer from 1120 to 880 MiB, not to half, because a large part of that allocation is fixed. It was not enough at 163840 and it will not be.",
+        "batch_size": 2048,
+        "ubatch_size": 1024,
+
+        "_speculative_help": "Multi-token prediction, MEASURED on this box at 50.44 vs 39.07 tok/s - 1.29x, not the 1.5x the vendor figures imply. It loads no second model (the draft head ships in this GGUF: qwen35 nextn_predict_layers 1) but the draft context allocates its OWN compute buffer, ~1120 MiB at ubatch 1024, and inherits the target's window - this build has no --ctx-size-draft to cap it. That is what decides whether it fits, and it does NOT fit at LLAMACPP_SERVER_CTX 163840. Measured peak VRAM of 24576 MiB: 163840+none 22759 (fits), 163840+mtp OOM, 131072+mtp 23495 (1081 spare), 98304+mtp 21987 (2589 spare). So turning this on means lowering LLAMACPP_SERVER_CTX, and that constant is 163840 for a documented reason - Cline compacts against a hardcoded 128000, so a 131072 server puts a maximal prompt back within ~3k tokens of the wall. Default off: 29% generation is not obviously worth re-opening that failure. Set type to draft-mtp AND lower LLAMACPP_SERVER_CTX together, or not at all.",
+        "speculative": {
+            "type": "none",
+            "n_max": 4,
+            "p_min": 0.75,
+            "draft_cache_type_k": "q4_0",
+            "draft_cache_type_v": "q4_0"
+        }
+    },
+
     "_sampling_help": "Per-phase sampling. `_modes` holds the model card's two presets - thinking wants a wide, unpenalised distribution because the reasoning channel needs room to explore; instruct wants a narrower one with a presence penalty so a non-thinking pass does not restate itself. Each phase names the mode it runs in and may override individual parameters on top of it (temperature, top_p, top_k, min_p, presence_penalty, repetition_penalty). Naming the mode rather than restating six numbers is the point: retuning a preset moves every phase that uses it, and an override reads as a deliberate deviation. An unknown parameter name is a startup error, not a silently ignored key. `cline_startup` is the Cline build agent's own turns; distill.py does not run that phase, so its values are applied by the orchestrator as llama-server defaults when it starts the shared server.",
 
     "sampling": {
         "_modes": {
             "_thinking_temperature_help": "0.95 rather than the card's 1.0: a deliberate local tune, carried over from the SAMPLING_TEMPERATURE constant this block replaced. It sits just under the preset rather than far below it - the repetition-loop risk this family shows is at temperatures well under the card's figures, which 0.6 and 0.3 both were.",
             "thinking": {
-                "temperature": 0.95,
+                "temperature": 1.0,
                 "top_p": 0.95,
                 "top_k": 20,
                 "min_p": 0.0,
@@ -68,7 +84,7 @@
         "cline_startup": { "mode": "thinking" },
         "architect": { "mode": "thinking" },
         "_engineer_help": "The only instruct phase. It transcribes an architecture that has already been decided into a file-by-file build map, and thinking-mode sampling on that job produces invention where transcription was wanted.",
-        "engineer": { "mode": "instruct" },
+        "engineer": { "mode": "thinking" },
         "safety": { "mode": "thinking" },
         "test_engineer": { "mode": "thinking" },
         "_bugfix_sampling_help": "A discrete phase, outside the four software-factory passes: it replaces the architect in slot 1 for `!bugfix` runs and is never one stage of the same pipeline.",
