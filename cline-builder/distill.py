@@ -1038,6 +1038,46 @@ def blocker_symbol_hints(blockers: list) -> dict:
     return hints
 
 
+# "lines ~1040-1100", "line 1040", "lines 1040 to 1100", "L1040-L1100". A blocker
+# that names a region is giving a better anchor than any symbol guess, and until
+# this parsed it the text was read past: the run that asked for
+# `Backend/src/routes/users.ts` lines ~1040-1100 was handed the first 24000
+# characters of a 46738-character file, and the region it named starts at 42012.
+_BLOCKER_LINE_RANGE_RE = re.compile(
+    r"lines?\s*~?\s*L?(\d{1,6})\s*(?:[-\u2013\u2014]|\bto\b)\s*~?L?(\d{1,6})"
+    r"|lines?\s*~?\s*L?(\d{1,6})",
+    re.IGNORECASE,
+)
+
+
+def blocker_line_hints(blockers: list) -> dict:
+    """
+    Map path -> (start_line, end_line) for regions a blocker named in prose.
+
+    Paired with the ticked paths in the same statement, the same way
+    blocker_symbol_hints pairs symbols. One statement usually names one file;
+    where it names several, the region applies to each, which is the honest
+    reading of "these files, around here".
+    """
+    hints = {}
+    for statement in blockers or []:
+        text = statement if isinstance(statement, str) else str(statement)
+        match = _BLOCKER_LINE_RANGE_RE.search(text)
+        if not match:
+            continue
+        if match.group(1):
+            start, end = int(match.group(1)), int(match.group(2))
+        else:
+            start = end = int(match.group(3))
+        if start > end:
+            start, end = end, start
+        for ticked in _BLOCKER_TICKED_RE.findall(text):
+            if not _LOOKS_LIKE_PATH_RE.search(ticked):
+                continue
+            hints[ticked.lstrip("./").split("::", 1)[0]] = (start, end)
+    return hints
+
+
 def _find_definition(content: str, symbols) -> "int | None":
     """
     Offset of the earliest DEFINITION of any named symbol, else any mention.
@@ -1057,14 +1097,53 @@ def _find_definition(content: str, symbols) -> "int | None":
             best = m.start()
     if best is not None:
         return best
+
+    # Mentions, but never the import that brought the name into the file.
+    #
+    # A symbol this file uses without defining - `externalJobs`, a table imported
+    # from a schema module - has its first mention in the import block at the top
+    # and its real uses hundreds of lines below. Measured: a blocker asked for the
+    # handler at lines 1040-1100 of a 46738-char file, the only hint resolvable
+    # was such a symbol, its first mention sat at byte 763, and the 24000-char
+    # slice centred there did not contain the requested region at all. The pass
+    # got a plausible slice of the right file, which is indistinguishable from
+    # having been answered.
+    import_only = None
     for sym in symbols or []:
-        m = re.search(rf"\b{re.escape(sym)}\b", content)
-        if m and (best is None or m.start() < best):
-            best = m.start()
-    return best
+        first = None
+        for m in re.finditer(rf"\b{re.escape(sym)}\b", content):
+            if first is None:
+                first = m.start()
+            line_end = content.find("\n", m.start())
+            line = content[content.rfind("\n", 0, m.start()) + 1:
+                           line_end if line_end != -1 else len(content)]
+            if IMPORT_RE.match(line):
+                continue
+            if best is None or m.start() < best:
+                best = m.start()
+            break
+        # Every mention was an import line. Keep it only as a last resort: the
+        # top of the file still beats nothing when there is no other anchor.
+        if first is not None and (import_only is None or first < import_only):
+            import_only = first
+    return best if best is not None else import_only
 
 
-def _slice_around_symbols(content: str, keep: int, symbols) -> str:
+def _line_offset(content: str, line_number: int) -> int:
+    """Byte offset of a 1-indexed line, clamped to the file."""
+    if line_number <= 1:
+        return 0
+    offset = 0
+    for _ in range(line_number - 1):
+        nxt = content.find("\n", offset)
+        if nxt == -1:
+            return len(content)
+        offset = nxt + 1
+    return offset
+
+
+def _slice_around_symbols(content: str, keep: int, symbols,
+                          line_range: tuple = None) -> str:
     """
     Take `keep` characters centred on the symbol the blocker asked about.
 
@@ -1090,7 +1169,13 @@ def _slice_around_symbols(content: str, keep: int, symbols) -> str:
         body = content[:max(0, keep - len(tail_marker.format(len(content))))]
         return body + tail_marker.format(len(content) - len(body))
 
-    hit = _find_definition(content, symbols)
+    # A stated line range outranks a symbol guess: it is what the pass asked for,
+    # in its own words, rather than what a name search happened to find.
+    hit = None
+    if line_range:
+        hit = _line_offset(content, line_range[0])
+    if hit is None:
+        hit = _find_definition(content, symbols)
     if hit is None:
         return head_slice()
 
@@ -1124,7 +1209,8 @@ EVIDENCE_PREAMBLE = (
 def read_evidence(project_dir: str, paths: list, budget_chars: int,
                   absent: list = None, symbol_hints: dict = None,
                   tag: str = "REQUESTED_EVIDENCE",
-                  preamble: str = EVIDENCE_PREAMBLE) -> "Evidence":
+                  preamble: str = EVIDENCE_PREAMBLE,
+                  line_hints: dict = None) -> "Evidence":
     """
     Read the requested files into a payload block, within budget.
 
@@ -1180,7 +1266,8 @@ def read_evidence(project_dir: str, paths: list, budget_chars: int,
                 continue
             # Centred on the symbol the blocker named, not the top of the file.
             content = _slice_around_symbols(
-                content, keep, (symbol_hints or {}).get(rel)
+                content, keep, (symbol_hints or {}).get(rel),
+                (line_hints or {}).get(rel),
             )
         remaining -= len(content)
         included.append(rel)
@@ -1320,7 +1407,8 @@ def resolve_pass_blockers(client, pass_key: str, model_config, prompt: str,
                   f"already exceeds the merge budget, so this call extracts either way.",
                   flush=True)
         found_evidence = read_evidence("/workspace", fresh, budget, fresh_absent,
-                                       symbol_hints=blocker_symbol_hints(blockers))
+                                       symbol_hints=blocker_symbol_hints(blockers),
+                                       line_hints=blocker_line_hints(blockers))
         addendum = found_evidence.text
         if not addendum:
             print("  ⚠ No readable evidence identified for these blockers.", flush=True)
