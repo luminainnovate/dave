@@ -349,10 +349,17 @@ class ExtractionFailed(RuntimeError):
     Same reasoning as BudgetInfeasible: fail loudly, name the cause.
     """
 
-    def __init__(self, stage: str, failures: list, total: int):
+    def __init__(self, stage: str, failures: list, total: int,
+                 summary: str = "", checks: list = None):
         self.stage = stage
         self.failures = failures          # list of (label, error_text)
         self.total = total
+        # An abort report that describes the wrong fault is worse than a generic
+        # one: "is a server listening?" sends the operator to check a server that
+        # answered perfectly well and returned nothing. A raiser that knows better
+        # says so here; everything else keeps the connectivity wording.
+        self.summary = summary
+        self.checks = checks
         labels = ", ".join(label for label, _ in failures)
         errors = sorted({err for _, err in failures})
         super().__init__(
@@ -2440,6 +2447,44 @@ def preload_model(client: httpx.Client, model_config: dict) -> bool:
         hb.join(timeout=11)
 
 
+def _empty_pass_failure(pass_key: str, where: str) -> "ExtractionFailed":
+    """
+    The exception for a pass that ran cleanly and produced nothing.
+
+    Distinct wording from a connectivity failure because it IS a distinct fault:
+    the model answered, the answer was empty, and every generic remedy about
+    unreachable endpoints points the operator away from the cause. See the
+    "empty answer" note above _rescue_empty_answer.
+    """
+    return ExtractionFailed(
+        f"{pass_key.title()} pass", [(where, "empty answer")], 1,
+        summary=(
+            f"**{pass_key}** returned an EMPTY document. The model was reachable and "
+            "answered; it just produced no content — on the measured case, several "
+            "thousand tokens on the thinking channel and zero on the content "
+            "channel. It has already been re-run once with thinking off."),
+        checks=[
+            "Look for a `reasoning_*.md` trace beside this file. If the document "
+            "was written without a closing `</think>`, the whole thing is in there.",
+            "The prompt for this pass may simply be too large to answer — check the "
+            "`Input:` line in the build log against the context window.",
+            "`--reasoning-format deepseek` routes everything before `</think>` to "
+            "the reasoning channel; a model that never closes the tag looks exactly "
+            "like a model that said nothing.",
+        ],
+    )
+
+
+def _abort_pass(pass_key: str, model_config, exc: "ExtractionFailed"):
+    """Write the abort report and stop, before .clinerules is assembled."""
+    update_status(f"Aborted: {exc}")
+    _write_pass_failure(pass_key, model_config, exc)
+    print(f"\n  ❌ {pass_key}: {exc}", flush=True)
+    print("  ↳ Aborting before .clinerules is written; nothing was overwritten.",
+          flush=True)
+    raise SystemExit(2)
+
+
 def _intermediate_path(pass_key: str) -> str:
     """Where a single pass's result is written between runs."""
     return os.path.join(INTERMEDIATE_DIR, f"distill_{pass_key}.md")
@@ -2470,8 +2515,10 @@ def _write_pass_failure(pass_key: str, model_config, exc: "ExtractionFailed"):
         "",
         ABORT_MARKER,
         "",
-        f"**{exc.stage}** failed: {len(exc.failures)} of {exc.total} call(s) to the model "
-        "returned an error, so the extracted context would have been incomplete.",
+        exc.summary or
+        (f"**{exc.stage}** failed: {len(exc.failures)} of {exc.total} call(s) to the "
+         "model returned an error, so the extracted context would have been "
+         "incomplete."),
         "",
         "This is **not** a finding about your codebase. No architecture was produced.",
         "",
@@ -2486,15 +2533,16 @@ def _write_pass_failure(pass_key: str, model_config, exc: "ExtractionFailed"):
     ]
     for label, err in exc.failures:
         lines.append(f"- **{label}** — `{err}`")
-    lines += [
-        "",
-        "### What to check",
-        "",
-        f"1. Is a server actually listening at `{endpoint}`?",
-        "2. From inside this container, `localhost` is the container — host "
+    checks = exc.checks or [
+        f"Is a server actually listening at `{endpoint}`?",
+        "From inside this container, `localhost` is the container — host "
         "services need `host.docker.internal`.",
-        "3. Check `llama-server.log` / `orchestrator.log` on the host for a "
+        "Check `llama-server.log` / `orchestrator.log` on the host for a "
         "model that died or was auto-unloaded mid-run.",
+    ]
+    lines += ["", "### What to check", ""]
+    lines += [f"{i}. {c}" for i, c in enumerate(checks, 1)]
+    lines += [
         "",
         "Fix the cause, then re-run this pass. Nothing was overwritten.",
     ]
@@ -3187,6 +3235,119 @@ def _salvage_note(answer_tokens: list, reasoning_tokens: list) -> str:
     )
 
 
+# --- The empty answer -----------------------------------------------------------
+#
+# Measured on the engineer pass: 82,435 prompt tokens in, 5,810 tokens out, all
+# of them on the reasoning channel, ZERO on the content channel, ending on a
+# clean stop 2,382 tokens short of the cap. The pass reported "Complete (0
+# chars)" and saved an empty intermediate that passes 3 and 4 then designed
+# against.
+#
+# Three guards were the wrong shape for it. _report_truncation returns early
+# unless finish_reason is "length", and this was a stop. The continuation round -
+# which exists precisely to re-run with thinking off - was gated on "length" too,
+# so a model that thought its whole turn away walked straight past the one
+# mechanism built for it. And _check_llm_result only matches "[ERROR:", so ""
+# is a valid result all the way to disk.
+#
+# The server runs with --reasoning-format deepseek, which routes everything
+# before </think> into delta.reasoning_content. So an answer that was written but
+# never had its think block closed is indistinguishable here from one that was
+# never written - and in both cases the text is sitting in the reasoning channel
+# that _stream_llm_once used to drop on the floor. Hence the trace file: the
+# retry is the fix, but 5,810 tokens of thought is the only evidence of what went
+# wrong, and it costs nothing to keep.
+
+_reasoning_trace_seq = 0
+
+
+def _write_reasoning_trace(label: str, reasoning: str) -> str:
+    """
+    Dump a call's thinking channel next to the intermediates. Returns the path.
+
+    Only called when the answer came back empty, where the trace is the only
+    record of the call. Empty string if there was nothing to write or the write
+    failed - a diagnostic must never be the thing that kills the run.
+    """
+    if not reasoning.strip():
+        return ""
+    global _reasoning_trace_seq
+    _reasoning_trace_seq += 1
+    slug = re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_") or "call"
+    path = os.path.join(INTERMEDIATE_DIR, f"reasoning_{slug}_{_reasoning_trace_seq}.md")
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(
+                f"# Reasoning trace: {label}\n\n"
+                "The model produced this on the thinking channel and then returned an "
+                "EMPTY answer. Kept because a document written without a closing "
+                "`</think>` lands here in full, and because it is the only evidence "
+                "of what the call was doing.\n\n"
+                "This is a trace, not a result. Nothing downstream reads it.\n\n"
+                "---\n\n"
+                f"{reasoning}\n"
+            )
+        return path
+    except Exception as e:
+        print(f"      ⚠ Could not write reasoning trace: {e}", flush=True)
+        return ""
+
+
+def _rescue_empty_answer(client: httpx.Client, model_config, system_prompt: str,
+                         user_content: str, label: str, max_output_tokens: int,
+                         assistant_prefix: str, thoughts: str, finish) -> tuple:
+    """
+    Re-run a call that returned no answer, with thinking off. Returns (text, finish).
+
+    The retry is the whole remedy: with enable_thinking=false the model has no
+    reasoning channel to disappear into, so the same prompt that produced 5,810
+    tokens of silence produces the document instead. It is deliberately not part
+    of the continuation budget - this is a failed call being re-run, not a long
+    answer being extended.
+
+    Nothing is retried if the call was already running without thinking; there is
+    no lever left to pull and a second identical call would just cost another
+    prompt evaluation.
+    """
+    level, _ = _reasoning_spec(model_config if isinstance(model_config, dict) else {})
+    thinking_was_off = level == "off" or bool(assistant_prefix)
+    stopped = f"finish_reason={finish!r}"
+    print(f"\n      ⚠ EMPTY ANSWER [{label}]: ~{est_tokens(thoughts)} tokens of "
+          f"reasoning, 0 of answer, at reasoning '{level}' ({stopped}). The model "
+          f"spent the turn on the thinking channel and never wrote to the content "
+          f"channel.", flush=True)
+
+    trace = _write_reasoning_trace(label, thoughts)
+    if trace:
+        print(f"        ↳ Thinking saved to {trace} — if the document was written "
+              f"without closing `</think>`, it is in there.", flush=True)
+
+    if thinking_was_off:
+        print(f"        ↳ Thinking was already off for this call; nothing left to "
+              f"retry with. Returning empty and letting the pass fail.", flush=True)
+        return "", finish
+
+    print(f"        ↳ Re-running once with thinking OFF.", flush=True)
+    text, retry_finish, retry_thoughts = _stream_llm_once(
+        client, model_config, system_prompt, user_content,
+        f"{label} (no-think)", max_output_tokens,
+        assistant_prefix=assistant_prefix, force_no_thinking=True,
+    )
+    if _looks_like_llm_error(text):
+        print(f"      ✗ Thinking-off retry errored ({text[:60]}).", flush=True)
+        return text, retry_finish
+    if not text.strip():
+        retry_trace = _write_reasoning_trace(f"{label} no-think", retry_thoughts)
+        if retry_trace:
+            print(f"        ↳ Retry trace: {retry_trace}", flush=True)
+        print(f"      ✗ Still empty with thinking off. This is not a reasoning-level "
+              f"problem — the prompt itself is not producing an answer.", flush=True)
+        return "", retry_finish
+    print(f"      ✓ Thinking-off retry produced {len(text)} characters.", flush=True)
+    return text, retry_finish
+
+
 # --- Continuation --------------------------------------------------------------
 #
 # `reasoning_effort` is a hint, not a bound. Measured on the engineer pass at
@@ -3264,13 +3425,24 @@ def _single_llm_call(client: httpx.Client, model_config, system_prompt: str, use
     """
     answer, finish = "", None
     for round_no in range(LLM_MAX_CONTINUATIONS + 1):
-        text, finish = _stream_llm_once(
+        text, finish, thoughts = _stream_llm_once(
             client, model_config, system_prompt, user_content,
             label if not answer else f"{label} (cont.{round_no})",
             max_output_tokens,
             assistant_prefix=answer,
             force_no_thinking=bool(answer),
         )
+        if not text.strip() and not _looks_like_llm_error(text):
+            # Not gated on finish_reason. A cap-length round with an empty answer
+            # is the same failure as a clean stop with an empty answer, and the
+            # continuation below would have re-run it WITH thinking on (its
+            # force_no_thinking is bool(answer), which is False while the answer
+            # is empty) - thinking away a second budget to return a second blank.
+            text, finish = _rescue_empty_answer(
+                client, model_config, system_prompt, user_content,
+                label if not answer else f"{label} (cont.{round_no})",
+                max_output_tokens, answer, thoughts, finish,
+            )
         if _looks_like_llm_error(text):
             # A failed continuation must not discard a good partial: what we
             # already have is strictly better than an error string.
@@ -3279,6 +3451,14 @@ def _single_llm_call(client: httpx.Client, model_config, system_prompt: str, use
                       f"the {len(answer)}-character partial answer.", flush=True)
                 return answer
             return text
+
+        if not text.strip():
+            # _rescue_empty_answer has already re-run this round with thinking
+            # off and still got nothing. Falling through would loop and re-run it
+            # a third time with thinking back ON. An empty first round returns
+            # "" for the pass-level check to abort on; an empty continuation
+            # returns the partial, which is everything there is.
+            return answer
 
         answer = _join_continuation(answer, text)
         if finish != "length":
@@ -3302,10 +3482,15 @@ def _stream_llm_once(client: httpx.Client, model_config, system_prompt: str, use
     Execute a single LLM API call with streaming for live feedback.
     Supports both Ollama native and OpenAI-compatible streaming formats.
 
-    Returns (text, finish_reason). A finish_reason of "length" means the server
-    stopped at the cap rather than because the model was done, which is what
-    _single_llm_call continues from. Error paths return (message, None) — an
-    error is not something to continue.
+    Returns (text, finish_reason, reasoning). A finish_reason of "length" means
+    the server stopped at the cap rather than because the model was done, which
+    is what _single_llm_call continues from. Error paths return (message, None,
+    ...) — an error is not something to continue.
+
+    `reasoning` is the thinking channel, returned rather than dropped because an
+    empty answer beside 5,000 tokens of thought is a specific, recoverable
+    failure and the thought is the only evidence of what the model was doing.
+    See _rescue_empty_answer().
 
     Args:
         model_config: Either a string (model name, Ollama) or a dict with provider info.
@@ -3395,6 +3580,11 @@ def _stream_llm_once(client: httpx.Client, model_config, system_prompt: str, use
     estimated_prompt_tokens = est_tokens(system_prompt) + est_tokens(user_content)
 
     max_retries = 3
+    # Bound outside the loop: the error returns below have to name what the
+    # thinking channel produced, and an exception raised before the per-attempt
+    # reset would otherwise leave these unbound.
+    full_response = []
+    reasoning_response = []
     for attempt in range(max_retries):
         first_token_received = threading.Event()
 
@@ -3444,7 +3634,8 @@ def _stream_llm_once(client: httpx.Client, model_config, system_prompt: str, use
                                 print(f"    Error: {err_body[:200]}")
                             except Exception:
                                 pass
-                            return f"[ERROR: LLM returned status {resp.status_code}]", None
+                            return (f"[ERROR: LLM returned status {resp.status_code}]",
+                                    None, "".join(reasoning_response))
                         
                         dot_count = 0
                         last_progress = time.time()
@@ -3507,7 +3698,8 @@ def _stream_llm_once(client: httpx.Client, model_config, system_prompt: str, use
                                          estimated_prompt_tokens, output_cap)
                     _report_truncation(label, finish_reason, output_cap,
                                        full_response, reasoning_response, cfg)
-                    return "".join(full_response), finish_reason
+                    return ("".join(full_response), finish_reason,
+                            "".join(reasoning_response))
 
                 except httpx.ReadTimeout:
                     first_token_received.set()
@@ -3518,14 +3710,14 @@ def _stream_llm_once(client: httpx.Client, model_config, system_prompt: str, use
                         # the way. Keep what the model actually produced.
                         print(f"\n      ✗ [Stability Protocol] Stream stalled ({STALL_TIMEOUT:.0f}s idle). "
                               f"{_salvage_note(full_response, reasoning_response)} Not retrying - identical prompt.")
-                        return salvaged, None
+                        return salvaged, None, "".join(reasoning_response)
                     if attempt < max_retries - 1:
                         print(f"\n      ⚠ [Stability Protocol] Stalled with no output. Retrying part ({attempt+2}/{max_retries})...")
                         report_server_state(model_config)
                         continue
                     print(f"\n      ✗ [Stability Protocol] Stalled on FINAL ATTEMPT. {_salvage_note(full_response, reasoning_response)}")
                     report_server_state(model_config)
-                    return "[ERROR: ReadTimeout]", None
+                    return "[ERROR: ReadTimeout]", None, "".join(reasoning_response)
 
         except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as e:
             first_token_received.set()
@@ -3538,11 +3730,11 @@ def _stream_llm_once(client: httpx.Client, model_config, system_prompt: str, use
                 time.sleep(wait_time)
                 continue
             print(f"\n  ❌ LLM request failed after {max_retries} attempts: {e}")
-            return f"[ERROR: {e}]", None
+            return f"[ERROR: {e}]", None, "".join(reasoning_response)
         except Exception as e:
             first_token_received.set()
             print(f"\n  ❌ Unexpected error: {e}")
-            return f"[ERROR: {e}]", None
+            return f"[ERROR: {e}]", None, "".join(reasoning_response)
         finally:
             # Belt and braces for the paths that return or continue without
             # setting it, so no attempt can ever outlive itself and print over
@@ -3550,7 +3742,7 @@ def _stream_llm_once(client: httpx.Client, model_config, system_prompt: str, use
             first_token_received.set()
             heartbeat_thread.join(timeout=6)
 
-    return "[ERROR: Max retries exceeded]", None
+    return "[ERROR: Max retries exceeded]", None, "".join(reasoning_response)
 
 
 def update_status(status: str):
@@ -4976,6 +5168,13 @@ def run_distillation():
 
             try:
                 result = call_llm(client, model_config, prompt, target_content, prior_context)
+                if not result.strip():
+                    # "✓ Complete (0 chars)" used to be a valid outcome here: the
+                    # empty string was saved as this pass's intermediate and the
+                    # remaining passes designed against it. _check_llm_result only
+                    # ever matched "[ERROR:", so nothing between the model and the
+                    # disk had an opinion about a document with nothing in it.
+                    raise _empty_pass_failure(pass_key, "pass output")
             except BudgetInfeasible as e:
                 # A misconfigured window is an operator problem, not something to
                 # paper over. Stop here with the arithmetic rather than writing a
@@ -4990,12 +5189,7 @@ def run_distillation():
                 # this pass and shows whatever lands there. Writing the diagnostic
                 # to that same path turns a silent 680s wait into an immediate,
                 # accurate report of why the pass could not run.
-                update_status(f"Aborted: {e}")
-                _write_pass_failure(pass_key, model_config, e)
-                print(f"\n  ❌ {pass_key}: {e}", flush=True)
-                print("  ↳ Aborting before .clinerules is written; nothing was overwritten.",
-                      flush=True)
-                raise SystemExit(2)
+                _abort_pass(pass_key, model_config, e)
 
             result = resolve_pass_blockers(
                 client, pass_key, model_config, prompt,
@@ -5014,6 +5208,12 @@ def run_distillation():
                     result = mark_unverified(
                         result, int(limits.get("bugfix_max_repro_attempts", 3))
                     )
+
+            if not result.strip():
+                # Re-checked after the blocker and reproduction rounds, which each
+                # run their own model calls and hand back a replacement result.
+                _abort_pass(pass_key, model_config,
+                            _empty_pass_failure(pass_key, "post-processing"))
 
             results[pass_key] = result
             previous_model_config = model_config
@@ -5513,6 +5713,9 @@ def run_replan(growth_threshold: int, max_replans: int) -> int:
                 # already a working plan on disk and a build using it.
                 return abandon(f"Re-planned {pass_key} is blocked; discarding the "
                                f"revision and keeping the existing plan.")
+            if not result.strip():
+                return abandon(f"Re-planned {pass_key} came back empty; discarding "
+                               f"the revision and keeping the existing plan.")
 
             results[pass_key] = result
             revised.append(pass_key)
