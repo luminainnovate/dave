@@ -2966,6 +2966,45 @@ def test_parse_survey_claims_ignores_commentary():
     assert [(c.path, c.symbol) for c in claims] == [("src/a.ts", "doThing"), ("src/b.tsx", None)]
 
 
+def test_the_survey_runs_after_the_model_is_loaded():
+    """
+    Ordering, pinned in the source because that is where the defect lived.
+
+    The first version ran the survey before the pass loop and it failed three
+    times with ECONNREFUSED: for a llama.cpp model the server process does not
+    exist until the orchestrator is asked to spawn it, and that request is the
+    preload inside the loop. There was nothing listening on the base URL, and
+    retrying could not start it. The survey's own try/except made this soft, so
+    the run continued and blocked exactly as it would have without the feature -
+    which is why nothing but the log said anything was wrong.
+    """
+    import inspect
+    source = inspect.getsource(distill.run_distillation)
+    preload = source.index("preload_model(client, model_config)")
+    survey = source.index("survey_codebase(")
+    assert preload < survey, \
+        "the survey calls a model before anything has been asked to load one"
+
+    loop = source.index("for pass_key, pass_label in passes:")
+    assert loop < survey, "the survey must run inside the pass loop, after preload"
+
+
+def test_the_survey_placeholder_never_survives_into_a_payload():
+    """
+    Cleared on every pass that reaches the clearing point, survey or not. A run
+    whose design pass is skipped by the review gate, or resumed from disk, must
+    not ship a NUL sentinel to a model.
+    """
+    import inspect
+    source = inspect.getsource(distill.run_distillation)
+    guard = source.index("if SURVEY_PLACEHOLDER in conversation_text:")
+    clear = source.index("conversation_text.replace(\n                    SURVEY_PLACEHOLDER, survey_block)")
+    between = source[guard:clear]
+    assert "if pass_key == DISTILL_DESIGN_PASS" in between, \
+        "only the design pass surveys, but every pass must clear the placeholder"
+    assert distill.SURVEY_PLACEHOLDER not in distill.EVIDENCE_PREAMBLE
+
+
 def test_evidence_framing_defaults_are_unchanged():
     """The blocker path keeps its own wording; only the survey overrides it."""
     here = os.path.dirname(os.path.abspath(__file__))

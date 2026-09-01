@@ -4706,41 +4706,6 @@ def run_distillation():
         else:
             print("  ↳ Every pass is resuming from disk; no model needed.", flush=True)
 
-        # R17 says survey before you design, and until this ran nothing could:
-        # the design pass could see source only by blocking for it, which costs a
-        # whole pass and only fires after the design has already failed. One
-        # small call maps the request onto files, the mapping is checked against
-        # the workspace, and the verified source goes into the payload ahead of
-        # the pass that needs it.
-        #
-        # Placed here rather than in the assembly because it needs a client and a
-        # model, and both are created by this block. An empty survey is not a
-        # failure - the indexes still stand, and the blocker protocol is still
-        # behind it - so the placeholder is always cleared either way.
-        if SURVEY_PLACEHOLDER in conversation_text:
-            survey_block = ""
-            if symbol_skeleton and latest_instruction:
-                survey_budget = solve_addendum_budget(
-                    CONTEXT_WINDOW,
-                    est_tokens(prompts.get(DISTILL_DESIGN_PASS, "")),
-                    est_tokens(conversation_text.replace(SURVEY_PLACEHOLDER, "")),
-                )
-                try:
-                    survey_block = survey_codebase(
-                        client,
-                        _resolve_model_config(
-                            models.get(DISTILL_DESIGN_PASS, models.get("architect")),
-                            pass_key=DISTILL_DESIGN_PASS,
-                        ),
-                        latest_instruction, symbol_skeleton, survey_budget,
-                    )
-                except Exception as e:
-                    # The survey is an optimisation on the blocker protocol, not
-                    # a prerequisite for it. Losing it costs a round trip later,
-                    # never the run.
-                    print(f"  ⚠ Survey errored ({e}); continuing without it.", flush=True)
-            conversation_text = conversation_text.replace(SURVEY_PLACEHOLDER, survey_block)
-
         for pass_key, pass_label in passes:
             print(f"\n{pass_label}", flush=True)
             print("-" * 40, flush=True)
@@ -4793,6 +4758,44 @@ def run_distillation():
                 # branch above, and the reason test_engineer could burn 3x45s
                 # without ever receiving a token.
                 preload_model(client, model_config)
+
+            # R17 says survey before you design, and until this ran nothing
+            # could: the design pass could see source only by blocking for it,
+            # which costs a whole pass and only fires after the design has
+            # already failed. One small call maps the request onto files, the
+            # mapping is checked against the workspace, and the verified source
+            # goes into the payload ahead of the pass that needs it.
+            #
+            # After the preload, not before it. The first attempt ran this ahead
+            # of the loop and it failed three times with ECONNREFUSED: for a
+            # llama.cpp model the server process does not exist until the
+            # orchestrator is asked to spawn it, which is what the preload above
+            # does. There was nothing listening on the base URL to survey with,
+            # and no amount of retrying was going to start it.
+            #
+            # The placeholder is cleared on every pass that reaches this point,
+            # survey or no survey, so a run whose design pass is skipped or
+            # resumed can never leak the sentinel into a payload.
+            if SURVEY_PLACEHOLDER in conversation_text:
+                survey_block = ""
+                if pass_key == DISTILL_DESIGN_PASS and symbol_skeleton and latest_instruction:
+                    try:
+                        survey_block = survey_codebase(
+                            client, model_config, latest_instruction, symbol_skeleton,
+                            solve_addendum_budget(
+                                CONTEXT_WINDOW, est_tokens(prompt),
+                                est_tokens(conversation_text.replace(
+                                    SURVEY_PLACEHOLDER, "")),
+                            ),
+                        )
+                    except Exception as e:
+                        # The survey is an optimisation on the blocker protocol,
+                        # not a prerequisite for it. Losing it costs a round trip
+                        # later, never the run.
+                        print(f"  ⚠ Survey errored ({e}); continuing without it.",
+                              flush=True)
+                conversation_text = conversation_text.replace(
+                    SURVEY_PLACEHOLDER, survey_block)
 
             prior_context = ""
             if results:
