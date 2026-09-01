@@ -3086,6 +3086,72 @@ def test_both_walks_agree_on_which_directories_count():
         assert distill.list_config_files(tmp) == ["src/config.yaml"]
 
 
+def test_a_blocker_that_names_lines_is_read_that_way():
+    """
+    The measured run said `Backend/src/routes/users.ts` lines ~1040-1100, and
+    nothing parsed it. The file is 46738 chars against a 24000 cap and the region
+    starts at byte 42012, so the slice went to the wrong 24k of the right file.
+    """
+    hints = distill.blocker_line_hints([
+        "`Backend/src/routes/users.ts` lines ~1040–1100 — need the handler body."
+    ])
+    assert hints == {"Backend/src/routes/users.ts": (1040, 1100)}
+
+    for text, expected in (
+        ("`a/b.ts` lines 10-20 blah", (10, 20)),
+        ("`a/b.ts` lines 10 to 20 blah", (10, 20)),
+        ("`a/b.ts` line ~42 blah", (42, 42)),
+        ("`a/b.ts` lines L100-L120 blah", (100, 120)),
+        ("`a/b.ts` lines 200-100 blah", (100, 200)),
+    ):
+        assert distill.blocker_line_hints([text]) == {"a/b.ts": expected}, text
+
+    assert distill.blocker_line_hints(["`a/b.ts` — need its shape"]) == {}
+
+
+def test_a_stated_line_range_outranks_a_symbol_guess():
+    """What the pass asked for beats what a name search happened to find."""
+    head = "import { thing } from '@/x';\n" + "// filler\n" * 400
+    target = "\n// THE REGION THE BLOCKER ASKED FOR\nfunction handler() { thing(); }\n"
+    content = head + "// more\n" * 400 + target + "// tail\n" * 400
+
+    line_of_target = content[:content.index(target)].count("\n") + 2
+    keep = 2000
+    aimed = distill._slice_around_symbols(content, keep, ["thing"],
+                                          (line_of_target, line_of_target + 3))
+    assert "THE REGION THE BLOCKER ASKED FOR" in aimed
+    assert len(aimed) <= keep
+
+
+def test_an_import_does_not_aim_the_slice():
+    """
+    A symbol a file uses without defining has its first mention in the import
+    block and its real uses far below. Centring there hands back a plausible
+    slice of the right file, which looks exactly like an answered request.
+    """
+    content = ("import { externalJobs } from '@/db/schema';\n"
+               + "// filler\n" * 500
+               + "const rows = await db.select().from(externalJobs);\n"
+               + "// tail\n" * 100)
+    hit = distill._find_definition(content, ["externalJobs"])
+    assert hit is not None
+    assert hit > content.index("// filler"), \
+        "the slice was aimed at the import that brought the name in"
+    assert content[hit:hit + 40].startswith("externalJobs")
+
+    # With nowhere else to point, the import is still better than nothing.
+    only_import = "import { externalJobs } from '@/db/schema';\nconst x = 1;\n"
+    assert distill._find_definition(only_import, ["externalJobs"]) is not None
+
+
+def test_line_offset_is_clamped_to_the_file():
+    content = "a\nb\nc\n"
+    assert distill._line_offset(content, 1) == 0
+    assert distill._line_offset(content, 2) == 2
+    assert distill._line_offset(content, 99) == len(content)
+    assert distill._line_offset(content, 0) == 0
+
+
 def test_evidence_framing_defaults_are_unchanged():
     """The blocker path keeps its own wording; only the survey overrides it."""
     here = os.path.dirname(os.path.abspath(__file__))
