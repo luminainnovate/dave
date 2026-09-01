@@ -858,13 +858,22 @@ EVIDENCE_MIN_BUDGET_CHARS = EVIDENCE_MAX_FILE_CHARS
 
 # How many times a pass may block, be shown files, and try again.
 #
-# One is right for design: the architect blocks on a specification gap, and a gap
-# that survives being shown the files is a gap the workspace does not contain.
-# Diagnosis is the opposite shape - reading files IS the work, and each round
-# narrows the search rather than re-asking the same question - so the bugfix pass
-# is allowed to follow the trail. The cost is a full pass per round, so it is
-# bounded rather than open.
-EVIDENCE_ROUNDS = {"bugfix": 3}
+# Diagnosis is the shape that follows a trail - reading files IS the work, and
+# each round narrows the search rather than re-asking the same question - so the
+# bugfix pass gets three. The cost is a full pass per round, so it is bounded
+# rather than open.
+#
+# The architect had one, on the reasoning that "a gap that survives being shown
+# the files is a gap the workspace does not contain". A measured run refuted
+# that. It blocked for three files, was shown six, and came back asking for
+# `config.yaml` and the job-radar install script instead - a narrower question
+# than the one it started with, which is a trail and not a wall. It had no round
+# left to follow it, and stopped at the review gate one step short.
+#
+# That rationale was written when the retry had no budget to spend anyway: the
+# same run measured 170484 chars available and used 52737. Being shown the files
+# now changes the question often enough to be worth a second pass.
+EVIDENCE_ROUNDS = {"bugfix": 3, "architect": 2}
 EVIDENCE_ROUNDS_DEFAULT = 1
 
 
@@ -3932,6 +3941,57 @@ SKELETON_SKIP_DIRS = {"node_modules", ".git", "venv", ".venv", "__pycache__",
 SKELETON_EXTS = (".py", ".ts", ".js", ".tsx", ".jsx", ".go", ".rs", ".java",
                  ".c", ".cpp", ".h")
 
+# Configuration and data files are listed by path and never parsed. A design
+# pass cannot reason about a file it does not know exists - the run that asked
+# for `config.yaml` could only name it because the directory tree happened to
+# show it, and the survey, which sees the symbol index and not the tree, could
+# not have named it at all. Listing costs 614 characters on a real workspace;
+# indexing their contents would cost the window and teach nothing, because a
+# config file has no exported surface to index.
+CONFIG_EXTS = (".yaml", ".yml", ".json", ".toml", ".ini", ".cfg", ".conf",
+               ".xml", ".properties")
+
+# Never listed, because a path a pass can see is a path it can request.
+#
+# Lockfiles are excluded for budget: package-lock.json is 200KB+ here, and a
+# request for one spends EVIDENCE_MAX_FILE_CHARS to learn nothing a design uses.
+# Anything .env is excluded for a different reason entirely - it holds secrets,
+# and the evidence read puts whatever it is given into a payload that leaves the
+# machine. Neither belongs in front of a model.
+CONFIG_EXCLUDE_NAMES = {"package-lock.json", "bun.lock", "yarn.lock",
+                        "pnpm-lock.yaml", "composer.lock", "poetry.lock",
+                        "cargo.lock", "Cargo.lock"}
+
+
+def _skip_dir(name: str) -> bool:
+    """
+    One definition of which directories are not part of the project.
+
+    Shared by the symbol walk and the config listing. Two walks with two filters
+    is two chances for them to disagree about what the project contains, and the
+    hidden-directory rule is exactly the sort that gets applied to one and not
+    the other - see scan_project_files for what that cost the last time.
+    """
+    return name in SKELETON_SKIP_DIRS or name.startswith(".")
+
+
+def is_listable_config(name: str) -> bool:
+    """True for a config file worth naming to a design pass."""
+    if name.startswith(".env") or name in CONFIG_EXCLUDE_NAMES:
+        return False
+    return name.endswith(CONFIG_EXTS)
+
+
+def list_config_files(project_dir: str) -> list:
+    """Project-relative paths of configuration and data files. Names only."""
+    found = []
+    for root, dirs, files in os.walk(project_dir):
+        dirs[:] = [d for d in dirs if not _skip_dir(d)]
+        for name in sorted(files):
+            if is_listable_config(name):
+                found.append(os.path.relpath(os.path.join(root, name), project_dir))
+    return sorted(found)
+
 # Languages with no export keyword, where the public surface has to be read from
 # indentation instead: a declaration at module level, not underscore-prefixed by
 # convention. Without this a Python project has no exported symbols at all, so
@@ -4248,8 +4308,7 @@ def scan_project_files(project_dir: str) -> list:
         # name that resolves twice to be path-qualified before it can be cited,
         # and every symbol in the project resolved three times. The design pass
         # was being asked to disambiguate its own workspace against itself.
-        dirs[:] = [d for d in dirs
-                   if d not in SKELETON_SKIP_DIRS and not d.startswith(".")]
+        dirs[:] = [d for d in dirs if not _skip_dir(d)]
         for file in sorted(files):
             if not file.endswith(SKELETON_EXTS):
                 continue
@@ -4293,7 +4352,7 @@ _IMPORT_SPEC_RE = re.compile(r"""['"]([^'"\n]+)['"]""")
 _MODULE_EXT_RE = re.compile(r"\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java)$")
 
 
-def build_symbol_index(files_data: list) -> str:
+def build_symbol_index(files_data: list, config_files: list = None) -> str:
     """
     Every file, every exported name, no signatures. The R18 authority.
 
@@ -4310,7 +4369,16 @@ def build_symbol_index(files_data: list) -> str:
               "Names only - for a symbol's shape, read it in SURVEYED_SOURCE or "
               "ask for the file.")
     body = "\n".join([header] + blocks + ([footer] if footer else []))
-    print(f"  🗂️  Symbol index: {len(files_data)} files, {len(body)} chars", flush=True)
+    if config_files:
+        # Listed, never parsed. Their contents are available on request like any
+        # other file; what was missing was any way to know they were there.
+        body += ("\n\nConfiguration and data files (contents NOT indexed - a "
+                 "config file has no exported surface. Name one by path if its "
+                 "format or values matter to the design):\n"
+                 + ", ".join(config_files) + "\n")
+    print(f"  🗂️  Symbol index: {len(files_data)} files, "
+          f"{len(config_files or [])} config file(s) listed, {len(body)} chars",
+          flush=True)
     return body
 
 
@@ -4487,7 +4555,8 @@ def run_distillation():
         # protocol map a request or a blocker onto files through, and names are
         # all either needs to do that.
         project_files = scan_project_files("/workspace")
-        symbol_index = build_symbol_index(project_files)
+        symbol_index = build_symbol_index(project_files,
+                                          list_config_files("/workspace"))
         call_graph = build_call_graph(project_files)
         symbol_skeleton = symbol_index
         tree_output = prune_tree_against_skeleton(
