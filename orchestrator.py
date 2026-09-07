@@ -15,6 +15,7 @@ from typing import Optional
 
 import mover
 import repo_tools
+import ship
 import tracer
 
 
@@ -1604,7 +1605,119 @@ async def shutdown_expert():
 async def proxy_ollama(request: Request):
     """
     Main entry point for AI chat requests.
-    Handles orchestration, triage, interception, and VRAM management.
+
+    A thin wrapper around the orchestrator proper, so the build-finished offer
+    can ride on whatever this turn was already going to say. The alternative -
+    announcing the finished build on its own - would mean swallowing the user's
+    message to say it.
+    """
+    response = await _orchestrate(request)
+    return await _attach_build_offer(request, response)
+
+
+async def _attach_build_offer(request: Request, response):
+    """
+    Prepend the one-time "a build finished on this branch" offer, if one is due.
+
+    Deliberately not a model instruction: a 3B router asked to mention a branch
+    mentions it about as often as it invents one. The text is the orchestrator's
+    and reaches the user verbatim, exactly like a command response.
+    """
+    try:
+        if response.headers.get(SILENT_HEADER):
+            return response
+
+        body = await request.json()
+        messages = body.get("messages", [])
+        if not _is_plain_user_turn(messages):
+            return response
+        # `!ship` prints the branch itself; the offer above it is noise.
+        if str(messages[-1].get("content", "")).strip().lower().startswith("!ship"):
+            return response
+
+        project_dir = _get_bound_project_dir(messages)
+        if not project_dir:
+            return response
+        offer = ship.pending_offer(project_dir)
+        if not offer:
+            return response
+
+        is_native = "/api/chat" in str(request.url.path)
+        return _prefix_response(response, f"{offer}\n\n---\n\n", is_native)
+    except Exception as e:
+        # An offer is a courtesy. It never costs the user their reply.
+        logger.warning(f"Could not attach the build offer: {e}")
+        return response
+
+
+def _is_plain_user_turn(messages: list) -> bool:
+    """True for a person typing, false for Open WebUI's pings and agent traffic."""
+    if not messages or messages[-1].get("role") != "user":
+        return False
+    content = str(messages[-1].get("content", "")).lower()
+    if "### task:" in content:
+        return False
+    if any(kw in content for kw in ("generate a title", "generate a short title",
+                                    "suggest 3-5", "short label", "tags")):
+        return False
+    for m in messages:
+        if m.get("role") == "system":
+            sys_content = str(m.get("content", "")).lower()
+            if "you are cline" in sys_content or "distillation" in sys_content:
+                return False
+    return True
+
+
+def _prefix_response(response, text: str, is_native: bool):
+    """
+    Put `text` in front of a reply that has already been built.
+
+    Handles the three shapes this endpoint returns: an SSE stream, an Ollama
+    line-JSON stream, and a one-shot JSON body in either dialect. Anything else
+    (an error, an unrecognised body) passes through untouched - a failed prefix
+    must never eat the reply.
+    """
+    if isinstance(response, StreamingResponse):
+        original = response.body_iterator
+
+        async def _generator():
+            if is_native:
+                yield f"{json.dumps({'model': 'Bob', 'message': {'role': 'assistant', 'content': text}, 'done': False})}\n".encode("utf-8")
+            else:
+                chunk = {
+                    "id": "chatcmpl-Bob", "object": "chat.completion.chunk",
+                    "created": int(time.time()), "model": "Bob",
+                    "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
+                }
+                yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
+            async for chunk in original:
+                yield chunk
+
+        return StreamingResponse(_generator(), media_type=response.media_type,
+                                 status_code=response.status_code)
+
+    if isinstance(response, JSONResponse) and response.status_code == 200:
+        try:
+            data = json.loads(response.body)
+        except Exception:
+            return response
+        if isinstance(data.get("message"), dict):
+            target = data["message"]
+        elif data.get("choices"):
+            target = data["choices"][0].get("message")
+        else:
+            return response
+        if not isinstance(target, dict):
+            return response
+        target["content"] = text + str(target.get("content", ""))
+        return JSONResponse(content=data)
+
+    return response
+
+
+async def _orchestrate(request: Request):
+    """
+    Orchestration, triage, interception, and VRAM management for one chat turn.
     """
     global vram_locked, expert_warm_until, expert_mode, last_comfy_history_count
 
@@ -1699,7 +1812,8 @@ async def proxy_ollama(request: Request):
         maintenance_commands = ["!status", "!stop", "!move", "!build", "!architect",
                                 "!bugfix", "!approve", "!review", "!restore",
                                 "!lock", "!unlock",
-                                "!write", "!readonly", "!undo", "!diff", "!pr"]
+                                "!write", "!readonly", "!undo", "!diff", "!pr",
+                                "!ship"]
         is_maintenance_followup = False
         if is_background_task and len(messages) >= 3:
             prev_user_msg = messages[-3].get("content", "").lower() if messages[-3].get("role") == "user" else ""
@@ -1876,6 +1990,21 @@ async def proxy_ollama(request: Request):
                 mover.get_conversation_id(messages), title
             )
             return _command_response(pr_msg, is_streaming, is_native)
+        elif prompt_lower.startswith("!ship"):
+            project_dir = _get_bound_project_dir(messages)
+            if not project_dir:
+                return _command_response("⚠️ **No project bound.**", is_streaming, is_native)
+            # Two steps on purpose. A squash-merge rewrites the default branch
+            # and cannot be undone from chat, so the bare command only ever
+            # describes what it would do.
+            rest = messages[-1].get("content", "").strip()[len("!ship"):].strip()
+            if rest.lower().lstrip("-") in ("confirm", "yes", "y"):
+                logger.info("Command: Ship confirmed; committing and squash-merging.")
+                ship_msg = await asyncio.to_thread(ship.confirm, project_dir)
+            else:
+                logger.info("Command: Ship proposal requested.")
+                ship_msg = await asyncio.to_thread(ship.propose, project_dir, rest)
+            return _command_response(ship_msg, is_streaming, is_native)
         elif "!stop" in prompt_lower:
             logger.info("Command: Stop pipeline triggered.")
             stop_msg = _stop_build_pipeline()
@@ -2227,14 +2356,23 @@ async def proxy_ollama(request: Request):
             gpu_lock.release()
 
 
+# Marks a reply that is not one: a silenced background ping, or the
+# "Analyzing..." placeholder a blocking client gets while the Expert is warm.
+# _attach_build_offer refuses to spend its one-time offer on either.
+SILENT_HEADER = "X-Bob-Silent"
+
+
 def _silent_response(is_native: bool, text: str = ""):
     """Returns an empty assistant response to silently terminate an interaction."""
+    headers = {SILENT_HEADER: "1"}
     if is_native:
-        return JSONResponse(content={"model": "Bob", "message": {"role": "assistant", "content": text}, "done": True})
+        return JSONResponse(
+            content={"model": "Bob", "message": {"role": "assistant", "content": text}, "done": True},
+            headers=headers)
     return JSONResponse(content={
         "id": "chatcmpl-Bob", "object": "chat.completion", "created": int(time.time()), "model": "Bob",
         "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}]
-    })
+    }, headers=headers)
 
 
 def _command_response(text: str, is_streaming: bool = False, is_native: bool = False):
@@ -2999,11 +3137,24 @@ async def _trigger_build_pipeline(messages: list, extra_env: Optional[dict] = No
             cmd += ["-e", f"{key}={value}"]
         cmd.append("cline-builder")
 
+        # Read the base branch before the container moves off it. Once the build
+        # has checked out `agent/build-<ts>`, "the branch we came from" is no
+        # longer answerable - the default-branch fallback returns the agent
+        # branch itself, which would propose merging it into itself.
+        build_base = ""
+        try:
+            build_base = ship.base_branch(abs_target_dir)
+            # A previous build's offer is stale the moment this one starts.
+            ship.clear_marker(abs_target_dir)
+        except Exception as e:
+            logger.warning(f"Could not prepare the build marker: {e}")
+
         logger.info(f"Launching pipeline command: {' '.join(cmd)}")
         subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         # Launch the Safety Monitor to ensure VRAM is released when container stops/deleted
-        asyncio.create_task(_docker_safety_monitor(container_name))
+        asyncio.create_task(_docker_safety_monitor(
+            container_name, workspace=abs_target_dir, base_branch=build_base))
 
         if extra_env and extra_env.get("PIPELINE_MODE") == "distill_only":
             # The caller polls for the architect output and reports to chat itself.
@@ -3084,10 +3235,26 @@ async def is_pipeline_active() -> bool:
         return False
 
 
-async def _docker_safety_monitor(container_name: str):
+def _record_finished_build(container_name: str, workspace: str, base_branch: str) -> None:
+    """Write the marker `!ship` reads, without letting git trouble kill the monitor."""
+    if not workspace:
+        return
+    try:
+        ship.record_build_complete(workspace, container=container_name, base=base_branch)
+    except Exception as e:
+        logger.warning(f"[Safety Monitor] Could not record the finished build: {e}")
+
+
+async def _docker_safety_monitor(container_name: str, workspace: str = "",
+                                 base_branch: str = ""):
     """
     Background task that monitors a specific Docker container.
     When the container stops, it automatically triggers a VRAM cleanup.
+
+    It is also the only place that learns a build has finished. The container is
+    launched detached and the chat turn returns immediately, so nothing else in
+    the process ever sees the exit - which is why the branch it leaves behind
+    used to be invisible until the user went looking for it with git.
     """
     logger.info(f"[Safety Monitor] Starting monitor for {container_name}")
     try:
@@ -3106,12 +3273,14 @@ async def _docker_safety_monitor(container_name: str):
             if proc.returncode != 0:
                 # Container likely deleted or vanished
                 logger.info(f"[Safety Monitor] Container {container_name} vanished. Releasing VRAM.")
+                _record_finished_build(container_name, workspace, base_branch)
                 await shutdown_expert()
                 break
             
             status = stdout.decode().strip().lower()
             if status == "false":
                 logger.info(f"[Safety Monitor] Container {container_name} stopped. Releasing VRAM.")
+                _record_finished_build(container_name, workspace, base_branch)
                 await shutdown_expert()
                 break
                 

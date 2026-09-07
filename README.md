@@ -344,7 +344,8 @@ Do this instead:
 | 5. Re-run if wrong | `!architect` again, with steering text | *"!architect — the queue must be durable, not in-memory."* Regenerating a document is minutes; regenerating a repo is hours. |
 | 6. Commit | `!approve` | Engineer → test → safety → implementation. |
 | 7. Watch | `!logs`, `!status` | `!stop` force-stops everything and clears VRAM. |
-| 8. Iterate narrowly | `!build` with a focused request | The next round reads what round 1 actually produced. Ask for one thing. |
+| 8. Ship it | `!ship`, then `!ship confirm` | The build leaves its work uncommitted on `agent/build-<ts>`. `!ship` shows what would be committed, pushed and squash-merged; only `!ship confirm` does it. |
+| 9. Iterate narrowly | `!build` with a focused request | The next round reads what round 1 actually produced. Ask for one thing. |
 
 Corollaries worth stating plainly:
 
@@ -447,6 +448,8 @@ deferral the explicit safe answer whenever the trace does not actually reach bot
 | `!approve` | Accepts the reviewed document, resumes the remaining passes plus implementation. | Requires a prior `!architect` or `!bugfix`. Refuses an unverified diagnosis. |
 | `!build` | Full 4-pass pipeline plus implementation. | Extra text in the same message steers it. |
 | `!status` / `!logs` | Container status / last 200 lines of the active build. | `!logs` is also an Expert tool. |
+| `!ship [title]` | Describes the commit, PR and squash-merge that would ship the finished build's branch. | Changes nothing. Refuses off an `agent/build-*` branch, on a clean tree, or without `origin` and `gh`. |
+| `!ship confirm` | Commits the build's files, pushes, opens the PR and **squash-merges** it into the base branch. | **Must open the message.** Irreversible from chat. `.cline_context/` is never staged. |
 | `!stop` | Force-stops all pipelines and clears VRAM. | |
 
 ### Repository editing & pull requests
@@ -459,6 +462,10 @@ deferral the explicit safe answer whenever the trace does not actually reach bot
 | `!undo` | Restores every touched file to its exact pre-session bytes. | Byte snapshots, so untracked files restore correctly. |
 | `!pr <title>` | Commits to `brain/<conv_id>`, pushes, opens a PR against `origin`. | **Must open the message.** Only files this conversation touched are staged. |
 
+`!pr` ships what the *Expert* edited in chat; `!ship` ships what a *build container* left on
+`agent/build-<ts>`. They are different branches and different sets of files — `!pr` reads the
+in-memory list of files this conversation touched, which a container build never populates.
+
 **How write mode stays safe.** The Expert must read a file before editing or deleting it — it
 cannot act on something it has only seen in the symbol skeleton. Edits are anchor-based and
 must match exactly once, so a wrong anchor fails loudly. Paths are realpath-resolved and
@@ -468,11 +475,11 @@ raising a PR is outward-facing, so it happens only when you run `!pr`.
 
 **Matching rules.** Substring match, first wins, in a fixed `if/elif` order:
 `!lock` → `!unlock` → `!code` → `!general` → `!move` → `!architect` → `!bugfix` → `!approve` →
-`!review` → `!build` → `!clone` → `!write`/`!readonly` → `!undo` → `!diff` → `!pr` → `!stop` →
+`!review` → `!build` → `!clone` → `!write`/`!readonly` → `!undo` → `!diff` → `!pr` → `!ship` → `!stop` →
 `!status` →
 `!logs`. So *"Should I run !build or !status?"* triggers `!build`, and *"!code let's !build
-this"* runs `!code` only. `!clone` and `!pr` are prefix-matched. Background title/tag/summary
-pings from Open WebUI never trigger commands.
+this"* runs `!code` only. `!clone`, `!pr` and `!ship` are prefix-matched. Background
+title/tag/summary pings from Open WebUI never trigger commands.
 
 ---
 
@@ -901,6 +908,7 @@ ComfyUI's `/history`. A background task sweeps idle ComfyUI RAM/VRAM every 5 min
 | `.clinerules` | The assembled plan the build agent executes |
 | `.cline_context/distill_*.md` | Per-pass design documents — **this is what `!architect` / `!bugfix` write and `!approve` reuses** |
 | `.cline_context/.design_pass` | Which design pass the last gate ran (`architect` or `bugfix`), so `!approve` and `!review` target the right document |
+| `.cline_context/.ship_pending` | Written when a build container exits with work on its branch — the branch, its base, and whether the offer has been shown. Survives an orchestrator restart, which is why `!ship` is still available hours later. Distinct from the root `.build_complete`, which is the agent's verdict on its own work |
 | `.cline_context/.session_state.md` | Regenerated each phase; the agent's first read every step |
 | `.cline_context/.build_issues.md` | Accumulated failures; drives re-planning and the next iteration |
 | `.cline_context/quality_audit.md` | Correctness / security / performance / quality findings from the review phase, reconciled during verify |
