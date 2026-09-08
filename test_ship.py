@@ -41,7 +41,7 @@ def git(root, *args):
 class Workspace:
     """A conversation workspace: a git repo with a `.cline_context`."""
 
-    def __init__(self, with_remote=True):
+    def __init__(self, with_remote=True, gitignore=None):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = self.tmp.name
         self.ctx = os.path.join(self.root, ".cline_context")
@@ -52,6 +52,9 @@ class Workspace:
         git(self.root, "config", "user.name", "Test")
         self.write("README.md", "start\n")
         git(self.root, "add", "README.md")
+        if gitignore:
+            self.write(".gitignore", gitignore)
+            git(self.root, "add", ".gitignore")
         git(self.root, "commit", "-q", "-m", "initial")
 
         if with_remote:
@@ -243,6 +246,56 @@ def test_confirm_commits_pushes_and_squash_merges():
     check("nor the design document", "distill_architect.md" not in committed, committed)
     check("the marker is spent", ship.read_marker(w.root) is None)
     check("and the workspace is back on main", w.branch() == "main", w.branch())
+
+
+def test_confirm_works_when_gitignore_already_covers_the_scratch_dirs():
+    """
+    The shape that broke it in the field.
+
+    `git add -A -- . \':(exclude).cline_context\'` refuses outright once
+    .gitignore names that directory: git will not take a pathspec that points
+    at an ignored path. Staging the listed files never names one.
+    """
+    w = Workspace(gitignore=".cline_context\n.cline_logs\nnode_modules/\n")
+    w.build()
+    w.write("node_modules/junk.js", "ignored\n")
+    ship.record_build_complete(w.root, base="main")
+
+    out = ship.propose(w.root)
+    check("the proposal does not offer the ignored build output",
+          "node_modules" not in out, out)
+
+    with FakeGh():
+        out = ship.confirm(w.root)
+    check("the push is not refused", "Could not push" not in out, out)
+    check("it merges", "Squash-merged into `main`" in out, out)
+
+    committed = git(w.root, "show", "--name-only", "--format=", "agent/build-1700000000").stdout
+    check("the build's file is committed", "widget.py" in committed, committed)
+    check("the ignored directory is not", "node_modules" not in committed, committed)
+    check("nor the scratch directory", ".cline_context" not in committed, committed)
+
+
+def test_paths_with_spaces_and_renames_survive_staging():
+    w = Workspace()
+    w.write("old name.py", "x = 1\n")
+    git(w.root, "add", "old name.py")
+    git(w.root, "commit", "-q", "-m", "add a spaced path")
+    git(w.root, "push", "-q", "origin", "main")
+
+    w.build(files={"a file with spaces.py": "y = 2\n"})
+    git(w.root, "mv", "old name.py", "new name.py")
+
+    ship.record_build_complete(w.root, base="main")
+    with FakeGh():
+        out = ship.confirm(w.root)
+    check("it merges", "Squash-merged into `main`" in out, out)
+
+    committed = git(w.root, "show", "--name-only", "--format=", "agent/build-1700000000").stdout
+    check("the spaced new file is committed", "a file with spaces.py" in committed, committed)
+    check("the rename's new half is committed", "new name.py" in committed, committed)
+    tree = git(w.root, "ls-tree", "-r", "--name-only", "agent/build-1700000000").stdout
+    check("and the old half is gone from the tree", "old name.py" not in tree, tree)
 
 
 def test_a_refused_merge_still_reports_the_open_pull_request():

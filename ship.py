@@ -52,9 +52,19 @@ MARKER_NAME = ".ship_pending"
 CONTEXT_DIR = ".cline_context"
 
 # Orchestration scratch that happens to sit inside the workspace: the design
-# documents, the serialized conversation, this marker. `git add -A` would sweep
-# the lot into the user's pull request, conversation transcript included.
-EXCLUDED_PATHSPECS = (f":(exclude){CONTEXT_DIR}", ":(exclude).cline_logs")
+# documents, the serialized conversation, this marker. A bare `git add -A` would
+# sweep the lot into the user's pull request, conversation transcript included,
+# so nothing under these ever reaches the file list that gets staged.
+#
+# They are filtered out of that list rather than excluded with a pathspec.
+# `git add -A -- . ':(exclude).cline_context'` fails outright in any repo whose
+# .gitignore already covers them - git refuses a pathspec that names an ignored
+# path - which is every workspace the build bootstraps a .gitignore for.
+EXCLUDED_DIRS = (CONTEXT_DIR, ".cline_logs")
+
+# Cap on paths per `git add` invocation, so a build touching thousands of files
+# cannot overflow the argument list.
+ADD_BATCH = 500
 
 MAX_TITLE_CHARS = 72
 
@@ -193,28 +203,50 @@ def _remote_ref(root: str, base: str) -> str:
     return base
 
 
+def _status_paths(root: str) -> set:
+    """
+    Working-tree and index paths, from `git status`.
+
+    -uall lists an untracked directory as its files, rather than as "dir/" -
+    which would tell the user a directory changed and nothing more. -z because
+    the readable format quotes and escapes any path with a space or a non-ASCII
+    character in it, and this list is fed straight back to `git add`.
+
+    Ignored files never appear here at all, which is what makes staging exactly
+    this list safe.
+    """
+    code, out = _git(root, "status", "--porcelain", "-uall", "-z")
+    if code != 0:
+        return set()
+
+    paths = set()
+    records = [r for r in out.split("\0") if r]
+    i = 0
+    while i < len(records):
+        record = records[i]
+        i += 1
+        if len(record) < 4:
+            continue
+        status, path = record[:2], record[3:]
+        paths.add(path)
+        # A rename or copy is followed by its source path in its own record.
+        # Both halves matter: the old path is a deletion that has to be staged.
+        if status[0] in ("R", "C") or status[1] in ("R", "C"):
+            if i < len(records):
+                paths.add(records[i])
+                i += 1
+    return paths
+
+
 def _changed_files(root: str, base: str) -> list:
     """Every path this branch changes: working tree, index and commits."""
-    paths = set()
-
-    # -uall so an untracked directory is listed as its files rather than as
-    # "dir/", which would tell the user a directory changed and nothing more.
-    code, out = _git(root, "status", "--porcelain", "-uall")
-    if code == 0:
-        for line in out.splitlines():
-            # "XY path", or "XY old -> new" for a rename. Never lstrip: the
-            # status columns are two characters wide and often blank.
-            path = line[3:] if len(line) > 3 else ""
-            path = path.split(" -> ")[-1].strip().strip('"')
-            if path:
-                paths.add(path)
+    paths = _status_paths(root)
 
     code, out = _git(root, "diff", "--name-only", f"{_remote_ref(root, base)}...HEAD")
     if code == 0:
         paths.update(ln.strip() for ln in out.splitlines() if ln.strip())
 
-    return sorted(p for p in paths
-                  if p.split("/")[0] not in (CONTEXT_DIR, ".cline_logs"))
+    return sorted(p for p in paths if p.split("/")[0] not in EXCLUDED_DIRS)
 
 
 def _has_work(root: str, base: str) -> bool:
@@ -379,6 +411,22 @@ def propose(workspace: str, title: str = "") -> str:
     )
 
 
+def _stageable(root: str, files: list) -> list:
+    """
+    The subset of `files` that `git add` can still be given.
+
+    A rename the agent staged itself leaves its old path in HEAD but in neither
+    the index nor the working tree, and `git add -A -- <that path>` is a fatal
+    "pathspec did not match any files" that would take the whole commit down
+    with it. There is nothing left to stage for those - the rename is already
+    in the index - so they are dropped rather than repaired.
+    """
+    code, out = _git(root, "ls-files", "-z")
+    indexed = {p for p in out.split("\0") if p} if code == 0 else set()
+    return [p for p in files
+            if p in indexed or os.path.exists(os.path.join(root, p))]
+
+
 def confirm(workspace: str) -> str:
     """`!ship confirm` — commit, push, open the PR, squash-merge it."""
     marker, root, files, refusal = _gate(workspace)
@@ -389,10 +437,13 @@ def confirm(workspace: str) -> str:
     title, body = _commit_text(workspace, marker, files)
 
     try:
-        # `git add -A` over the workspace, minus the orchestration scratch that
-        # happens to live inside it. Everything else here is build output by
-        # definition: the workspace is this conversation's own folder.
-        _git(root, "add", "-A", "--", ".", *EXCLUDED_PATHSPECS, check=True)
+        # Stage exactly the paths the proposal listed. Naming them, rather than
+        # sweeping the workspace and excluding the scratch directories, keeps
+        # the commit identical to what the user was shown and keeps every
+        # pathspec clear of anything .gitignore covers.
+        stageable = _stageable(root, files)
+        for i in range(0, len(stageable), ADD_BATCH):
+            _git(root, "add", "-A", "--", *stageable[i:i + ADD_BATCH], check=True)
 
         code, staged = _git(root, "diff", "--cached", "--name-only")
         if staged.strip():
