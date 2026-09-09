@@ -25,7 +25,7 @@ logger = logging.getLogger("Bob-Orchestrator")
 
 # --- STRICT MODEL CONFIG ---
 # Each model role is a dict: model name, provider type, and API base URL.
-# Supported providers: "ollama", "lmstudio", "llamacpp"
+# Supported providers: "ollama", "lmstudio", "llamacpp", "vllm"
 # EXPERT_CONFIG = {
 #    "model": "unsloth/Qwen3.8-27B-GGUF:Q5_K_M",
 #     "provider": "llamacpp",
@@ -44,10 +44,30 @@ logger = logging.getLogger("Bob-Orchestrator")
 # the model server keeps a port nothing else wants. Changing it here means
 # changing every base_url in cline-builder/agent_config.json too; the container
 # reaches the same process through host.docker.internal.
+# The llama.cpp expert, kept here as a one-block switch back. Everything it
+# needs (LLAMACPP_*, _start_llamacpp_server, the janitor's auto-stop) is intact;
+# nothing below is vllm-only except the provider branches.
+# EXPERT_CONFIG = {
+#     "model": "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL",
+#     "provider": "llamacpp",
+#     "base_url": "http://localhost:8081",
+# }
+#
+# The vLLM expert (../qwen-serving), and the reason its lifecycle looks nothing
+# like llama.cpp's: vLLM preallocates against GPU_UTIL and holds that VRAM for
+# the container's whole life. There is no cheap unload. So this provider is
+# RESIDENT - the orchestrator never starts or stops it, it only checks that it
+# is up. `docker compose --profile single up -d` in qwen-serving owns it, and
+# the card is its for as long as it runs.
+#
+# The consequence to know about: ComfyUI and the build pipeline can no longer
+# take the GPU back by evicting the expert. free_comfyui() still releases what
+# ComfyUI holds, but the ~20 GB under vLLM stays put. If you need the card for
+# something else, stop the container.
 EXPERT_CONFIG = {
-    "model": "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL",
-    "provider": "llamacpp",
-    "base_url": "http://localhost:8081",
+    "model": "qwen3.8-27b",          # --served-model-name in qwen-serving's start scripts
+    "provider": "vllm",
+    "base_url": "http://localhost:18020",
 }
 # EXPERT_CONFIG = {
 #    "model": "qwen3.8:27b",
@@ -168,6 +188,42 @@ LLAMACPP_SERVER_CTX = 163840
 # it is stuck, and should fail rather than hold the pipeline open.
 LLAMACPP_STARTUP_TIMEOUT = 300.0
 
+# --- vLLM (resident, externally managed) settings ---
+# Only used when a config's provider is "vllm". The orchestrator does not spawn
+# this server; qwen-serving's docker compose does.
+#
+# Auth: qwen-serving leaves the API unauthenticated unless VLLM_API_KEY is set.
+# Set the same value in this process's environment and every backend call to a
+# vLLM base_url picks up a bearer token; leave it unset for localhost-only use
+# and nothing is sent. Ollama and ComfyUI never see it - _auth_headers matches
+# on the URL, not on a shared client default.
+VLLM_API_KEY = os.getenv("VLLM_API_KEY", "").strip()
+# How long to wait for /health when a request finds the server not yet ready.
+# A cold vLLM start is torch.compile + CUDA graphs + FlashInfer JIT; qwen-serving's
+# own compose healthcheck budgets 900s for it. This is not a startup timeout -
+# nothing here starts the server - it is how long a request will sit waiting for
+# a container someone else just brought up.
+VLLM_READY_TIMEOUT = 900.0
+VLLM_HEALTH_INTERVAL = 3.0
+# How long AFTER the expert warm window expires the janitor waits before sleeping
+# the engine. 0 disables idle sleeping entirely.
+#
+# Deliberately not expert_warm_until itself, which is what the llama.cpp
+# auto-stop used. The two evictions are not the same trade:
+#
+#   llama.cpp: stopping frees VRAM and costs a process restart to undo. There is
+#   no cache to lose, so evicting the moment the window expires is free.
+#
+#   vLLM: sleeping frees VRAM and costs 2.6 s to undo - but it also DISCARDS THE
+#   PREFIX CACHE, and at CTX=long a 112k-token document costs 251 s to re-prefill
+#   against 5.9 s cached. Sleeping on the 700 s warm timer would mean anyone who
+#   steps away from a long document mid-session pays four minutes to resume.
+#
+# So this is a second, longer timer stacked on the first: the expert must have
+# been cold for the warm window AND this again (~42 minutes total idle) before
+# its VRAM is worth more than its cache. Nothing on the request path sleeps.
+VLLM_SLEEP_AFTER_IDLE = 1800.0
+
 EXPERT_CTX = 98304    # Context the EXPERT's own calls are budgeted against (96k).
                       # Deliberately below LLAMACPP_SERVER_CTX, but no longer by
                       # half. "Using less of it is free" was only true of the
@@ -210,7 +266,7 @@ DISTILL_CTX = 131072  # Context for the distillation engine. Reaches the contain
                       # LLAMACPP_SERVER_CTX first if this ever goes above it -
                       # the server is the real ceiling and rejects an over-long
                       # prompt outright with exceed_context_size_error.
-CLINE_CTX = 163840    # Window the Cline agent is EXPECTED to run at. This is an
+CLINE_CTX = 131072    # Window the Cline agent is EXPECTED to run at. This is an
                       # assertion, not a setting - entrypoint.sh reads the window
                       # actually in force from the server and aborts the build if
                       # it is short of what Cline assumes. Raising this alone does
@@ -220,7 +276,13 @@ CLINE_CTX = 163840    # Window the Cline agent is EXPECTED to run at. This is an
                       # assert_cline_ctx() aborts when the server is below
                       # CLINE_ASSUMED_CTX (128000, hardcoded in the Cline binary),
                       # and merely warns when the server disagrees with THIS
-                      # value. So this tracks LLAMACPP_SERVER_CTX to keep the
+                      # value. Under the vllm provider the ceiling is MAX_LEN in
+                      # qwen-serving/.env, not LLAMACPP_SERVER_CTX: 131072, which
+                      # is what a 5.2 GiB pinned KV pool holds at int8 KV. 163840
+                      # was tried and vLLM refused to boot (it needs 6.77 GiB),
+                      # so this tracks the vLLM window now. Still only ~3k above
+                      # CLINE_ASSUMED_CTX, which is the tightest this may be.
+                      # So this tracks the server's real window to keep the
                       # banner honest and the warning quiet - it is a description
                       # of the window, not a claim about where Cline compacts.
                       # Keep it in step with entrypoint.sh's own default.
@@ -314,24 +376,26 @@ PARAMS_GENERAL = {
 #     writing code a repetition penalty is worse than merely off-card - code
 #     legitimately repeats tokens (indentation, closing braces, an identifier used
 #     five times in a function) and penalising that damages syntax.
-#  2. It was never reaching the model. EXPERT_CONFIG is provider "llamacpp", so
-#     every dispatch goes through _adapt_body -> the OpenAI translation, and that
-#     forwards exactly ("temperature", "top_p", "presence_penalty",
-#     "frequency_penalty"). repeat_penalty, top_k and min_p are dropped there.
+#  2. It was never reaching the model, while EXPERT_CONFIG was provider
+#     "llamacpp": every dispatch goes through _adapt_body -> the OpenAI
+#     translation, which forwarded exactly ("temperature", "top_p",
+#     "presence_penalty", "frequency_penalty") and dropped the rest. Under the
+#     vllm provider that is no longer true - see below.
 #
 # So 0.6 was live and its 1.15 mitigation was not: coding mode was carrying the
 # repetition risk without the compensation that was supposed to offset it.
 #
-# top_k and min_p are kept here despite also being dropped by that translation.
-# They currently match --top-k/--min-p in the llama-server command line, so the
-# values in force are right by coincidence rather than by this dict. Leaving them
-# stated means the dict still describes the intended preset in full if the
-# provider changes to one that reads them (Ollama takes the whole options dict).
+# top_k, min_p and repeat_penalty are LIVE under the vllm provider: _adapt_body
+# forwards all three (repeat_penalty as vLLM's repetition_penalty). This is the
+# widening that comment used to anticipate, and it cost nothing precisely because
+# the values here were kept at the card's even while inert - the numbers in force
+# did not move, only where they come from. Under llamacpp they were set on the
+# command line and these keys were dropped; under vllm there is no command line
+# to set them on, so this dict is now the only thing stating them.
 #
-# If you ever widen the key tuple in _adapt_to_openai, everything here goes live
-# at once. That is the reason to keep this at the card's values even where a
-# setting is currently inert: an off-card number parked in an inert slot is a
-# quality regression waiting for an unrelated refactor to arm it.
+# The rule that made that safe still applies: an off-card number parked in a slot
+# that looks inert is a quality regression waiting for a provider switch to arm
+# it. Keep these at the card's values.
 PARAMS_CODING = {
     "temperature": 1.0,
     "top_p": 0.95,
@@ -374,6 +438,44 @@ def _get_base_url(config: dict) -> str:
     return config.get("base_url", "http://localhost:11434")
 
 
+def _is_vllm_provider(config: dict) -> bool:
+    """Check if a model config uses the vLLM provider."""
+    return config.get("provider", "ollama") == "vllm"
+
+
+def _is_resident_provider(config: dict) -> bool:
+    """
+    True for providers whose model cannot be cheaply evicted and reloaded, so
+    callers that free VRAM should leave them alone.
+
+    vLLM WAS in this set, and is not any more: with --enable-sleep-mode the
+    engine offloads its weights to CPU RAM on request. Measured on this box:
+    /sleep took VRAM from 22,887 to 1,767 MiB and /wake_up came back in 2.6 s,
+    against the ~3 minute cold start that made it resident in the first place.
+    That is cheap enough that declining to evict it is now the wrong call - and
+    it has to be evicted, because the build pipeline's Pass 3 runs an 18.2 GB
+    Ollama model that cannot fit beside it.
+
+    llamacpp stays: it is a managed subprocess that CAN be killed, but reloading
+    is ~17 GB off disk, so the build pipeline is right to leave it resident.
+    """
+    return config.get("provider", "ollama") == "llamacpp"
+
+
+def _auth_headers(url: str) -> dict:
+    """
+    Bearer token for backend calls that need one, selected by destination URL.
+
+    Keyed on the URL rather than threaded through every call site as a config,
+    because the agentic loop and the stream proxy are handed a target_url and no
+    config at all. Setting a default header on http_client instead would send the
+    vLLM key to Ollama, ComfyUI and SearXNG too.
+    """
+    if VLLM_API_KEY and url.startswith(_get_base_url(EXPERT_CONFIG)) and _is_vllm_provider(EXPERT_CONFIG):
+        return {"Authorization": f"Bearer {VLLM_API_KEY}"}
+    return {}
+
+
 def _get_chat_url(config: dict, prefer_native: bool = False) -> str:
     """
     Get the full chat endpoint URL for a provider.
@@ -406,6 +508,26 @@ def _adapt_body(body: dict, config: dict) -> dict:
     for key in ("temperature", "top_p", "presence_penalty", "frequency_penalty"):
         if key in options:
             adapted[key] = options[key]
+
+    # top_k, min_p and repetition_penalty are not in the OpenAI schema, but vLLM
+    # accepts all three as top-level sampling params. Forwarding them here is the
+    # "widen the key tuple" case PARAMS_CODING's comment anticipates: those dicts
+    # have carried card-correct values in inert slots specifically so that arming
+    # them changes nothing about the sampling actually in force. It only changes
+    # where it comes from - the dicts instead of a llama-server command line that
+    # no longer exists under this provider.
+    #
+    # Gated to vLLM rather than to every non-Ollama provider: LM Studio rejects
+    # unknown top-level fields, so widening this for all of them would trade a
+    # silent drop for a 400.
+    if _is_vllm_provider(config):
+        for key in ("top_k", "min_p"):
+            if key in options:
+                adapted[key] = options[key]
+        # The card and llama.cpp call this repeat_penalty; vLLM calls the same
+        # knob repetition_penalty.
+        if "repeat_penalty" in options:
+            adapted["repetition_penalty"] = options["repeat_penalty"]
 
     if body.get("format") == "json":
         adapted["response_format"] = {"type": "json_object"}
@@ -525,6 +647,141 @@ async def _provider_load(config: dict):
 
     elif provider == "llamacpp":
         await _start_llamacpp_server(config)
+
+    elif provider == "vllm":
+        await _await_vllm_ready(config)
+
+
+async def _vllm_is_sleeping(base_url: str) -> Optional[bool]:
+    """
+    True/False from GET /is_sleeping, or None when the question cannot be
+    answered - the endpoint is absent (sleep mode not enabled, or
+    VLLM_SERVER_DEV_MODE unset) or the server did not respond.
+
+    None is not False. A caller that cannot tell whether the engine is asleep
+    must not assume it is awake; every use below treats None as "carry on
+    without sleep-mode behaviour" rather than as a negative answer.
+    """
+    try:
+        resp = await http_client.get(f"{base_url}/is_sleeping", timeout=5.0,
+                                     headers=_auth_headers(base_url))
+        if resp.status_code == 200:
+            return bool(resp.json().get("is_sleeping"))
+        # 404: the server is up but was started without --enable-sleep-mode.
+        return None
+    except Exception:
+        return None
+
+
+async def _vllm_sleep(config: dict) -> bool:
+    """
+    Offload the engine's weights to CPU RAM and drop its KV cache. Returns True
+    if the engine is asleep afterwards.
+
+    Level 1, not 2: level 2 discards the weights entirely and re-reads ~16 GB
+    from disk on wake, which throws away the entire point. Level 1 keeps them in
+    system RAM (75 GB on this box against ~16 GB of weights).
+
+    This also discards the prefix cache, which is why nothing on the chat path
+    calls it: at CTX=long a 112k-token document costs 251 s to re-prefill
+    against 5.9 s cached. Sleeping belongs between build passes, not between
+    conversation turns.
+    """
+    base_url = _get_base_url(config)
+    model = config.get("model", "")
+    try:
+        resp = await http_client.post(f"{base_url}/sleep?level=1", timeout=120.0,
+                                      headers=_auth_headers(base_url))
+        if resp.status_code != 200:
+            logger.warning(
+                f"vLLM: /sleep returned HTTP {resp.status_code} for {model}. VRAM was "
+                f"NOT released. If this is a 404 the server was started without "
+                f"--enable-sleep-mode (set it and VLLM_SERVER_DEV_MODE=1 in "
+                f"qwen-serving/.env)."
+            )
+            return False
+        # Trust the endpoint's own state rather than the 200: the sleep call is
+        # asynchronous inside the engine.
+        for _ in range(20):
+            await asyncio.sleep(0.5)
+            if await _vllm_is_sleeping(base_url):
+                logger.info(f"vLLM: {model} is asleep; its VRAM is released.")
+                return True
+        logger.warning(f"vLLM: /sleep accepted but {model} did not report asleep.")
+        return False
+    except Exception as e:
+        logger.warning(f"vLLM: sleep failed for {model}: {e}")
+        return False
+
+
+async def _vllm_wake(config: dict) -> bool:
+    """Bring a sleeping engine back. ~2.6 s measured; the caller still waits on health."""
+    base_url = _get_base_url(config)
+    model = config.get("model", "")
+    try:
+        started = time.monotonic()
+        resp = await http_client.post(f"{base_url}/wake_up", timeout=300.0,
+                                      headers=_auth_headers(base_url))
+        if resp.status_code != 200:
+            logger.error(f"vLLM: /wake_up returned HTTP {resp.status_code} for {model}.")
+            return False
+        logger.info(f"vLLM: woke {model} in {time.monotonic() - started:.1f}s.")
+        return True
+    except Exception as e:
+        logger.error(f"vLLM: wake failed for {model}: {e}")
+        return False
+
+
+async def _await_vllm_ready(config: dict):
+    """
+    Wait for an externally-managed vLLM server to answer /health.
+
+    This never starts anything. If the container is not up, the wait is pointless
+    and the error should say so plainly rather than making every request hang for
+    VLLM_READY_TIMEOUT - so a connection refusal fails fast, while an HTTP error
+    (the server is there, still loading weights) is what we actually wait through.
+
+    Health is necessary but NOT sufficient: a sleeping engine answers /health with
+    200 (verified on this box). Waiting on health alone would hand requests to an
+    engine with no weights on the GPU, so a sleeping engine is woken first.
+    """
+    base_url = _get_base_url(config)
+    model = config.get("model", "")
+    deadline = time.time() + VLLM_READY_TIMEOUT
+    logged_wait = False
+
+    while True:
+        try:
+            resp = await http_client.get(f"{base_url}/health", timeout=5.0)
+            if resp.status_code == 200:
+                # 200 does not mean servable - check for sleep before returning.
+                # None means the endpoint is absent (sleep mode off), in which
+                # case the engine cannot be asleep and health is the whole answer.
+                if await _vllm_is_sleeping(base_url) is True:
+                    logger.info(f"vLLM: {model} is asleep; waking it.")
+                    if not await _vllm_wake(config):
+                        raise RuntimeError(f"vLLM asleep and wake failed at {base_url}")
+                    continue
+                if logged_wait:
+                    logger.info(f"vLLM: {model} is ready at {base_url}.")
+                return
+            if not logged_wait:
+                logger.info(f"vLLM: {base_url} is up but not ready "
+                            f"(HTTP {resp.status_code}); waiting for weights to load.")
+                logged_wait = True
+        except Exception as e:
+            # Nothing listening. No amount of waiting fixes that from here.
+            logger.error(
+                f"vLLM: no server at {base_url} ({e}). This provider is resident and "
+                f"externally managed - start it with: "
+                f"cd ../qwen-serving && docker compose --profile single up -d"
+            )
+            raise RuntimeError(f"vLLM backend unreachable at {base_url}") from e
+
+        if time.time() >= deadline:
+            logger.error(f"vLLM: {base_url} still not ready after {VLLM_READY_TIMEOUT:.0f}s.")
+            raise RuntimeError(f"vLLM backend not ready at {base_url}")
+        await asyncio.sleep(VLLM_HEALTH_INTERVAL)
 
 
 async def _start_llamacpp_server(config: dict):
@@ -964,6 +1221,19 @@ async def get_loaded_models() -> list[str]:
             except Exception:
                 pass
 
+        elif provider == "vllm":
+            # Reachable is not the same as loaded: a sleeping engine still answers
+            # /health 200 while holding no weights on the GPU. Callers use this list
+            # to decide what to evict, so reporting a sleeping engine as loaded would
+            # send them chasing VRAM that is already free.
+            try:
+                resp = await http_client.get(f"{base_url}/health", timeout=2.0,
+                                             headers=_auth_headers(base_url))
+                if resp.status_code == 200 and not await _vllm_is_sleeping(base_url):
+                    loaded.append(cfg["model"])
+            except Exception:
+                pass
+
     # Check managed llama.cpp processes
     for model_name, proc in list(_managed_processes.items()):
         if proc.poll() is None:
@@ -1000,6 +1270,13 @@ async def force_unload(model_name: str):
         elif provider == "llamacpp":
             logger.info(f"Unloading model (llama.cpp): {model_name}")
             await _stop_llamacpp_server(config)
+        elif provider == "vllm":
+            # Sleep, not stop: the container is not this process's to stop, but the
+            # engine will offload its weights to CPU RAM on request and come back in
+            # ~2.6 s. Best-effort like every other branch here - a server without
+            # sleep mode enabled logs and carries on rather than failing the caller.
+            logger.info(f"Unloading model (vLLM sleep): {model_name}")
+            await _vllm_sleep(config)
     except Exception as e:
         logger.warning(f"Failed to unload {model_name}: {e}")
 
@@ -1080,8 +1357,11 @@ async def free_comfyui():
 async def periodic_cleanup():
     """
     Background loop that periodically sweeps memory if the system is idle.
-    Runs every 5 minutes. Also auto-unloads llama-server when the expert
-    warm timer expires (mirrors Ollama's native keep_alive behavior).
+    Runs every 5 minutes. Also releases the expert when it has been idle long
+    enough: llama-server is stopped when the warm timer expires (mirroring
+    Ollama's native keep_alive), and a vLLM engine is put to sleep after a
+    further VLLM_SLEEP_AFTER_IDLE - see that constant for why the two providers
+    do not share one deadline.
     """
     while True:
         try:
@@ -1090,14 +1370,34 @@ async def periodic_cleanup():
                 logger.info("Periodic idle cleanup triggered.")
                 await free_comfyui()
 
-                # Auto-unload llama-server when expert warm period expires
+                # Release the expert once it has been idle long enough.
                 if not vram_locked and time.time() > expert_warm_until:
                     expert_config = _resolve_config(EXPERT_MODEL)
-                    if expert_config.get("provider") == "llamacpp" and EXPERT_MODEL in _managed_processes:
+                    provider = expert_config.get("provider", "ollama")
+
+                    if provider == "llamacpp" and EXPERT_MODEL in _managed_processes:
                         proc = _managed_processes[EXPERT_MODEL]
                         if proc.poll() is None:
                             logger.info(f"Expert warm period expired. Auto-stopping llama-server for {EXPERT_MODEL}.")
                             await _stop_llamacpp_server(expert_config)
+
+                    elif provider == "vllm" and VLLM_SLEEP_AFTER_IDLE > 0:
+                        # The second timer. expert_warm_until is already in the
+                        # past here, so this is the extra grace on top of it.
+                        if time.time() > expert_warm_until + VLLM_SLEEP_AFTER_IDLE:
+                            base_url = _get_base_url(expert_config)
+                            # is-None means we cannot tell (sleep mode off, or the
+                            # server is gone). Only sleep on a definite False - never
+                            # act on an unknown, and never re-sleep a sleeping engine.
+                            if await _vllm_is_sleeping(base_url) is False:
+                                idle_min = (time.time() - expert_warm_until
+                                            + VLLM_SLEEP_AFTER_IDLE) / 60.0
+                                logger.info(
+                                    f"Expert idle past its sleep grace. Sleeping vLLM "
+                                    f"{EXPERT_MODEL} to release VRAM "
+                                    f"(~{idle_min:.0f} min idle)."
+                                )
+                                await _vllm_sleep(expert_config)
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -1181,7 +1481,8 @@ async def analyze_request(messages: list) -> dict:
     started = time.monotonic()
     try:
         await _provider_load(router_config)
-        resp = await http_client.post(url, json=payload, timeout=10.0)
+        resp = await http_client.post(url, json=payload, timeout=10.0,
+                                      headers=_auth_headers(url))
         if resp.status_code == 200:
             resp_data = resp.json()
             if _is_ollama_provider(router_config):
@@ -1243,7 +1544,8 @@ async def stream_proxy(url: str, body: dict, lock: asyncio.Lock,
     backend_sends_native = backend_is_ollama and is_native
 
     try:
-        async with http_client.stream("POST", url, json=body, timeout=700.0) as resp:
+        async with http_client.stream("POST", url, json=body, timeout=700.0,
+                                      headers=_auth_headers(url)) as resp:
             if resp.status_code != 200:
                 error_body = ""
                 async for chunk in resp.aiter_bytes():
@@ -1598,6 +1900,20 @@ async def shutdown_expert():
             pass
 
     logger.info(f"VRAM Cleanup: Terminated {killed_count} tracked expert processes.")
+
+    # The sweep above kills managed subprocesses. A vLLM expert is neither managed
+    # nor a subprocess, so killing is not the lever - sleeping is. The container
+    # keeps running (this process does not own it) but the weights leave the GPU,
+    # which is what a caller asking to shut the expert down actually wants.
+    expert_cfg = _resolve_config(EXPERT_MODEL)
+    if _is_vllm_provider(expert_cfg):
+        if await _vllm_sleep(expert_cfg):
+            logger.info("VRAM Cleanup: vLLM expert is asleep; its VRAM is released.")
+        else:
+            logger.warning(
+                "VRAM Cleanup: vLLM expert did NOT sleep - its VRAM is still held. "
+                "To release it fully: cd ../qwen-serving && docker compose --profile single down"
+            )
     return JSONResponse(content={"status": "ok", "processes_killed": killed_count})
 
 @app.post("/api/chat")
@@ -1774,8 +2090,20 @@ async def _orchestrate(request: Request):
         ]
         is_search_query = (role == "user") and any(kw in last_content for kw in search_triggers)
         
-        # Image Intent (In user prompt)
-        image_triggers = ["generate an image", "create an image", "create a picture", "draw a", "make an image", "flux", "comfyui"]
+        # Image Intent (In user prompt). EMPTY, and deliberately so: this list
+        # routed the turn to the Router model (see Rule B below), which was right
+        # only while ComfyUI could actually serve the request. It cannot - the
+        # resident vLLM Expert holds the card - so every trigger here is now a
+        # pure downgrade, answering a real question with the 1.5B model. "draw a"
+        # in particular fires on "draw a diagram", "draw a comparison", "draw a
+        # distinction": ordinary chat, silently sent to the wrong model.
+        #
+        # Kept as an empty list rather than deleted so the routing rule and the
+        # background-task exclusion that reference is_image_query stay intact.
+        # Restore the values below alongside ComfyUI in start_standalone.sh:
+        #   ["generate an image", "create an image", "create a picture",
+        #    "draw a", "make an image", "flux", "comfyui"]
+        image_triggers = []
         is_image_query = (role == "user") and any(kw in last_content for kw in image_triggers)
 
         # History-based Search Detection (Check only last 2 messages)
@@ -2306,7 +2634,8 @@ async def _orchestrate(request: Request):
 
         if not is_streaming:
             try:
-                resp = await http_client.post(target_url, json=dispatch_body, timeout=700.0)
+                resp = await http_client.post(target_url, json=dispatch_body, timeout=700.0,
+                                              headers=_auth_headers(target_url))
                 if resp.status_code != 200:
                     error_text = ""
                     try:
@@ -2616,7 +2945,8 @@ async def _handle_agentic_request(body: dict, project_dir: str, target_url: str,
 
         hop_started = time.monotonic()
         try:
-            resp = await http_client.post(target_url, json=temp_body, timeout=700.0)
+            resp = await http_client.post(target_url, json=temp_body, timeout=700.0,
+                                          headers=_auth_headers(target_url))
             if resp.status_code != 200:
                 tracer.error(f"hop {current_hops} returned HTTP {resp.status_code}")
                 return JSONResponse(status_code=resp.status_code, content={"error": "Agentic inference failed."})
@@ -2720,7 +3050,8 @@ async def _handle_agentic_request(body: dict, project_dir: str, target_url: str,
 
     final_started = time.monotonic()
     try:
-        resp = await http_client.post(target_url, json=final_body, timeout=700.0)
+        resp = await http_client.post(target_url, json=final_body, timeout=700.0,
+                                      headers=_auth_headers(target_url))
         if resp.status_code == 200:
             payload = resp.json()
             msg = (payload.get("message", {}) if response_is_native
@@ -2785,6 +3116,20 @@ async def internal_model_unload(request: Request):
             await proc.communicate()
         elif provider == "llamacpp":
             await _stop_llamacpp_server(config)
+        elif provider == "vllm":
+            # distill.py calls this to free VRAM before a pass that needs a
+            # different model - Pass 3 (test_engineer) runs an 18.2 GB Ollama
+            # model that cannot fit beside a loaded expert. It reads "ok" as
+            # "the VRAM is free", so only say that when the engine really slept.
+            slept = await _vllm_sleep(config)
+            if not slept:
+                logger.warning(f"Internal unload: {model_name} did not sleep; "
+                               f"VRAM is still held.")
+                return JSONResponse(status_code=503,
+                                    content={"status": "error", "unloaded": False,
+                                             "detail": "vLLM did not enter sleep; "
+                                                       "VRAM not released"})
+            return JSONResponse(content={"status": "ok", "unloaded": True})
 
         return JSONResponse(content={"status": "ok"})
     except Exception as e:
@@ -3322,7 +3667,7 @@ async def _trigger_build_pipeline_safe(
         # Don't kill the Expert if it is a managed llama.cpp process
         # This prevents the 'Network unreachable' error when the container starts
         expert_cfg = _resolve_config(EXPERT_MODEL)
-        if expert_cfg.get("provider") != "llamacpp":
+        if not _is_resident_provider(expert_cfg):
             # If the build's first pass wants this same model, evicting it here just
             # forces the pipeline to reload ~17GB it already had. Leave it resident.
             first_pass_model = _get_first_pass_model()

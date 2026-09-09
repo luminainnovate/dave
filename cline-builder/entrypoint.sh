@@ -768,12 +768,36 @@ llamacpp_props() {
                 /tmp/props.json 2>/dev/null || echo "")
 }
 
+# The same two facts from a vLLM server, which has no /props: /v1/models reports
+# the window as .data[0].max_model_len. Sets the same two variables so the
+# assertion below reads identically whichever server is behind CLINE_BASE_URL.
+#
+# This check is not decoration. vLLM sizes its KV pool independently of
+# max_model_len and refuses to start when they disagree, so the window in force
+# is whatever survived that negotiation - not what anyone put in a config file.
+# A boot at 163840 against a pinned 5.2 GiB pool is exactly how this stack landed
+# below Cline's assumption once already.
+vllm_props() {
+    PROPS_HTTP=$(curl -s -m 30 -o /tmp/props.json -w '%{http_code}' \
+                 ${VLLM_API_KEY:+-H "Authorization: Bearer $VLLM_API_KEY"} \
+                 "${CLINE_BASE_URL}/v1/models" 2>/dev/null)
+    PROPS_HTTP="${PROPS_HTTP:-000}"
+    PROPS_CTX=$(jq -r '.data[0].max_model_len // empty' \
+                /tmp/props.json 2>/dev/null || echo "")
+}
+
 assert_cline_ctx() {
-    if [ "$CLINE_PROVIDER" = "llamacpp" ]; then
+    if [ "$CLINE_PROVIDER" = "llamacpp" ] || [ "$CLINE_PROVIDER" = "vllm" ]; then
         echo "  📏 Verifying context window (Cline assumes ${CLINE_ASSUMED_CTX})..."
 
-        local actual
-        llamacpp_props
+        local actual endpoint
+        if [ "$CLINE_PROVIDER" = "vllm" ]; then
+            vllm_props
+            endpoint="${CLINE_BASE_URL}/v1/models"
+        else
+            llamacpp_props
+            endpoint="${CLINE_BASE_URL}/props"
+        fi
         actual="$PROPS_CTX"
 
         # An unreachable server is fatal, not a warning. Continuing here buys
@@ -782,16 +806,22 @@ assert_cline_ctx() {
         # metadata rather than "the model is not running".
         if [ "$PROPS_HTTP" != "200" ]; then
             echo ""
-            echo "  ✗ FATAL: no llama.cpp server answering at ${CLINE_BASE_URL}/props"
+            echo "  ✗ FATAL: no model server answering at ${endpoint}"
             echo "      HTTP status: ${PROPS_HTTP} (000 = nothing listening)"
             echo ""
-            echo "    The build agent has no model to talk to. Check that the orchestrator"
-            echo "    is running and that its VRAM sweep has not just killed the server."
+            if [ "$CLINE_PROVIDER" = "vllm" ]; then
+                echo "    The build agent has no model to talk to. vLLM is resident and"
+                echo "    externally managed - the orchestrator neither starts nor stops it:"
+                echo "      cd qwen-serving && docker compose --profile single up -d"
+            else
+                echo "    The build agent has no model to talk to. Check that the orchestrator"
+                echo "    is running and that its VRAM sweep has not just killed the server."
+            fi
             return 1
         fi
 
         if ! [[ "$actual" =~ ^[0-9]+$ ]]; then
-            echo "  ⚠ WARNING: ${CLINE_BASE_URL}/props answered but reported no n_ctx."
+            echo "  ⚠ WARNING: ${endpoint} answered but reported no window."
             echo "    Expected window ${CLINE_CTX} is UNVERIFIED - the build continues, but if"
             echo "    it dies mid-iteration on 'maximum output token limit', this is the first"
             echo "    thing to check."
@@ -808,9 +838,16 @@ assert_cline_ctx() {
             echo "    Cline compacts against ${CLINE_ASSUMED_CTX}, so it will not compact before"
             echo "    it runs off the end of ${actual}. The build would spend its iteration"
             echo "    budget and die on 'maximum output token limit' with nothing written."
-            echo "    Raise LLAMACPP_SERVER_CTX in orchestrator.py to at least"
-            echo "    ${CLINE_ASSUMED_CTX} and restart the orchestrator. Mind the KV cost:"
-            echo "    128k needs --cache-type-k/v q8_0 to fit -ngl all on 24GB."
+            if [ "$CLINE_PROVIDER" = "vllm" ]; then
+                echo "    Raise MAX_LEN in qwen-serving/.env above ${CLINE_ASSUMED_CTX} and"
+                echo "    recreate the container. Mind the KV pool: it is pinned by bytes"
+                echo "    (KV_MEM in single-user/start_qwen.sh), so past its capacity vLLM"
+                echo "    refuses to boot rather than serving a smaller window."
+            else
+                echo "    Raise LLAMACPP_SERVER_CTX in orchestrator.py to at least"
+                echo "    ${CLINE_ASSUMED_CTX} and restart the orchestrator. Mind the KV cost:"
+                echo "    128k needs --cache-type-k/v q8_0 to fit -ngl all on 24GB."
+            fi
             return 1
         fi
 
@@ -821,7 +858,7 @@ assert_cline_ctx() {
         fi
 
         CLINE_CTX_ACTUAL="$actual"
-        echo "  ✓ Cline CTX: ${actual} tokens confirmed by the llama.cpp server"
+        echo "  ✓ Cline CTX: ${actual} tokens confirmed by the ${CLINE_PROVIDER} server"
         return 0
     fi
 
