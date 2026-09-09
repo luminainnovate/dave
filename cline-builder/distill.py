@@ -5490,6 +5490,59 @@ def build_replan_payload(previous: dict, new_request: str,
                            f"  <BUILD_ISSUES>\n{issues}\n  </BUILD_ISSUES>\n\n")
 
 
+# Operator-authored facts about the environment the build runs IN, as opposed to
+# the code it is building. Verbatim, project-local, and present in EVERY
+# .clinerules: an LLM pass never sees it, so it cannot be paraphrased away.
+#
+# It exists because nothing else in the pipeline could carry it. `.knowledge_base/`
+# is keyword-scored against the instruction, so "add job revisions" scores zero on
+# a Postgres file and the agent goes into the build not knowing a database exists.
+# `.build_issues.md` is a ledger the agent is told to cross items off - the wrong
+# semantics for a standing fact. `<operational_constraints>` is compiled in and
+# shared by every project. This is the per-project slot none of those provide.
+#
+# WHAT BELONGS HERE: how to reach services that are already running, the exact
+# connection strings, which database is safe to write to, and what to do when a
+# service is unreachable. WHAT DOES NOT: anything the agent can learn by reading
+# the code, and anything that changes per build - that is the request, not the
+# environment.
+BUILDER_ENV_PATH = "/workspace/.builder_env.md"
+
+# Small on purpose. This is a fact sheet competing with the plan for the agent's
+# window; at 4000 chars it costs ~1000 tokens. A file that wants to be larger is
+# documentation and belongs in `.knowledge_base/`, where it is budgeted against
+# the window instead of charged to it unconditionally.
+BUILDER_ENV_MAX_CHARS = 4000
+
+
+def read_builder_env(path: str = None) -> str:
+    """
+    Return the project's environment fact sheet, or "" if there is none.
+
+    Absence is the normal case and is not an error: most projects have no
+    external services and the block is simply omitted. A read failure is also
+    non-fatal - a build must not die because an optional file was unreadable.
+    """
+    path = path or BUILDER_ENV_PATH
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except OSError:
+        return ""
+
+    content = content.strip()
+    if not content:
+        return ""
+
+    if len(content) > BUILDER_ENV_MAX_CHARS:
+        print(f"  ⚠️  {path} is {len(content)} chars, truncating to "
+              f"{BUILDER_ENV_MAX_CHARS} - move the detail to .knowledge_base/",
+              flush=True)
+        content = content[:BUILDER_ENV_MAX_CHARS].rstrip() + "\n[TRUNCATED]"
+
+    return content
+
+
 def assemble_clinerules(results: dict, config: dict, messages: list) -> str:
     """Combine the 4-pass results into a structured .clinerules document."""
     limits = config.get("limits", {})
@@ -5586,6 +5639,26 @@ def assemble_clinerules(results: dict, config: dict, messages: list) -> str:
         "</operational_constraints>",
         "",
     ])
+
+    # After the rules, because it qualifies them: several of the constraints above
+    # ("run the test suite", "verify each major component") are unachievable if the
+    # agent cannot reach the services the tests need, and the agent's own guess at
+    # what to do about that has been to try installing one.
+    builder_env = read_builder_env()
+    if builder_env:
+        doc.extend([
+            "## 🌐 Environment You Are Building In",
+            "",
+            "Operator-supplied and authoritative. It describes services that are "
+            "ALREADY RUNNING and how to reach them. Do not install, provision or "
+            "substitute anything described here, and do not infer the environment "
+            "from the code - this section outranks both.",
+            "",
+            "<project_environment>",
+            builder_env,
+            "</project_environment>",
+            "",
+        ])
 
     return "\n".join(doc)
 

@@ -3282,6 +3282,108 @@ def test_evidence_framing_defaults_are_unchanged():
     assert "You previously reported these blockers" in blocker.text
 
 
+# --- .builder_env.md ----------------------------------------------------------
+#
+# The block exists so an agent stops inferring the environment. Every test here
+# is about it arriving intact and unconditionally: a fact sheet that an LLM pass
+# could rewrite, or that a keyword score could withhold, is the failure mode the
+# other channels already have.
+
+
+@contextlib.contextmanager
+def _builder_env(content):
+    """Point distill at a temporary .builder_env.md, or at nothing."""
+    original = distill.BUILDER_ENV_PATH
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, ".builder_env.md")
+        if content is not None:
+            with io.open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+        distill.BUILDER_ENV_PATH = path
+        try:
+            yield path
+        finally:
+            distill.BUILDER_ENV_PATH = original
+
+
+def _clinerules(env_content, request="add job revisions"):
+    with _builder_env(env_content):
+        return distill.assemble_clinerules(
+            {"architect": "ARCH", "engineer": "ENG"},
+            {"limits": {"max_build_iterations": 6}},
+            [{"role": "user", "content": request}],
+        )
+
+
+def test_builder_env_reaches_clinerules_verbatim():
+    fact = "DATABASE_URL=postgres://vif:vif@veriform-postgres:5432/veriform_build"
+    doc = _clinerules("# Postgres\n\n" + fact + "\n")
+    assert "<project_environment>" in doc, "environment block missing"
+    assert fact in doc, "the connection string did not survive into .clinerules"
+
+
+def test_builder_env_is_independent_of_the_request():
+    """
+    The .knowledge_base/ failure this exists to fix: a request with no database
+    word in it scores zero and the agent starts blind. This block is not scored.
+    """
+    fact = "postgres://vif:vif@veriform-postgres:5432/veriform_build"
+    doc = _clinerules(fact + "\n", request="rename a button and update its snapshot")
+    assert fact in doc
+
+
+def test_no_builder_env_leaves_no_trace():
+    doc = _clinerules(None)
+    assert "project_environment" not in doc
+    assert "Environment You Are Building In" not in doc
+
+
+def test_a_blank_builder_env_is_not_an_empty_block():
+    doc = _clinerules("   \n\n\t\n")
+    assert "project_environment" not in doc
+
+
+def test_builder_env_survives_an_unreadable_path():
+    """A build must not die because an optional file could not be read."""
+    original = distill.BUILDER_ENV_PATH
+    with tempfile.TemporaryDirectory() as d:
+        distill.BUILDER_ENV_PATH = d  # a directory: open() raises IsADirectoryError
+        try:
+            assert distill.read_builder_env() == ""
+        finally:
+            distill.BUILDER_ENV_PATH = original
+
+
+def test_an_oversized_builder_env_is_capped_and_marked():
+    body = "x" * (distill.BUILDER_ENV_MAX_CHARS + 2000)
+    with _builder_env(body):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            content = distill.read_builder_env()
+    assert len(content) <= distill.BUILDER_ENV_MAX_CHARS + len("\n[TRUNCATED]")
+    assert content.endswith("[TRUNCATED]"), "truncation must be visible to the agent"
+    assert ".knowledge_base" in out.getvalue(), "the warning must name the alternative"
+
+
+def test_builder_env_follows_the_rules_it_qualifies():
+    """
+    It sits after <operational_constraints> on purpose: several of those rules
+    ("run the test suite") are unachievable without the services it describes.
+    """
+    doc = _clinerules("DB: veriform-postgres:5432\n")
+    assert doc.index("</operational_constraints>") < doc.index("<project_environment>")
+
+
+def test_the_shipped_veriform_example_fits_the_cap():
+    example = os.path.join(os.path.dirname(_HERE), "builder-env.veriform.md")
+    if not os.path.exists(example):
+        raise Skipped("builder-env.veriform.md not present")
+    with io.open(example, encoding="utf-8") as f:
+        body = f.read()
+    assert len(body.strip()) <= distill.BUILDER_ENV_MAX_CHARS, (
+        "the shipped example is %d chars and would be truncated" % len(body.strip())
+    )
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failures, skipped = [], []

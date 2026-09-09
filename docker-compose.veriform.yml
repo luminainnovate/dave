@@ -27,6 +27,10 @@
 #        npx drizzle-kit migrate
 #    Re-run the migrate step whenever new migrations land, or the agent's gates
 #    will fail against a schema older than the code under test.
+# 3. The agent must be TOLD all of this. Networking it to the database does not
+#    stop it inferring `localhost`, failing, and costing out `apt-get install
+#    postgresql`. Copy `builder-env.veriform.md` to the workspace root as
+#    `.builder_env.md` and it lands verbatim in every .clinerules — see README §5.5.
 #
 # VERIFY REACHABILITY BEFORE TRUSTING A GREEN GATE
 #   docker compose -f docker-compose.yml -f docker-compose.veriform.yml \
