@@ -421,6 +421,41 @@ specific hazard here: the single-site rule pressures a model toward exactly that
 fabricated common cause is undetectable by anyone reading the fix — so the prompt makes
 deferral the explicit safe answer whenever the trace does not actually reach both.
 
+### 5.5 Services the build runs against: `.builder_env.md`
+
+Put a Markdown file at the workspace root called `.builder_env.md` and every `.clinerules`
+the pipeline writes ends with its contents, verbatim, under **Environment You Are Building
+In**. No LLM pass sees it on the way, so nothing paraphrases it away, and the build, review
+and safety phases all re-read it on every iteration.
+
+It is for **the environment, not the code**: how to reach services that are already running,
+the exact connection strings, which database is safe to write to, and what to do when
+something is unreachable. Anything the agent could learn by reading the repository does not
+belong in it, and neither does anything that changes per build — that is the request.
+
+Without it the agent infers the environment, and the inference is expensive. Handed a
+Postgres it could not reach, one run spent its remaining iterations costing out `apt-get
+install postgresql`, `embedded-postgres` and `pg-mem`, concluded the database was "gone", and
+reported the DB-backed gates as blocked — when the real answer was that it was addressing
+`localhost` instead of the container. Four lines of fact would have skipped all of it.
+
+The three channels that already existed cannot carry this:
+
+| Channel | Why not |
+|---|---|
+| `.knowledge_base/` | Keyword-scored against the instruction. *"add job revisions"* scores zero on a file about Postgres, so the build starts not knowing a database exists. |
+| `.build_issues.md` | A ledger the agent is told to cross items off. Wrong semantics for a standing fact. |
+| `<operational_constraints>` | Compiled into `distill.py` and shared by every project. |
+
+Capped at 4000 chars (~1000 tokens) and truncated with a warning past it — it is charged to
+the window unconditionally, so anything longer is documentation and belongs in
+`.knowledge_base/`, where `solve_kb_budget()` makes it pay its own way.
+
+[`builder-env.veriform.md`](builder-env.veriform.md) is a worked example: Veriform's Postgres,
+Zitadel, OpenFGA, PgBouncer, Mailpit and dnsmasq containers, the one database the agent may
+write to, and the instruction to record an unreachable service as an environment fault rather
+than try to install one. Copy it to the workspace root as `.builder_env.md`.
+
 ---
 
 ## 6. Chat commands
@@ -916,3 +951,4 @@ ComfyUI's `/history`. A background task sweeps idle ComfyUI RAM/VRAM every 5 min
 | `.cline_logs/*.txt` | Per-iteration build / review / verify / safety / test-gate logs |
 | `.build_complete` | `VERIFIED` + `SAFE` — necessary, but the test gate decides |
 | `.knowledge_base/` | Optional reference repo from `!clone --kb` |
+| `.builder_env.md` | Optional operator-written fact sheet on the services the build runs against. Copied verbatim into every `.clinerules` |
