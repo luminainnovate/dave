@@ -16,18 +16,56 @@
 # ECONNREFUSED. Joining the container network and addressing the container by name
 # is the only route that works without exposing the DB off the box.
 #
+# WHY THE AGENT IS NOT GIVEN THE SUPERUSER
+# `vif` is SUPERUSER with BYPASSRLS. Under it, row-level security does not apply,
+# so every tenant-isolation assertion passes whether or not the policies are
+# correct — the gate goes green on a schema that leaks across tenants. Connecting
+# as `veriform_app` is what makes those tests mean anything: the same context-free
+# query that returns every row as `vif` fails as `veriform_app` with
+# "no tenant or person context is set".
+#
+# Migrations need a role that OWNS the tables, and veriform_app owns nothing by
+# design, so MIGRATION_DATABASE_URL is veriform_owner. Both are NOBYPASSRLS.
+#
 # PREREQUISITES
 # 1. veriform's stack must be up — it is what creates `backend_default`:
 #      docker compose -f <veriform-ui>/Backend/docker-compose.yml up -d
-# 2. The build agent's own database must exist and be migrated. Created once:
+#
+# 2. Role passwords. The roles are CLUSTER-WIDE and already exist with passwords
+#    the developer's own Backend/.env uses. Put the SAME values in this repo's
+#    `.env` (compose reads it automatically) so the agent gets working credentials
+#    without ever reading or writing the developer's file:
+#
+#      VERIFORM_APP_PASSWORD=<same as veriform_app in veriform-ui/Backend/.env>
+#      VERIFORM_OWNER_PASSWORD=<same as veriform_owner in that file>
+#
+#    Do NOT `ALTER ROLE ... PASSWORD` to make these match — the roles are shared
+#    with the developer's dev database and every git worktree's .env. Changing a
+#    password here logs all of them out.
+#
+# 3. The build agent's own database must exist, be migrated, and be owned by
+#    veriform_owner. Created once:
 #      docker exec veriform-postgres psql -U vif -d postgres \
 #        -c 'CREATE DATABASE veriform_build OWNER vif'
-#      cd <veriform-ui>/Backend && \
-#        DATABASE_URL=postgres://vif:vif@localhost:5432/veriform_build \
-#        npx drizzle-kit migrate
-#    Re-run the migrate step whenever new migrations land, or the agent's gates
-#    will fail against a schema older than the code under test.
-# 3. The agent must be TOLD all of this. Networking it to the database does not
+#
+#    Then the bootstrap grants that CANNOT be migrations, because they are what
+#    lets migrations run at all. `drizzle-kit migrate` issues CREATE SCHEMA IF NOT
+#    EXISTS on every run, which needs CREATE on the database; and the drizzle
+#    bookkeeping table stays owned by whoever first applied migrations (`vif`).
+#    Run once per build database, as the superuser:
+#      docker exec veriform-postgres psql -U vif -d veriform_build \
+#        -c 'GRANT CREATE ON DATABASE veriform_build TO veriform_owner' \
+#        -c 'ALTER SCHEMA drizzle OWNER TO veriform_owner' \
+#        -c 'ALTER TABLE drizzle.__drizzle_migrations OWNER TO veriform_owner'
+#
+#    Without these three, the agent's first migration dies with
+#    "permission denied for database veriform_build" — an environment fault it is
+#    instructed not to work around, so the whole run reports BLOCKED.
+#
+#    Re-run migrations whenever new ones land, or the agent's gates will fail
+#    against a schema older than the code under test.
+#
+# 4. The agent must be TOLD all of this. Networking it to the database does not
 #    stop it inferring `localhost`, failing, and costing out `apt-get install
 #    postgresql`. Copy `builder-env.veriform.md` to the workspace root as
 #    `.builder_env.md` and it lands verbatim in every .clinerules — see README §5.5.
@@ -36,6 +74,15 @@
 #   docker compose -f docker-compose.yml -f docker-compose.veriform.yml \
 #     run --rm cline-builder \
 #     bash -c 'timeout 5 bash -c "</dev/null >/dev/tcp/veriform-postgres/5432" && echo REACHABLE'
+#
+# And verify RLS is genuinely enforced for the role the agent will use — this must
+# FAIL, and its failure is the proof:
+#   docker compose -f docker-compose.yml -f docker-compose.veriform.yml \
+#     run --rm cline-builder \
+#     bash -c 'psql "$DATABASE_URL" -c "select count(*) from jobs"'
+#   expected: ERROR ... no tenant or person context is set
+#   if it returns a NUMBER, the agent is connected with too much privilege and
+#   every isolation gate in the run is worthless.
 #
 # A skipped gate is not a passed gate: entrypoint.sh classifies a refused
 # connection as an environment fault and self-reports completion, so a build run
@@ -47,7 +94,7 @@ services:
       - ai-workspace-net
       - backend_default
     environment:
-      # BOTH default to veriform_build — never `veriform`, never `veriform_test`.
+      # ── Database. ALWAYS veriform_build — never `veriform`, never `veriform_test`.
       #
       # `veriform`  is the dev database. The build agent runs migrations, seeds and
       #             destructive setup unattended; pointed here it would clobber real
@@ -56,14 +103,28 @@ services:
       #             on the host. Sharing it means an unattended build and a human
       #             test run truncating the same tables at the same time, producing
       #             failures in both that belong to neither.
+      # `veriform_uitest` / `veriform_restoretest` are likewise not the agent's.
       # `veriform_build` is the build agent's own. Disposable, and safe to reset:
       #             docker exec veriform-postgres psql -U vif -d postgres \
       #               -c 'DROP DATABASE veriform_build' -c 'CREATE DATABASE veriform_build OWNER vif'
-      #             then re-apply migrations (see the header of this file).
+      #             then re-apply the bootstrap grants and migrations (see header).
       #
-      # To deliberately target another database, set DATABASE_URL in the environment.
-      - DATABASE_URL=${DATABASE_URL:-postgres://vif:vif@veriform-postgres:5432/veriform_build}
-      - TEST_DATABASE_URL=${TEST_DATABASE_URL:-postgres://vif:vif@veriform-postgres:5432/veriform_build}
+      # The application role: owns nothing, NOBYPASSRLS, policies apply.
+      - DATABASE_URL=${DATABASE_URL:-postgres://veriform_app:${VERIFORM_APP_PASSWORD:?set VERIFORM_APP_PASSWORD in br.ai.n/.env — see header}@veriform-postgres:5432/veriform_build}
+      - TEST_DATABASE_URL=${TEST_DATABASE_URL:-postgres://veriform_app:${VERIFORM_APP_PASSWORD}@veriform-postgres:5432/veriform_build}
+      # The owner role: owns the tables, runs migrations, still NOBYPASSRLS.
+      - MIGRATION_DATABASE_URL=${MIGRATION_DATABASE_URL:-postgres://veriform_owner:${VERIFORM_OWNER_PASSWORD:?set VERIFORM_OWNER_PASSWORD in br.ai.n/.env — see header}@veriform-postgres:5432/veriform_build}
+      # Tenant-isolation probes. Same database, unprivileged roles, pooled variant
+      # through PgBouncer so `SET LOCAL` non-persistence is actually exercised.
+      - RLS_PROBE_DATABASE_URL=postgres://veriform_app:${VERIFORM_APP_PASSWORD}@veriform-postgres:5432/veriform_build
+      - RLS_PROBE_POOLED_DATABASE_URL=postgres://veriform_app:${VERIFORM_APP_PASSWORD}@veriform-pgbouncer:6432/veriform_build
+      # Rate-limit / quota counters (RBAC-06c). COUNTERS ONLY — this Redis runs
+      # with persistence off and an LRU eviction policy, so a restart or a memory
+      # ceiling drops keys. Nothing durable may be written to it; see
+      # builder-env.veriform.md. It is started by veriform's own
+      # Backend/docker-compose.yml, so it sits on `backend_default` alongside
+      # Postgres and is reached by container name.
+      - REDIS_URL=${REDIS_URL:-redis://veriform-redis:6379}
 
 networks:
   backend_default:
