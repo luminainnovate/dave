@@ -345,6 +345,23 @@ gpu_lock = asyncio.Lock()
 http_client: httpx.AsyncClient = None
 vram_locked = False
 expert_warm_until = 0
+# Wall clock of the last turn that actually used the Expert.
+#
+# Deliberately NOT expert_warm_until, which is a deadline and is reset to 0 all
+# over this file to mean "not warm any more". The janitor needs a last USE, and
+# reading a cleared deadline as one is how it came to compute idleness against
+# the epoch: `now > 0 + VLLM_SLEEP_AFTER_IDLE` is true for every clock since
+# 1970, so a freshly started orchestrator slept a working engine on its first
+# five-minute tick and logged "~29821919 min idle" while doing it.
+expert_last_used = time.time()
+# Build containers launched and not yet seen to exit, by container name.
+#
+# The vLLM expert is a SHARED resident server and a builder talks to it DIRECTLY
+# - that traffic never passes through this process, so neither the warm timer
+# nor the sleep timer can see a build working. While this set is non-empty the
+# engine is somebody's backend: an exiting sibling container may not sleep it
+# and neither may the idle janitor. _docker_safety_monitor owns the removals.
+_live_builds: set = set()
 expert_mode = "coding"  # "general" or "coding"
 last_comfy_history_count = 0  # Track ComfyUI history count for automated pings
 
@@ -1371,7 +1388,15 @@ async def periodic_cleanup():
                 await free_comfyui()
 
                 # Release the expert once it has been idle long enough.
-                if not vram_locked and time.time() > expert_warm_until:
+                #
+                # A live build is the one user of the engine this process cannot
+                # observe, so ask the registry before believing either timer.
+                if _live_builds:
+                    logger.info(
+                        f"Expert idle timers held: {len(_live_builds)} build(s) live "
+                        f"({', '.join(sorted(_live_builds))})."
+                    )
+                elif not vram_locked and time.time() > expert_warm_until:
                     expert_config = _resolve_config(EXPERT_MODEL)
                     provider = expert_config.get("provider", "ollama")
 
@@ -1384,14 +1409,16 @@ async def periodic_cleanup():
                     elif provider == "vllm" and VLLM_SLEEP_AFTER_IDLE > 0:
                         # The second timer. expert_warm_until is already in the
                         # past here, so this is the extra grace on top of it.
-                        if time.time() > expert_warm_until + VLLM_SLEEP_AFTER_IDLE:
+                        # A cleared deadline means "not warm", not "idle since
+                        # the epoch" - fall back to the last real use.
+                        idle_since = expert_warm_until or expert_last_used
+                        if time.time() > idle_since + VLLM_SLEEP_AFTER_IDLE:
                             base_url = _get_base_url(expert_config)
                             # is-None means we cannot tell (sleep mode off, or the
                             # server is gone). Only sleep on a definite False - never
                             # act on an unknown, and never re-sleep a sleeping engine.
                             if await _vllm_is_sleeping(base_url) is False:
-                                idle_min = (time.time() - expert_warm_until
-                                            + VLLM_SLEEP_AFTER_IDLE) / 60.0
+                                idle_min = (time.time() - idle_since) / 60.0
                                 logger.info(
                                     f"Expert idle past its sleep grace. Sleeping vLLM "
                                     f"{EXPERT_MODEL} to release VRAM "
@@ -1853,13 +1880,38 @@ async def health_check():
         "expert_warm": time.time() < expert_warm_until,
         "expert_mode": expert_mode,
         "vram_locked": vram_locked,
+        "live_builds": sorted(_live_builds),
         "gpu_lock_held": gpu_lock.locked()
     })
 
 @app.post("/v1/shutdown_expert")
 async def shutdown_expert():
-    """Explicitly shutdown any managed expert processes and release VRAM."""
+    """
+    Explicitly shutdown any managed expert processes and release VRAM.
+
+    Declines while another build is live. This endpoint is called from the
+    builder's EXIT trap, which fires once per CONTAINER rather than once per
+    build: with two builds overlapping, the first to finish would sleep the
+    shared engine out from under the second AND clear vram_locked - which
+    re-armed the idle janitor to sleep it again every five minutes for the rest
+    of the surviving build, stalling it mid-turn each time.
+
+    _docker_safety_monitor deregisters a container before calling this, so the
+    last build out still releases the VRAM.
+    """
     global expert_warm_until, vram_locked
+
+    if _live_builds:
+        logger.info(
+            f"shutdown_expert: declining - {len(_live_builds)} build(s) still live "
+            f"({', '.join(sorted(_live_builds))}). The expert is shared."
+        )
+        return JSONResponse(content={
+            "status": "declined",
+            "reason": "builds_live",
+            "live_builds": sorted(_live_builds),
+        })
+
     expert_warm_until = 0
     vram_locked = False
     
@@ -2035,7 +2087,7 @@ async def _orchestrate(request: Request):
     """
     Orchestration, triage, interception, and VRAM management for one chat turn.
     """
-    global vram_locked, expert_warm_until, expert_mode, last_comfy_history_count
+    global vram_locked, expert_warm_until, expert_last_used, expert_mode, last_comfy_history_count
 
     body = await request.json()
     is_streaming = body.get("stream", True)
@@ -2452,6 +2504,14 @@ async def _orchestrate(request: Request):
             else:
                 logger.info("Triage: Router model sufficient.")
                 tracer.route(target_model, "triage: router sufficient")
+
+        # One place to stamp the last use, rather than at each of the five
+        # branches above that extend the warm deadline. It also covers the two
+        # that deliberately do NOT extend it (vram_locked holds the expert
+        # resident, so the deadline is left alone) - those turns still used the
+        # model, and the sleep timer must count from them.
+        if target_model == EXPERT_MODEL:
+            expert_last_used = current_time
 
         # --- Agent Detection ---
         # Detect if this is an automated agent (Cline or Distillation pass)
@@ -3497,6 +3557,11 @@ async def _trigger_build_pipeline(messages: list, extra_env: Optional[dict] = No
         logger.info(f"Launching pipeline command: {' '.join(cmd)}")
         subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+        # Registered before the monitor starts, not inside it: the monitor
+        # sleeps 10s before its first poll, and the builder's own EXIT trap can
+        # fire inside that window on a fast failure.
+        _live_builds.add(container_name)
+
         # Launch the Safety Monitor to ensure VRAM is released when container stops/deleted
         asyncio.create_task(_docker_safety_monitor(
             container_name, workspace=abs_target_dir, base_branch=build_base))
@@ -3619,6 +3684,7 @@ async def _docker_safety_monitor(container_name: str, workspace: str = "",
                 # Container likely deleted or vanished
                 logger.info(f"[Safety Monitor] Container {container_name} vanished. Releasing VRAM.")
                 _record_finished_build(container_name, workspace, base_branch)
+                _live_builds.discard(container_name)
                 await shutdown_expert()
                 break
             
@@ -3626,6 +3692,7 @@ async def _docker_safety_monitor(container_name: str, workspace: str = "",
             if status == "false":
                 logger.info(f"[Safety Monitor] Container {container_name} stopped. Releasing VRAM.")
                 _record_finished_build(container_name, workspace, base_branch)
+                _live_builds.discard(container_name)
                 await shutdown_expert()
                 break
                 
@@ -3636,6 +3703,11 @@ async def _docker_safety_monitor(container_name: str, workspace: str = "",
         logger.info(f"[Watchdog] Monitor for {container_name} cancelled.")
     except Exception as e:
         logger.error(f"[Watchdog] Error monitoring {container_name}: {e}")
+    finally:
+        # A monitor that died owes the engine its deregistration. Leaving the
+        # name behind would pin the expert awake for the life of the process -
+        # the opposite failure to the one above, and just as quiet.
+        _live_builds.discard(container_name)
 
 
 async def _trigger_build_pipeline_safe(

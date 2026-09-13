@@ -42,6 +42,27 @@ export GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:-$GIT_AUTHOR_EMAIL}"
 # Ensure that we release the GPU expert model when the container shuts down
 # regardless of success or failure.
 cleanup_vram() {
+    # Not ours to release under a resident provider. This trap was written when
+    # the expert was a llama.cpp subprocess the orchestrator owned and this
+    # container was its only other user. A vLLM expert is a SHARED server that
+    # outlives every build, so an exiting container asking for it to be released
+    # is asking on behalf of whoever is still using it - and when two builds
+    # overlap, that is the sibling container still mid-iteration.
+    #
+    # The orchestrator's safety monitor releases the expert when the LAST build
+    # exits, which is the same guarantee this trap was reaching for, minus the
+    # cross-container kill. (shutdown_expert also declines while builds are
+    # live, so this is belt and braces - but the log line it would print is
+    # noise on a path that should not be asking in the first place.)
+    # ${...:-} because this is an EXIT trap under `set -u`: it is installed
+    # before CLINE_PROVIDER is parsed out of the config, so an early abort fires
+    # it while the variable is still unbound. Unguarded, the trap would itself
+    # die on the unbound name and release nothing at all.
+    if [ "${CLINE_PROVIDER:-}" = "vllm" ]; then
+        echo ""
+        echo "  ℹ️  Expert is a resident vLLM server; leaving it to the orchestrator."
+        return 0
+    fi
     echo ""
     echo "========================================"
     echo "🧹 VRAM VACUUM: Releasing GPU Expert..."
@@ -723,11 +744,24 @@ CLINE_ASSUMED_CTX=128000
 # port with nothing behind it and got ConnectionRefused on its first request,
 # after the /props assertion had already shrugged at the same dead socket.
 #
-# /internal/model/load blocks until the server answers /health, so returning
-# from here means the model is genuinely ready. It is idempotent: an already
-# running server is reported ready and returns immediately.
+# vLLM is the same hole with a quieter floor. The server is resident, so nothing
+# is refused - but with --enable-sleep-mode the engine offloads its weights and
+# a sleeping engine still answers /health AND still reports its full window on
+# /v1/models. So the assertion below passes, Cline is handed a port with no
+# weights behind it, and the build hangs on its first completion with no error
+# anywhere. Measured on a resumed !approve run: the last line printed was
+# "[hook:agent_start]" and nothing followed it.
+#
+# /internal/model/load covers both: _provider_load waits on /health for
+# llama.cpp and wakes a sleeping engine for vLLM. It is idempotent - an already
+# running, already awake server is reported ready and returns immediately - and
+# it runs HERE, after distillation, so the wake does not put ~20 GB back on the
+# card while a pass that needs it elsewhere is still running.
 ensure_cline_model_loaded() {
-    [ "$CLINE_PROVIDER" = "llamacpp" ] || return 0
+    case "$CLINE_PROVIDER" in
+        llamacpp|vllm) ;;
+        *) return 0 ;;
+    esac
 
     echo "  ⏳ Loading ${CLINE_MODEL} via the orchestrator..."
     local body http
@@ -784,6 +818,23 @@ vllm_props() {
     PROPS_HTTP="${PROPS_HTTP:-000}"
     PROPS_CTX=$(jq -r '.data[0].max_model_len // empty' \
                 /tmp/props.json 2>/dev/null || echo "")
+
+    # Servable is not the same question as reachable. /v1/models is served from
+    # the config and answers with the full window while the weights sit in CPU
+    # RAM, so it cannot distinguish a working engine from a sleeping one - the
+    # window it reports is exactly as correct and exactly as useless.
+    #
+    # "unknown" is not "awake": a 404 means the server was started without
+    # --enable-sleep-mode (so it cannot be asleep) but a timeout means we could
+    # not ask. Neither is a negative answer, and only a definite "true" is acted
+    # on below.
+    PROPS_SLEEPING=$(curl -s -m 10 \
+                     ${VLLM_API_KEY:+-H "Authorization: Bearer $VLLM_API_KEY"} \
+                     "${CLINE_BASE_URL}/is_sleeping" 2>/dev/null \
+                     | jq -r 'if type == "object" and has("is_sleeping")
+                              then (.is_sleeping | tostring) else "unknown" end' \
+                       2>/dev/null || echo "unknown")
+    PROPS_SLEEPING="${PROPS_SLEEPING:-unknown}"
 }
 
 assert_cline_ctx() {
@@ -817,6 +868,28 @@ assert_cline_ctx() {
                 echo "    The build agent has no model to talk to. Check that the orchestrator"
                 echo "    is running and that its VRAM sweep has not just killed the server."
             fi
+            return 1
+        fi
+
+        # A sleeping engine answers everything above and serves nothing. Fatal
+        # rather than a wake-and-carry-on: ensure_cline_model_loaded already
+        # asked the orchestrator to wake it moments ago, so finding it asleep
+        # here means either that wake failed or something slept it in between -
+        # and both are worth reading about now rather than inferring later from
+        # a build that stopped printing.
+        if [ "$CLINE_PROVIDER" = "vllm" ] && [ "$PROPS_SLEEPING" = "true" ]; then
+            echo ""
+            echo "  ✗ FATAL: the vLLM engine at ${CLINE_BASE_URL} is ASLEEP."
+            echo "      /v1/models answered ${actual:-?} tokens, but the weights are in CPU"
+            echo "      RAM, not on the GPU. Cline's first completion would hang with no"
+            echo "      error printed anywhere."
+            echo ""
+            echo "    Wake it:  curl -X POST ${CLINE_BASE_URL}/wake_up"
+            echo "    Then ask what slept it. Candidates, in order of likelihood:"
+            echo "      - the orchestrator's idle janitor (periodic_cleanup)"
+            echo "      - another build container exiting (/v1/shutdown_expert)"
+            echo "      - a manual POST /sleep"
+            echo "    The orchestrator's /health reports live_builds and vram_locked."
             return 1
         fi
 
