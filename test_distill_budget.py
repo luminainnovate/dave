@@ -152,6 +152,39 @@ def test_taking_the_floor_cannot_cost_the_pass_its_single_pass_call():
               total <= facts, f"{total} vs {facts}")
 
 
+def test_the_survey_leaves_room_for_the_first_evidence_round():
+    """
+    The regression this exists for: with the survey spending everything the
+    solver offered, the payload came back 454 tokens over the computed figure -
+    read_evidence budgets file content, not the block that wraps it - and the
+    evidence floor on top of that crossed the facts budget. The live log said so:
+    "window has 0 chars spare ... the payload (~103081 tok) already exceeds the
+    merge budget, so this call extracts either way". Extraction is the lossy path,
+    which is what the whole branch exists to keep the pass off.
+    """
+    d = _distill()
+    window = 131072
+    system = d.est_tokens(open(ARCHITECT, encoding="utf-8").read())
+    facts, _ = d.solve_merge_budget(
+        window, system + d.est_tokens("### CURRENT TASK\n"))
+
+    payload = 50449                      # after the build-issues reduction
+    survey = d.solve_survey_budget(window, system, payload)
+    check("the survey still gets a real budget", survey > 100000, survey)
+
+    # What the payload becomes once the survey block is in it, framing included.
+    after = payload + (survey + d.EVIDENCE_FRAMING_RESERVE_CHARS) // d.CHARS_PER_TOKEN_DENSE
+    evidence = d.solve_addendum_budget(window, system, after)
+    check("a later evidence round solves to its floor without needing it",
+          evidence >= d.EVIDENCE_MIN_BUDGET_CHARS, evidence)
+
+    final = after + max(evidence, d.EVIDENCE_MIN_BUDGET_CHARS) // d.CHARS_PER_TOKEN_DENSE
+    check("survey + evidence together still fit one merge call",
+          final <= facts, f"{final} vs {facts}")
+    check("and the slack left is the held-back answer reserve",
+          facts - final >= d.ANSWER_MAX_TOKENS, facts - final)
+
+
 def test_a_zero_budget_survey_says_so_instead_of_returning_silently():
     d = _distill()
     import io
@@ -187,9 +220,10 @@ def test_blocker_targets_reads_what_the_pass_asked_for():
 class _ScriptedPass:
     """A pass that emits a scripted sequence of results, one per call."""
 
-    def __init__(self, results, resolved):
+    def __init__(self, results, resolved, include_limit=None):
         self.results = list(results)
         self.resolved = list(resolved)   # paths the resolver returns, per round
+        self.include_limit = include_limit
         self.calls = 0
 
     def call_llm(self, client, model_config, prompt, target, prior):
@@ -201,7 +235,10 @@ class _ScriptedPass:
         return d_mod.BlockerPaths(self.resolved[idx], [])
 
     def read_evidence(self, project_dir, paths, budget, absent=None, **kw):
-        return d_mod.Evidence(f"\n<E>{','.join(paths)}</E>\n", list(paths))
+        # `include_limit` models the real budget behaviour: read_evidence spends
+        # one shared budget in order and leaves the rest in <NOT_READ>.
+        included = list(paths)[:self.include_limit] if self.include_limit else list(paths)
+        return d_mod.Evidence(f"\n<E>{','.join(included)}</E>\n", included)
 
 
 def _run(scripted, pass_key="architect", max_rounds=None):
@@ -275,6 +312,59 @@ def test_the_ceiling_still_bounds_an_endless_trail():
     check("never more rounds than the ceiling",
           scripted.calls <= d_mod.EVIDENCE_MAX_ROUNDS["architect"], scripted.calls)
     check("still blocked", d_mod.detect_blockers(out) != [], out[:80])
+
+
+def test_a_partly_read_request_reports_the_deferral_without_crashing():
+    """
+    The branch the round-accounting rename broke: when the budget runs out
+    mid-request, the deferral line quotes the ceiling. It read the old
+    `max_rounds`, which is None on the default path, and every architect pass
+    whose blocker named more files than one budget could hold died on
+    `'>=' not supported between instances of 'int' and 'NoneType'`.
+
+    Only reachable when the evidence is partly delivered, which is why the first
+    round of tests walked straight past it.
+    """
+    global d_mod
+    d_mod = _distill()
+    scripted = _ScriptedPass(
+        results=[
+            "# BLOCKED\n- `Backend/src/db/schema.ts::feedback` — need its columns",
+            "# BLOCKED\n- `Backend/src/schemas/wire.ts::Wire` — need its shape",
+            "# 1. Blockers\n- BLOCKER: - none\n\n# 2. The design\n- it is designed",
+        ],
+        resolved=[["Backend/src/db/schema.ts", "Backend/src/schemas/wire.ts",
+                   "src/types/domain.ts"]] * 3,
+        include_limit=1,          # one file per round fits the budget
+    )
+    out = _run(scripted)
+
+    check("the pass ran rather than crashing", scripted.calls >= 2, scripted.calls)
+    check("and reached a design", "it is designed" in out, out[:120])
+
+
+def test_an_unread_path_stays_askable_next_round():
+    """The deferral is only useful if the unread files are not marked supplied."""
+    global d_mod
+    d_mod = _distill()
+    scripted = _ScriptedPass(
+        results=["# BLOCKED\n- `src/a.ts::Alpha` — need it",
+                 "# BLOCKED\n- `src/b.ts::Beta` — need it",
+                 "# 1. Blockers\n- BLOCKER: - none\n\n# 2. The design\n- done"],
+        resolved=[["src/a.ts", "src/b.ts"]] * 3,
+        include_limit=1,
+    )
+    reads = []
+    inner = scripted.read_evidence
+
+    def spy(project_dir, paths, budget, absent=None, **kw):
+        reads.append(list(paths))
+        return inner(project_dir, paths, budget, absent, **kw)
+
+    scripted.read_evidence = spy
+    _run(scripted)
+    check("round 2 re-offers the file round 1 could not afford",
+          len(reads) >= 2 and "src/b.ts" in reads[1], reads)
 
 
 def test_an_explicit_max_rounds_still_caps_both_meters():
