@@ -343,6 +343,7 @@ DU_EXCLUDES=(
     --exclude=.knowledge_base
     --exclude=.cline_logs
     --exclude=.cline_context
+    --exclude=.claude
 )
 
 check_project_size() {
@@ -368,8 +369,52 @@ check_project_size() {
 # never worth a review turn. The cap is a context guard, not a correctness one -
 # a build that rewrote 200 files cannot be reviewed in one turn anyway, and the
 # newest 25 are where this iteration's work is.
+#
+# `.claude` is pruned for a different reason than the rest. It is not noise: it
+# holds `.claude/worktrees/`, which are FULL CHECKOUTS of the same project. A
+# touched file in one of them is a real file, so `-newer` matches it and the
+# review prompt then lists `.claude/worktrees/<branch>/Backend/src/lib/x.ts`
+# beside `Backend/src/lib/x.ts` - the same code at two paths, only one of which
+# the build is allowed to change. distill.py's scanner already skips hidden
+# directories for this reason (see its comment on the 71% duplication it
+# measured); this is the same exclusion on the review side, which had been
+# missed.
 REVIEW_MARKER="/workspace/.cline_context/.review_marker"
 REVIEW_MAX_FILES=25
+
+# What the last phase ACTUALLY left on disk, with line counts.
+#
+# Every other section of .session_state.md is the agent's own account of its
+# work: `Previous Step Summaries` greps the build log for the lines the agent
+# printed about itself, and `.build_issues.md` and `analysis_notes.md` are files
+# the agent writes. Nothing in it was ever observed.
+#
+# That is how a build spends an iteration acting on a file that does not exist
+# in the state it believes. In the run this was written for, the agent had
+# written a test file's header claiming "Covers TC1-TC8, TC1', M1, M2", and
+# several of those test bodies never landed - the writes went through a staging
+# file and a copy, and some chunks were lost on the way. The agent never read
+# the file back, so its summary said TC1-TC8, the summary became the next
+# iteration's memory, and the 364-line file on disk was invisible to the whole
+# pipeline. A sub-agent eventually read it and was disbelieved.
+#
+# `<N> lines` next to a path is the cheapest possible contradiction of that: it
+# costs one `wc -l` per changed file and needs no model, no git and no network.
+# git would not do here - the file in that run was UNTRACKED, so `git diff`
+# reported nothing about the one file that mattered. changed_sources() is
+# mtime-based and sees untracked files.
+observed_changes() {
+    local path lines
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        if [ -f "/workspace/$path" ]; then
+            lines=$(wc -l < "/workspace/$path" 2>/dev/null | tr -d ' ')
+            echo "- ${path} — ${lines:-?} lines"
+        else
+            echo "- ${path} — (no longer present)"
+        fi
+    done < <(changed_sources)
+}
 
 changed_sources() {
     [ -f "$REVIEW_MARKER" ] || return 0
@@ -377,10 +422,10 @@ changed_sources() {
         \( -name .git -o -name node_modules -o -name .venv -o -name venv \
            -o -name __pycache__ -o -name .pytest_cache -o -name .knowledge_base \
            -o -name .cline_logs -o -name .cline_context -o -name dist \
-           -o -name build -o -name .next -o -name target \) -prune -o \
+           -o -name build -o -name .next -o -name target -o -name .claude \) -prune -o \
         -type f -newer "$REVIEW_MARKER" -print 2>/dev/null \
         | grep -vE '\.(log|lock|pyc|map|min\.js|min\.css)$' \
-        | grep -vE '/(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|\.gitignore|\.build_complete)$' \
+        | grep -vE '/(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|\.gitignore|\.build_complete|\.clinerules)$' \
         | sed 's|^/workspace/||' \
         | sort \
         | head -n "$REVIEW_MAX_FILES"
@@ -494,6 +539,7 @@ SESSION_STATE_AUDIT_BYTES=4000
 SESSION_STATE_NOTES_BYTES=3000
 SESSION_STATE_SUMMARY_BYTES=6000
 SESSION_STATE_LINE_CHARS=300
+SESSION_STATE_OBSERVED_BYTES=2500
 
 # =============================================================================
 # TEST GATE
@@ -622,7 +668,27 @@ generate_session_state() {
     echo "- **Step**: ${STEP}" >> "$STATE_FILE"
     echo "- **Timestamp**: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$STATE_FILE"
     echo "" >> "$STATE_FILE"
-    
+
+    # Observed state, first and above everything the agent said about itself.
+    # See observed_changes() for why this section exists and why it is not git.
+    local OBSERVED
+    OBSERVED=$(observed_changes 2>/dev/null | head -c "$SESSION_STATE_OBSERVED_BYTES")
+    if [ -n "$OBSERVED" ]; then
+        {
+            echo "## Files on disk, as measured just now"
+            echo ""
+            echo "> These line counts were read from the filesystem a moment ago. Every"
+            echo "> other section below is what the agent SAID it did. Where the two"
+            echo "> disagree, this section is right. If a file here is shorter than the"
+            echo "> work you remember doing on it, your edits did not all land: re-read"
+            echo "> the file before you touch it, and do not trust your memory of its"
+            echo "> contents."
+            echo ""
+            echo "$OBSERVED"
+            echo ""
+        } >> "$STATE_FILE"
+    fi
+
     # Inject known issues if they exist
     if [ -f "/workspace/.cline_context/.build_issues.md" ]; then
         echo "## Known Issues (from previous steps)" >> "$STATE_FILE"
@@ -1035,6 +1101,23 @@ while [ $ITERATION -lt $MAX_ITERATIONS ] && [ "$BUILD_COMPLETE" = false ]; do
         fi
     fi
 
+    # --- Skeleton Refresh ---
+    #
+    # After the re-plan, because a re-plan rewrites .clinerules wholesale through
+    # assemble_clinerules and would drop the section this puts back.
+    #
+    # Unconditional, unlike the re-plan: it runs no model, so there is no budget
+    # to protect and no trigger worth getting wrong. On iteration 1 it ADDS the
+    # section - distillation has never written one - and on every iteration after
+    # that it replaces a map of code the agent has since been editing.
+    set +e
+    PYTHONUNBUFFERED=1 python3 /app/distill.py --refresh-skeleton
+    SKELETON_EXIT=$?
+    set -e
+    if [ $SKELETON_EXIT -ne 0 ]; then
+        echo "  ⚠ Skeleton refresh exited ${SKELETON_EXIT}; continuing with .clinerules as it stands."
+    fi
+
 # --- Build Phase ---
     echo "  🔧 Running Cline (Build mode)..."
     generate_session_state "$ITERATION" "build"
@@ -1090,10 +1173,45 @@ ${BUILD_MSG}"
     # clean. quality_audit.md existed for exactly those findings but nothing ever
     # systematically produced them - the build agent appended to it only when it
     # happened to notice something while working. This is the producer.
-    REVIEW_FILES=""
-    if [ "$REVIEW_ENABLED" = "true" ]; then
-        REVIEW_FILES=$(changed_sources)
+
+    # Computed unconditionally, not just when review is on: the claim-vs-disk
+    # guard below needs it either way.
+    REVIEW_FILES=$(changed_sources)
+
+    # THE BUILD CLAIMED WORK AND WROTE NOTHING.
+    #
+    # The general shape of the failure this pipeline could not see. An agent
+    # that believes it edited a file, and did not, ends its turn with
+    # attempt_completion and a summary of work that exists only in its own
+    # account - and generate_session_state then carries that summary forward as
+    # this project's memory. Nothing downstream can tell it from real work: the
+    # verify phase asks the agent, the safety phase asks the agent, and the test
+    # gate only runs at the very end.
+    #
+    # An empty changeset against a completion claim is objective and free to
+    # check. It is not proof of the specific failure - a genuinely finished
+    # iteration also writes nothing - which is why this records an issue rather
+    # than failing the build: .build_issues.md is read by the next iteration and
+    # by the re-plan, so the discrepancy steers the next round instead of
+    # silently becoming fact.
+    BUILD_LOG="/workspace/.cline_logs/build_log_iter_${ITERATION}.txt"
+    if [ -z "$REVIEW_FILES" ] && [ -f "$BUILD_LOG" ] \
+       && grep -qiE "attempt_completion|FINAL SUMMARY" "$BUILD_LOG" 2>/dev/null; then
+        echo "  ⚠️  Build phase claimed completion but wrote no source files."
+        {
+            echo ""
+            echo "## Claim/disk mismatch — iteration ${ITERATION} ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+            echo ""
+            echo "The build phase ended with a completion claim, but no source file"
+            echo "under /workspace was modified during it."
+            echo ""
+            echo "Either the work was already done before this iteration started, or"
+            echo "the edits did not reach disk. Before reporting any of that work as"
+            echo "done again, READ the files it was supposed to touch and confirm"
+            echo "their contents. Do not re-summarise from memory."
+        } >> /workspace/.cline_context/.build_issues.md
     fi
+
     if [ "$REVIEW_ENABLED" != "true" ]; then
         echo "  ⏭️  Review phase disabled (limits.review_enabled = false)."
     elif [ -z "$REVIEW_FILES" ]; then
