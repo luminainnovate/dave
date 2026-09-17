@@ -59,6 +59,37 @@ services:
       # Prompt bodies are referenced by relative path from agent_config.json,
       # so they must be present next to it inside the container.
       - ./cline-builder/prompts:/app/prompts:ro
+    # Mask the developer's Claude Code state out of the build's view.
+    #
+    # /workspace is a bind mount of an ACTUAL working tree, and that tree can
+    # hold `.claude/worktrees/` — full checkouts of the same project. Measured on
+    # a live workspace: six of them, so `Backend/src/lib/breakglass.ts` resolved
+    # at seven paths, all of them real files, only one of which the build is
+    # allowed to change. distill.py's scanner skips hidden directories for this
+    # reason (see its note on the 71% duplication it measured), but that only
+    # cleans the skeleton — the agent's own read_files and search_codebase see
+    # whatever is on disk.
+    #
+    # There is no way to restrain those tools from inside Cline 3.0.55. It has no
+    # .clineignore; `permissions.allow`/`permissions.deny` belong to a vendored
+    # Claude Code settings validator and are not consulted by its agent loop; and
+    # `--hooks-dir` sets CLINE_HOOKS_DIR, which nothing in the binary reads (a
+    # correctly-named executable hook fires from no location — verified against a
+    # stub provider). So the exclusion is done where it cannot be argued with: an
+    # empty tmpfs over the directory, and inside the container it simply is not
+    # there.
+    #
+    # tmpfs and not `-v /dev/null` or a :ro bind, because compose applies it after
+    # the /workspace mount (shallower paths first) and it needs no host-side
+    # scratch directory to exist. It is writable, and discarded with the
+    # container — which also means an agent that decides to "fix" the developer's
+    # .claude/ writes into nothing instead of into their tree.
+    #
+    # NOT a `--tmpfs` flag on the launch: `docker compose run` has no such option
+    # (only plain `docker run` does), and orchestrator.py launches through
+    # compose. It belongs here or nowhere.
+    tmpfs:
+      - /workspace/.claude
     environment:
       - OLLAMA_HOST=http://host.docker.internal:11434
       - AGENT_CONFIG_PATH=/app/agent_config.json

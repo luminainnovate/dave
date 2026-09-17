@@ -4722,7 +4722,7 @@ def build_call_graph(files_data: list) -> str:
     return body
 
 
-def get_symbol_skeleton(project_dir: str) -> str:
+def get_symbol_skeleton(project_dir: str, max_chars: int = None) -> str:
     """
     Build a navigable map of the project's declarations.
 
@@ -4731,13 +4731,19 @@ def get_symbol_skeleton(project_dir: str) -> str:
     to - drops whole files off the end of the directory walk, so the architect
     silently never learns that, say, engagement-card.tsx exists. Shedding detail
     before shedding files keeps every file represented.
+
+    `max_chars` overrides the module cap for callers working to a different
+    budget. The distillation passes are sized against EXPERT_CTX; the copy
+    embedded in .clinerules is charged to the BUILD agent's window on every
+    phase of every iteration, which is a different and tighter budget.
     """
+    cap = MAX_SKELETON_CHARS if max_chars is None else max_chars
     files_data = scan_project_files(project_dir)
 
     for detail in SKELETON_TIERS:
         blocks, footer = _render_skeleton(files_data, detail)
         total = sum(len(b) for b in blocks) + len(footer)
-        if total <= MAX_SKELETON_CHARS:
+        if total <= cap:
             header = "[PROJECT SYMBOL SKELETON]"
             if detail.note:
                 header += f"\n{detail.note}"
@@ -4751,10 +4757,10 @@ def get_symbol_skeleton(project_dir: str) -> str:
     blocks, footer = _render_skeleton(files_data, SKELETON_TIERS[-1])
     # Fitted, not seeded. An unbounded roll-up spent the entire cap before the
     # first entry was considered - see _fit_bare_footer.
-    footer = _fit_bare_footer(footer, int(MAX_SKELETON_CHARS * BARE_FOOTER_CAP_FRACTION))
+    footer = _fit_bare_footer(footer, int(cap * BARE_FOOTER_CAP_FRACTION))
     skeleton, total, kept = ["[PROJECT SYMBOL SKELETON]"], len(footer), 0
     for block in blocks:
-        if total + len(block) > MAX_SKELETON_CHARS:
+        if total + len(block) > cap:
             break
         skeleton.append(block)
         total += len(block)
@@ -4766,6 +4772,154 @@ def get_symbol_skeleton(project_dir: str) -> str:
           f"{kept} of {len(blocks)} entries carry detail, roll-up trimmed to "
           f"{len(footer)} chars", flush=True)
     return "\n".join(skeleton)
+
+
+# =============================================================================
+# THE SKELETON THE AGENT WAS ALREADY TOLD IT HAD
+# =============================================================================
+# Two instructions the build agent receives on every phase:
+#
+#   .clinerules  "SYMBOL SKELETON FIRST: Your .clinerules contains a Symbol
+#                 Skeleton with imports, function names and - where they fitted -
+#                 their signatures. Use this to navigate, not readFile. If a
+#                 signature is there, do not open the file to learn it."
+#   entrypoint   "Use the SYMBOL SKELETON in '.clinerules' to navigate, and read
+#                 only the specific files a task names, in ranges, never whole."
+#
+# assemble_clinerules never put one there. The skeleton was built and spent on
+# the distillation passes - it is what the architect and engineer map a request
+# onto files through - and the assembled document carries only their prose
+# output. Measured on a live workspace: a 29572-byte .clinerules whose only
+# occurrence of "SYMBOL SKELETON" was the rule telling the agent to use it.
+#
+# So the agent was ordered to navigate by a map it did not have, and forbidden
+# in the same breath from the reads that were its only alternative. That is a
+# fair description of the "Discovery Death Loop" the prompts elsewhere try to
+# talk it out of.
+#
+# This writes the map. Separately from assemble_clinerules, and called once per
+# iteration, because the two have different lifetimes: the prose sections are
+# the PLAN and change only on a re-plan, while the skeleton describes code the
+# agent is actively rewriting and is wrong the moment it does. Regenerating it
+# costs an os.walk and some regex - no model, no GPU, no network - which is
+# what makes per-iteration affordable at all.
+SKELETON_BEGIN = "<!-- BEGIN SYMBOL SKELETON (regenerated each iteration) -->"
+SKELETON_END = "<!-- END SYMBOL SKELETON -->"
+
+# Below MAX_SKELETON_CHARS, but not by as much as the first attempt at this.
+#
+# "Shedding detail before shedding files" holds only while some tier still fits
+# the cap. Past that, get_symbol_skeleton's overflow path keeps whole entries
+# until the budget runs out and drops the rest, so too tight a cap does exactly
+# the thing the tiers exist to avoid. Measured on veriform-ui, 606 files:
+#
+#     cap 40000 -> OVERFLOW, 257 of 377 detailed entries kept
+#     cap 50000 -> OVERFLOW, 309 of 377
+#     cap 60000 -> OVERFLOW, 355 of 377
+#     cap 75000 -> FITS at "exported symbol names only", 62195 chars, all 606
+#
+# So 75000. ~15.6k tokens of the build agent's 163840 window, on every phase of
+# every iteration, for a map of the whole project - against 90000 for a
+# one-off distillation payload sized to a different window. Raise it for a
+# larger repository; check the console line this prints before assuming a
+# smaller number is free, because the failure it buys is silent.
+CLINERULES_SKELETON_MAX_CHARS = int(
+    os.environ.get("CLINERULES_SKELETON_MAX_CHARS", "75000")
+)
+
+# get_symbol_skeleton's own marker for "I dropped files off the end".
+SKELETON_OVERFLOW_MARKER = "[Skeleton truncated:"
+
+
+def refresh_skeleton_section(clinerules_path: str = None,
+                             project_dir: str = "/workspace") -> int:
+    """
+    Regenerate the symbol skeleton and splice it into .clinerules.
+
+    Replaces the marked section if it is there, appends it if it is not, and
+    leaves every other section untouched - the prose passes are expensive and
+    are not this function's to rewrite.
+
+    Never fatal. A build that has lost its navigation aid is worse off than one
+    that has a stale one, but both are better off than a build that did not
+    start, so every failure here returns 0 with a warning.
+    """
+    path = clinerules_path or OUTPUT_PATH
+    try:
+        skeleton = get_symbol_skeleton(project_dir,
+                                       max_chars=CLINERULES_SKELETON_MAX_CHARS)
+    except Exception as e:
+        print(f"  ⚠ Could not build the symbol skeleton ({e}); leaving .clinerules as is.",
+              flush=True)
+        return 0
+
+    if not skeleton.strip():
+        print("  ⚠ Symbol skeleton came back empty; leaving .clinerules as is.",
+              flush=True)
+        return 0
+
+    # A partial map that does not say it is partial is worse than no map,
+    # because the agent is told in the same document to trust it: "if a
+    # signature is there, do not open the file to learn it" invites the
+    # converse, and the converse is false under truncation.
+    partial = SKELETON_OVERFLOW_MARKER in skeleton
+    if partial:
+        print(f"  ⚠️  Symbol skeleton OVERFLOWED {CLINERULES_SKELETON_MAX_CHARS} chars - "
+              "some files carry no symbols in it. Raise "
+              "CLINERULES_SKELETON_MAX_CHARS if the window can afford it.",
+              flush=True)
+
+    caveat = (
+        "> INCOMPLETE: this map hit its size limit and some files below carry no\n"
+        "> symbols. A name missing from it is NOT evidence the code lacks it -\n"
+        "> search or read the file before concluding anything is absent.\n"
+        if partial else ""
+    )
+
+    section = (
+        f"{SKELETON_BEGIN}\n"
+        "## 🦴 Repository Symbol Skeleton\n"
+        "\n"
+        "> Regenerated from the filesystem at the top of this iteration, so it\n"
+        "> describes the code as it is NOW, including your own edits from the\n"
+        "> previous iteration. Navigate with it instead of reading whole files.\n"
+        "> It carries declarations, not bodies: when you need to know what code\n"
+        "> DOES, or you are about to change a file, open the file.\n"
+        f"{caveat}"
+        "\n"
+        "```\n"
+        f"{skeleton}\n"
+        "```\n"
+        f"{SKELETON_END}\n"
+    )
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            doc = f.read()
+    except OSError as e:
+        print(f"  ⚠ Could not read {path} ({e}); skeleton not refreshed.", flush=True)
+        return 0
+
+    if SKELETON_BEGIN in doc and SKELETON_END in doc:
+        head = doc[:doc.index(SKELETON_BEGIN)]
+        tail = doc[doc.index(SKELETON_END) + len(SKELETON_END):].lstrip("\n")
+        doc = head + section + tail
+        verb = "refreshed"
+    else:
+        doc = doc.rstrip("\n") + "\n\n" + section
+        verb = "added"
+
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(doc)
+    except OSError as e:
+        print(f"  ⚠ Could not write {path} ({e}); skeleton not refreshed.", flush=True)
+        return 0
+
+    print(f"  🦴 Symbol skeleton {verb} in .clinerules "
+          f"({len(skeleton)} chars of map, {len(doc)} chars of document).",
+          flush=True)
+    return 0
 
 
 # Chat commands that launch a pipeline run. Any of them can appear alone or with
@@ -5832,6 +5986,11 @@ if __name__ == "__main__":
     # `--replan <growth_bytes> <max_replans>` is called by the build loop between
     # iterations. It decides for itself whether the plan has fallen behind, so
     # the shell does not have to duplicate the trigger logic.
+    # `--refresh-skeleton` is called by the build loop at the top of every
+    # iteration. Deterministic and model-free, so it is safe to run every time
+    # rather than on a trigger the way --replan is.
+    if sys.argv[1:2] == ["--refresh-skeleton"]:
+        raise SystemExit(refresh_skeleton_section())
     if sys.argv[1:2] == ["--replan"]:
         threshold = int(sys.argv[2]) if len(sys.argv) > 2 else 2000
         budget = int(sys.argv[3]) if len(sys.argv) > 3 else 2
