@@ -790,6 +790,124 @@ def conversation_to_text(messages: list, max_messages: int = None) -> str:
     return "\n\n---\n\n".join(parts)
 
 
+# How much of .build_issues.md a design pass actually reads.
+#
+# It was the whole file, uncapped, and it is append-only: entrypoint.sh records
+# every failed gate with `>>` and nothing ever truncates it. Measured on a live
+# workspace, on the run this cap was written for: 144935 characters, 48312
+# tokens - 49% of a 98296-token payload against a facts budget of 110819. The
+# architect fitted, but only just, and what the log displaced was the budget for
+# reading source: solve_addendum_budget returned 12993 characters for the whole
+# survey, against a SURVEY_MAX_FILES of 12. It could afford one file. It did not
+# pick `Backend/src/routes/feedback.ts`, the pass blocked for the signature of a
+# symbol in it, and the blocker rounds ran out following the trail.
+#
+# The reduction below is nearly free because the log is 99% crossed-off work:
+# 57 of 59 entries on that file were `- [x]`, 143560 of 144935 characters. The
+# build agent is already told to cross off or remove what it fixed
+# (entrypoint.sh, step 4 of the iteration prompt), so `[x]` is its own statement
+# that an entry is spent - and a spent entry is exactly what a design pass must
+# not spend half its window on. The two survivors were `- [~] SUPERSEDED - DO
+# NOT REPEAT THIS FIX`, which is the one shape in that file worth a design
+# pass's attention.
+#
+# The character cap is the backstop for a project whose OPEN issues are large,
+# and 12000 is deliberately generous against the ~1400 that survived here.
+#
+# NOT applied to the re-plan payload, which reads the same file (see
+# build_replan_payload). There a crossed-off entry is still evidence: its
+# directive 4 tells the pass that work not implicated in BUILD_ISSUES stands, and
+# `[x] VERIFIED - ALL gates GREEN` from the build being revised is exactly what
+# establishes that. The re-plan has its own budget clip; the difference between
+# the two is deliberate.
+BUILD_ISSUES_MAX_CHARS = int(os.environ.get("BUILD_ISSUES_MAX_CHARS", "12000"))
+
+# A top-level log entry: `- [x]`, `- [ ]`, `- [~]`. Continuation lines are
+# indented, so anchoring at column zero splits entries without splitting bodies.
+_ISSUE_ENTRY_RE = re.compile(r"^- \[([^\]]?)\]", re.MULTILINE)
+
+
+def reduce_build_issues(text: str, max_chars: int = None) -> str:
+    """
+    Drop the resolved entries from the build-issues log, then cap what is left.
+
+    Two reductions, in that order, because only the first is lossless. `[x]` is
+    the agent's own mark for "fixed"; dropping those entries removes no open
+    question. The cap that follows can, so it is applied to as little as
+    possible and says what it dropped.
+
+    Entries are kept from the END when the cap bites. That is not a claim about
+    which end is newest - the log is written from both, appended to by the shell
+    and rewritten in place by the agent - but it is what entrypoint.sh's
+    `tail -c $SESSION_STATE_ISSUES_BYTES` already does for session state, and
+    two readers of one file disagreeing about which half matters is worse than
+    either choice.
+
+    Returns "" for an empty or fully-resolved log: a log with nothing open in it
+    is not a fact the design pass needs, and an empty block is not emitted.
+    """
+    if max_chars is None:
+        max_chars = BUILD_ISSUES_MAX_CHARS
+    text = (text or "").strip()
+    if not text or len(text) <= max_chars and not _ISSUE_ENTRY_RE.search(text):
+        return text
+
+    starts = [m.start() for m in _ISSUE_ENTRY_RE.finditer(text)]
+    if not starts:
+        # No entries to select between, so the cap is all there is. Keep the
+        # tail for the same reason the entry path does.
+        return _tail_with_marker(text, max_chars, 0)
+
+    bounds = list(zip(starts, starts[1:] + [len(text)]))
+    entries = [(text[s:e], _ISSUE_ENTRY_RE.match(text, s).group(1).strip().lower())
+               for s, e in bounds]
+    resolved = sum(1 for _, mark in entries if mark == "x")
+    kept = [body for body, mark in entries if mark != "x"]
+    if not kept:
+        return ""
+
+    body = "".join(kept).strip()
+    if len(body) <= max_chars:
+        return _issues_note(body, resolved, 0)
+
+    # Whole entries from the end, never a half one: a truncated entry reads as a
+    # complete statement that simply stops, which is how a partial gate list
+    # becomes a fact the pass designs around.
+    chosen, total = [], 0
+    for entry in reversed(kept):
+        if total + len(entry) > max_chars and chosen:
+            break
+        chosen.insert(0, entry)
+        total += len(entry)
+    if not chosen:
+        return _tail_with_marker(kept[-1].strip(), max_chars, resolved)
+    return _issues_note("".join(chosen).strip(), resolved, len(kept) - len(chosen))
+
+
+def _issues_note(body: str, resolved: int, dropped_open: int) -> str:
+    """Say what was left out, so a partial log does not read as a whole one."""
+    notes = []
+    if resolved:
+        notes.append(f"{resolved} resolved entr{'y' if resolved == 1 else 'ies'} "
+                     f"([x]) omitted")
+    if dropped_open:
+        notes.append(f"{dropped_open} older unresolved entr"
+                     f"{'y' if dropped_open == 1 else 'ies'} omitted to fit the "
+                     f"window")
+    if not notes:
+        return body
+    return f"... [{'; '.join(notes)}]\n\n{body}"
+
+
+def _tail_with_marker(text: str, max_chars: int, resolved: int) -> str:
+    """Last resort: one entry that alone exceeds the cap, or a log with none."""
+    if len(text) <= max_chars:
+        return _issues_note(text, resolved, 0)
+    marker = "... [{} earlier characters omitted]\n"
+    keep = max(0, max_chars - len(marker.format(len(text))))
+    return marker.format(len(text) - keep) + text[-keep:]
+
+
 # --- Blocker protocol ---------------------------------------------------------
 #
 # Every prompt defines a way for a pass to refuse. architect.md R10 emits a bare
@@ -882,6 +1000,31 @@ EVIDENCE_MIN_BUDGET_CHARS = EVIDENCE_MAX_FILE_CHARS
 # now changes the question often enough to be worth a second pass.
 EVIDENCE_ROUNDS = {"bugfix": 3, "architect": 2}
 EVIDENCE_ROUNDS_DEFAULT = 1
+
+# The hard ceiling on rounds, and what EVIDENCE_ROUNDS actually budgets.
+#
+# EVIDENCE_ROUNDS used to be the ceiling, and it was charged per round whatever
+# the round did. That is the wrong meter. A round that comes back naming a file
+# the pass has never been shown is the trail narrowing - the work the protocol
+# exists to do - and it was being billed at the same rate as a pass going in
+# circles. Circling is already caught one branch above, and caught better: a
+# request in which EVERY path was supplied in an earlier round stops the loop on
+# the spot, without spending a model call.
+#
+# Measured, on the run this split was written for. The architect blocked, was
+# shown files, came back with a different question, was shown those, and came
+# back with `Backend/src/routes/feedback.ts::serializeFeedback` - a 9268-byte
+# file on the mounted volume it had never been handed. Three steps of a trail
+# against a two-round ceiling, and the third question was never asked. The same
+# thing is written up in the EVIDENCE_ROUNDS comment above happening at one
+# round; raising the number bought one more step and did not change the shape.
+#
+# So EVIDENCE_ROUNDS is now charged only for a round that did NOT move the
+# question - the pass restating a request it has already had answered - and this
+# is the ceiling that bounds the cost. It has to exist: a round is a full design
+# pass, and the measured run spent 50 minutes on two of them.
+EVIDENCE_MAX_ROUNDS = {"bugfix": 5, "architect": 4}
+EVIDENCE_MAX_ROUNDS_DEFAULT = 2
 
 
 def detect_blockers(result: str) -> list:
@@ -1043,6 +1186,34 @@ def blocker_symbol_hints(blockers: list) -> dict:
                 if symbol not in hints.setdefault(key, []):
                     hints[key].append(symbol)
     return hints
+
+
+def blocker_targets(blockers: list) -> frozenset:
+    """
+    What this round is asking about, as a set, so two rounds can be compared.
+
+    `path::symbol` where the blocker named both, a bare path where it named only
+    a file. A blocker that names no path at all - the architect's whole document,
+    which detect_blockers falls back to - collapses to its own normalised text,
+    so re-emitting the same refusal verbatim still reads as the same question.
+
+    Deliberately built from what the PASS said, not from the paths the resolver
+    mapped it onto. The resolver is a model call: the same blocker can map onto a
+    different file twice, and that is the resolver wandering, not the pass making
+    progress.
+    """
+    targets = set()
+    for blocker in blockers or []:
+        hints = blocker_symbol_hints([blocker])
+        if not hints:
+            targets.add(" ".join((blocker or "").split()).lower())
+            continue
+        for path, symbols in hints.items():
+            if symbols:
+                targets.update(f"{path}::{symbol}" for symbol in symbols)
+            else:
+                targets.add(path)
+    return frozenset(targets)
 
 
 # "lines ~1040-1100", "line 1040", "lines 1040 to 1100", "L1040-L1100". A blocker
@@ -1337,30 +1508,56 @@ def resolve_pass_blockers(client, pass_key: str, model_config, prompt: str,
     caller can apply it unconditionally. Shared by the initial distillation and
     by the re-plan, which is just as capable of asking for a file it cannot see.
 
-    Runs up to EVIDENCE_ROUNDS rounds. Evidence accumulates across them: a pass
-    that blocks twice is following a trail, and dropping round one's files to
-    make room for round two's would walk it back to the start.
+    Evidence accumulates across rounds: a pass that blocks twice is following a
+    trail, and dropping round one's files to make room for round two's would walk
+    it back to the start.
 
-    `max_rounds` overrides that budget. The reproduction loop passes 1: the pass
-    has already had its full allowance on the first attempt, so a re-run that
-    blocks is correcting a diagnosis rather than starting one, and letting each
-    of three attempts buy three more rounds turns one bug into twelve LLM calls.
+    Two limits, because rounds are not all the same thing - see
+    EVIDENCE_MAX_ROUNDS. EVIDENCE_ROUNDS is charged only for a round that asks
+    the same question again; a round that names something new is the trail
+    narrowing and is not billed for it. EVIDENCE_MAX_ROUNDS is the hard ceiling
+    that bounds the cost either way.
+
+    `max_rounds` overrides BOTH. The reproduction loop passes 1: the pass has
+    already had its full allowance on the first attempt, so a re-run that blocks
+    is correcting a diagnosis rather than starting one, and letting each of three
+    attempts buy three more rounds turns one bug into twelve LLM calls.
     """
     if pass_key not in EVIDENCE_RETRY_PASSES or not symbol_skeleton:
         return result
 
     if max_rounds is None:
-        max_rounds = EVIDENCE_ROUNDS.get(pass_key, EVIDENCE_ROUNDS_DEFAULT)
+        restated_budget = EVIDENCE_ROUNDS.get(pass_key, EVIDENCE_ROUNDS_DEFAULT)
+        ceiling = EVIDENCE_MAX_ROUNDS.get(pass_key, EVIDENCE_MAX_ROUNDS_DEFAULT)
+    else:
+        restated_budget = ceiling = max_rounds
     seen = set()
     evidence = ""
+    restated = 0
+    asked = None
 
-    for round_no in range(1, max_rounds + 1):
+    for round_no in range(1, ceiling + 1):
         blockers = detect_blockers(result)
         if not blockers:
             return result
 
+        # Did the question move? Compared against what the pass asked last round,
+        # before any of it is resolved - see blocker_targets.
+        targets = blocker_targets(blockers)
+        moved = asked is None or bool(targets - asked)
+        if not moved:
+            restated += 1
+            if restated > restated_budget:
+                print(f"  ⚠ {pass_key} has restated the same request "
+                      f"{restated} time(s) with the files already attached; "
+                      f"stopping. Another round buys the same answer.", flush=True)
+                return result
+        asked = targets
+
         print(f"  🚧 {pass_key} reported {len(blockers)} blocker(s) "
-              f"(round {round_no}/{max_rounds}); resolving against the workspace...",
+              f"(round {round_no}/{ceiling}"
+              f"{'' if moved else f'; restated {restated}/{restated_budget}'}"
+              f"); resolving against the workspace...",
               flush=True)
         for i, b in enumerate(blockers, 1):
             print_blocker(i, b)
@@ -1392,6 +1589,12 @@ def resolve_pass_blockers(client, pass_key: str, model_config, prompt: str,
             print(f"     ↳ already supplied in an earlier round: "
                   f"{', '.join(repeated)}", flush=True)
 
+        # The other stop, and the cheaper one: this fires on what the RESOLVER
+        # mapped the request onto, after the mapping, so it catches a pass that
+        # rephrases the same question into the same files. The `moved` test above
+        # catches what this one cannot - a restated question the resolver maps
+        # onto a different file each time, which looks like fresh ground here and
+        # is the resolver wandering rather than the pass progressing.
         if not fresh and not fresh_absent:
             print(f"  ⚠ Round {round_no} asked only for paths already supplied; "
                   f"stopping. The pass has the contents and still cannot place "
@@ -1458,8 +1661,19 @@ def resolve_pass_blockers(client, pass_key: str, model_config, prompt: str,
             print(f"  ✓ {pass_key} unblocked by the evidence.", flush=True)
             return result
 
-    print(f"  ⚠ {pass_key} is still blocked after {max_rounds} round(s) of evidence "
-          f"({len(seen)} path(s) supplied).", flush=True)
+    # Which of the two ways this ended matters to whoever reads the log. A pass
+    # still naming files it has never been handed was stopped mid-trail, and the
+    # ceiling is the thing to raise; a pass out of new ground to cover was not.
+    unseen = sorted(p for p in blocker_symbol_hints(detect_blockers(result))
+                    if p not in seen)
+    tail = (f" Its last request still names {', '.join(unseen)}, which it has not "
+            f"been shown - this is the ceiling stopping a live trail. Raise "
+            f"EVIDENCE_MAX_ROUNDS if the round cost is affordable."
+            if unseen else
+            " Its last request names nothing new, so the gap is in the report "
+            "rather than the workspace.")
+    print(f"  ⚠ {pass_key} is still blocked after {ceiling} round(s) of evidence "
+          f"({len(seen)} path(s) supplied).{tail}", flush=True)
     return result
 
 
@@ -1558,6 +1772,37 @@ def render_survey_findings(claims: list) -> str:
     return "\n  ".join(lines)
 
 
+def solve_survey_budget(window: int, system_tokens: int, payload_tokens: int) -> int:
+    """
+    Characters the survey may spend on source, with the same floor evidence has.
+
+    The survey had no floor, and solve_addendum_budget's zero is not "there is no
+    room" - it is "the payload has already taken everything the solver was
+    willing to promise". Below that line survey_codebase returned "" on its first
+    line, silently, and the design pass went in with no source at all. Measured
+    on the run this was written for: 12993 characters for up to SURVEY_MAX_FILES
+    (12) files, enough for one of them, and the one it needed was not it. The
+    perversity is the same one EVIDENCE_MIN_BUDGET_CHARS was added for - the
+    bigger the project, the more certain the pass is to need source, and the more
+    certain the budget is to be nothing when it asks.
+
+    Taking the floor cannot cost the pass its single-pass call. The addendum
+    solver holds ANSWER_MAX_TOKENS (8192) back on top of its own answer reserve,
+    and the floor is 24000 chars - 8000 tokens at the dense rate - so overspending
+    it eats into that held-back reserve and stops short of solve_merge_budget's
+    facts budget. The one case where it does not is a
+    payload already over that budget, and there the call was going through
+    chunked extraction either way. Asserted in test_distill_budget.py.
+    """
+    solved = solve_addendum_budget(window, system_tokens, payload_tokens)
+    if solved >= EVIDENCE_MIN_BUDGET_CHARS:
+        return solved
+    print(f"  🔍 Survey budget: {solved} chars spare; taking the "
+          f"{EVIDENCE_MIN_BUDGET_CHARS}-char floor. Reading one file the request "
+          f"turns on beats blocking for it and spending a round.", flush=True)
+    return EVIDENCE_MIN_BUDGET_CHARS
+
+
 def survey_codebase(client, model_config, instruction: str, symbol_index: str,
                     budget_chars: int, project_dir: str = "/workspace") -> str:
     """
@@ -1568,7 +1813,16 @@ def survey_codebase(client, model_config, instruction: str, symbol_index: str,
     symbol index, the call graph and - if it needs a specific file after all -
     the blocker protocol behind it.
     """
-    if not instruction or not symbol_index or budget_chars <= 0:
+    if not instruction or not symbol_index:
+        return ""
+    if budget_chars <= 0:
+        # Reachable only if a caller bypasses solve_survey_budget's floor. It used
+        # to be the normal outcome on a large project, and it was invisible: the
+        # design pass simply started with no SURVEYED_SOURCE and no line saying
+        # why, which is indistinguishable from a survey that found nothing.
+        print(f"  ⚠ Survey skipped: budget is {budget_chars} chars. The design "
+              f"pass gets no source and will block for any shape it needs.",
+              flush=True)
         return ""
 
     system = (
@@ -5035,7 +5289,17 @@ def run_distillation():
             read_workspace_file("README.md"), latest_instruction,
             store_to=os.path.join("/workspace", README_DIGEST_PATH),
         )
-        issues_content = read_workspace_file(".cline_context/.build_issues.md")
+        # Reduced, not injected whole - see reduce_build_issues. The log is
+        # append-only and was measured at 49% of this payload, nearly all of it
+        # entries the agent had already crossed off.
+        issues_raw = read_workspace_file(".cline_context/.build_issues.md")
+        issues_content = reduce_build_issues(issues_raw)
+        if issues_raw and len(issues_content) < len(issues_raw):
+            kept = (f"{len(issues_content)} chars" if issues_content
+                    else "nothing - no open entries")
+            print(f"  🧾 Build issues: {len(issues_raw)} chars reduced to {kept} "
+                  f"(~{est_tokens(issues_raw) - est_tokens(issues_content)} tok "
+                  f"returned to the window).", flush=True)
 
         # The eight directives above are written for a design request. A bug
         # report is not one: the same instruction to "fulfil the NEW_REQUEST"
@@ -5285,7 +5549,7 @@ def run_distillation():
                     try:
                         survey_block = survey_codebase(
                             client, model_config, latest_instruction, symbol_skeleton,
-                            solve_addendum_budget(
+                            solve_survey_budget(
                                 CONTEXT_WINDOW, est_tokens(prompt),
                                 est_tokens(conversation_text.replace(
                                     SURVEY_PLACEHOLDER, "")),
