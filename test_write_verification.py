@@ -400,6 +400,27 @@ def test_a_complete_skeleton_carries_no_incomplete_banner():
 
 
 # ---------------------------------------------------------------------------
+# The worktree mask
+# ---------------------------------------------------------------------------
+
+def test_compose_masks_the_developers_claude_directory():
+    """`.claude/worktrees/` holds full checkouts of the same project, and there
+    is no way to restrain Cline's read tools from inside Cline. The exclusion is
+    a tmpfs over the directory, declared on the service - `docker compose run`,
+    which is how orchestrator.py launches, has no --tmpfs flag."""
+    path = os.path.join(HERE, "docker-compose.yml")
+    raw = open(path, encoding="utf-8").read()
+    try:
+        import yaml
+        tmpfs = yaml.safe_load(raw)["services"]["cline-builder"].get("tmpfs") or []
+    except ImportError:
+        tmpfs = [ln.strip("- ").strip() for ln in raw.splitlines()
+                 if ln.strip().startswith("- /workspace/")]
+
+    check("the builder masks .claude", "/workspace/.claude" in tmpfs, tmpfs)
+
+
+# ---------------------------------------------------------------------------
 # The operational policy
 # ---------------------------------------------------------------------------
 

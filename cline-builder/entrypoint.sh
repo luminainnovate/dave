@@ -379,6 +379,12 @@ check_project_size() {
 # directories for this reason (see its comment on the 71% duplication it
 # measured); this is the same exclusion on the review side, which had been
 # missed.
+#
+# Belt and braces with the tmpfs mask in docker-compose.yml, which makes the
+# directory not exist in the container at all. That mask is the real fix and
+# this prune matches nothing under it - but the mask is declared on the compose
+# service, so a container started any other way still needs this. Do not remove
+# one on the strength of the other.
 REVIEW_MARKER="/workspace/.cline_context/.review_marker"
 REVIEW_MAX_FILES=25
 
