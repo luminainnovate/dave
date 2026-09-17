@@ -1026,6 +1026,14 @@ EVIDENCE_ROUNDS_DEFAULT = 1
 EVIDENCE_MAX_ROUNDS = {"bugfix": 5, "architect": 4}
 EVIDENCE_MAX_ROUNDS_DEFAULT = 2
 
+# What an evidence block costs ON TOP of the file bytes read_evidence budgets:
+# the preamble, a `<file path=...>` wrapper per file, the <ABSENT>/<NOT_READ>
+# notes and the tag itself. Small per file, irrelevant to the read, and nothing
+# was charging it - see solve_survey_budget, where a measured 454-token overshoot
+# on exactly this was the difference between the single-pass call and the chunked
+# one. Sized for a full SURVEY_MAX_FILES set with long paths, deliberately over.
+EVIDENCE_FRAMING_RESERVE_CHARS = 4000
+
 
 def detect_blockers(result: str) -> list:
     """
@@ -1632,8 +1640,8 @@ def resolve_pass_blockers(client, pass_key: str, model_config, prompt: str,
         if unread:
             print(f"     ⏭ budget spent before reading: {', '.join(unread)} "
                   f"— deferred to round {round_no + 1}"
-                  + (" (none left; raise DISTILL_CTX or EVIDENCE_ROUNDS)"
-                     if round_no >= max_rounds else ""), flush=True)
+                  + (" (none left; raise DISTILL_CTX or EVIDENCE_MAX_ROUNDS)"
+                     if round_no >= ceiling else ""), flush=True)
 
         # Only what was actually read. Marking the whole `fresh` set seen meant a
         # request the budget could not satisfy in one round was recorded as
@@ -1786,20 +1794,40 @@ def solve_survey_budget(window: int, system_tokens: int, payload_tokens: int) ->
     bigger the project, the more certain the pass is to need source, and the more
     certain the budget is to be nothing when it asks.
 
-    Taking the floor cannot cost the pass its single-pass call. The addendum
-    solver holds ANSWER_MAX_TOKENS (8192) back on top of its own answer reserve,
-    and the floor is 24000 chars - 8000 tokens at the dense rate - so overspending
-    it eats into that held-back reserve and stops short of solve_merge_budget's
-    facts budget. The one case where it does not is a
-    payload already over that budget, and there the call was going through
-    chunked extraction either way. Asserted in test_distill_budget.py.
+    The survey is not the last thing appended to this payload, so it does not get
+    to spend everything the solver offers. What it leaves behind is the blocker
+    protocol's own floor plus the framing that carries it:
+
+      solved  = facts - payload - ANSWER_MAX_TOKENS       (the solver's offer)
+      survey  = solved - EVIDENCE_MIN_BUDGET_CHARS - EVIDENCE_FRAMING_RESERVE_CHARS
+
+    so a later evidence round solves to its floor, spends it inside the held-back
+    ANSWER_MAX_TOKENS, and the merge call still fits in one piece.
+
+    Reserving it is not optional, and the margin is why. ANSWER_MAX_TOKENS is 8192
+    and the floor is 8000 tokens at the dense rate, so an unreserved survey leaves
+    192 tokens of slack - while read_evidence budgets file CONTENT only, and the
+    block it returns also carries a preamble, a `<file path=...>` wrapper per file
+    and any <ABSENT>/<NOT_READ> notes. Measured: a payload computed at 102627
+    tokens arrived at 103081, 454 over, and the evidence floor on top of that
+    crossed the facts budget and sent the pass down the chunked path - the lossy
+    one, where source reaches the merge as capped bullet records and a blocker
+    asking for a signature cannot be answered by any of them.
+
+    This covers the FIRST evidence round. Rounds accumulate by design (see
+    resolve_pass_blockers), so a pass deep in a trail can still cross into
+    extraction - the trade EVIDENCE_MIN_BUDGET_CHARS already states it is willing
+    to make. Asserted in test_distill_budget.py.
     """
     solved = solve_addendum_budget(window, system_tokens, payload_tokens)
-    if solved >= EVIDENCE_MIN_BUDGET_CHARS:
-        return solved
-    print(f"  🔍 Survey budget: {solved} chars spare; taking the "
-          f"{EVIDENCE_MIN_BUDGET_CHARS}-char floor. Reading one file the request "
-          f"turns on beats blocking for it and spending a round.", flush=True)
+    spendable = solved - EVIDENCE_MIN_BUDGET_CHARS - EVIDENCE_FRAMING_RESERVE_CHARS
+    if spendable >= EVIDENCE_MIN_BUDGET_CHARS:
+        return spendable
+    print(f"  🔍 Survey budget: {solved} chars spare, {spendable} after reserving "
+          f"the blocker protocol's floor; taking the "
+          f"{EVIDENCE_MIN_BUDGET_CHARS}-char floor instead. Reading one file the "
+          f"request turns on beats blocking for it and spending a round.",
+          flush=True)
     return EVIDENCE_MIN_BUDGET_CHARS
 
 
