@@ -423,8 +423,23 @@ def _stageable(root: str, files: list) -> list:
     """
     code, out = _git(root, "ls-files", "-z")
     indexed = {p for p in out.split("\0") if p} if code == 0 else set()
-    return [p for p in files
-            if p in indexed or os.path.exists(os.path.join(root, p))]
+    candidates = [p for p in files
+                  if p in indexed or os.path.exists(os.path.join(root, p))]
+
+    # A path the branch's commits touched can still be ignored today, by a
+    # global ignore as readily as by the repo's own (`.claude/settings.local.json`
+    # is the usual one). `git add` refuses to be handed one, fatally, and an
+    # untracked ignored file has nothing to stage anyway. Tracked paths are
+    # never reported as ignored, so deletions of them still go through.
+    unindexed = [p for p in candidates if p not in indexed]
+    if not unindexed:
+        return candidates
+    result = subprocess.run(
+        ["git", "-C", root, "check-ignore", "-z", "--stdin"],
+        input="\0".join(unindexed) + "\0", capture_output=True, text=True,
+    )
+    ignored = {p for p in result.stdout.split("\0") if p}
+    return [p for p in candidates if p not in ignored]
 
 
 def confirm(workspace: str) -> str:

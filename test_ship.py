@@ -276,6 +276,25 @@ def test_confirm_works_when_gitignore_already_covers_the_scratch_dirs():
     check("nor the scratch directory", ".cline_context" not in committed, committed)
 
 
+def test_confirm_skips_an_ignored_path_the_branch_already_touched():
+    """
+    `git add` is fatal on an ignored pathspec, e.g. a committed-then-untracked
+    `.claude/settings.local.json` under a global ignore.
+    """
+    w = Workspace(gitignore=".claude/settings.local.json\n")
+    w.build()
+    w.write(".claude/settings.local.json", "{}\n")
+    git(w.root, "add", "-f", ".claude/settings.local.json", "widget.py")
+    git(w.root, "commit", "-q", "-m", "agent commit")
+    git(w.root, "rm", "-q", "--cached", ".claude/settings.local.json")
+    ship.record_build_complete(w.root, base="main")
+
+    with FakeGh():
+        out = ship.confirm(w.root)
+    check("the push is not refused", "Could not push" not in out, out)
+    check("it merges", "Squash-merged into `main`" in out, out)
+
+
 def test_paths_with_spaces_and_renames_survive_staging():
     w = Workspace()
     w.write("old name.py", "x = 1\n")
