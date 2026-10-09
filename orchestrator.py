@@ -100,6 +100,16 @@ ROUTER_CONFIG = {
 # is the one place this trade is visible.
 ROUTER_ON_CPU = True
 ROUTER_KEEP_ALIVE = "30m"  # free to hold, now that holding it costs no VRAM
+# Hard ceiling on tokens a background/triage Router call may generate. These are
+# titles, tags and JSON verdicts; a 1.5B model that fails to emit a stop token
+# otherwise loops (with context shift) for as long as it is left, and the
+# orchestrator holds the GPU lock waiting on it.
+ROUTER_BACKGROUND_MAX_TOKENS = 512
+# Wall-clock ceiling for the same calls. The token cap bounds a looping model;
+# this bounds everything else (a wedged backend, a dead connection), which the
+# 700s httpx timeout does not: that is a gap between bytes, and a stream that keeps
+# emitting never trips it.
+ROUTER_BACKGROUND_TIMEOUT = 90.0
 ROUTER_CTX = 8192          # generous for triage-grade turns; EXPERT_CTX was not
                            # a considered value here, just the fall-through
 
@@ -525,6 +535,8 @@ def _adapt_body(body: dict, config: dict) -> dict:
     for key in ("temperature", "top_p", "presence_penalty", "frequency_penalty"):
         if key in options:
             adapted[key] = options[key]
+    if "num_predict" in options:
+        adapted["max_tokens"] = options["num_predict"]
 
     # top_k, min_p and repetition_penalty are not in the OpenAI schema, but vLLM
     # accepts all three as top-level sampling params. Forwarding them here is the
@@ -1489,7 +1501,7 @@ async def analyze_request(messages: list) -> dict:
             ],
             "stream": False,
             "keep_alive": ROUTER_KEEP_ALIVE,
-            "options": _router_options(num_ctx=2048)
+            "options": _router_options(num_ctx=2048, num_predict=ROUTER_BACKGROUND_MAX_TOKENS)
         }
         url = f"{_get_base_url(router_config)}/api/chat"
     else:
@@ -1536,7 +1548,8 @@ async def analyze_request(messages: list) -> dict:
 
 async def stream_proxy(url: str, body: dict, lock: asyncio.Lock,
                        is_native: bool = False, backend_is_ollama: bool = True,
-                       request_headers: dict = {}, turn_id: str = ""):
+                       request_headers: dict = {}, turn_id: str = "",
+                       max_seconds: float = 0.0):
     """
     Proxies a streaming response from the backend AI model while managing VRAM locks.
     Handles format translation between Ollama and OpenAI-compatible backends/clients.
@@ -1547,6 +1560,8 @@ async def stream_proxy(url: str, body: dict, lock: asyncio.Lock,
         request_headers: Headers from the initial request (for X-No-Scrub).
         turn_id: Trace id captured in the request handler, rebound here because the
                  generator body may run outside the handler's context.
+        max_seconds: Total wall-clock budget for the stream; 0 disables it. Checked
+                 per line, so it also ends a stream that never stops emitting.
     """
     lock_released = False
     turn_throughput = 0  # Character counter to detect infinite reasoning loops
@@ -1605,6 +1620,10 @@ async def stream_proxy(url: str, body: dict, lock: asyncio.Lock,
             seen_openers = set() # Track starting tags to prevent dangling closures
             
             while True:
+                if max_seconds and time.monotonic() - stream_started > max_seconds:
+                    logger.error(f"Stream exceeded its {max_seconds:.0f}s budget; cutting it off.")
+                    next_line_task.cancel()
+                    break
                 try:
                     # Wait for next line or heartbeat timeout (60s)
                     done, _ = await asyncio.wait(
@@ -2630,7 +2649,8 @@ async def _orchestrate(request: Request):
         # --- Payload Config ---
         options = body.get("options", {})
         if is_background_task:
-            options.update({"temperature": 0.0, "num_ctx": 2048})
+            options.update({"temperature": 0.0, "num_ctx": 2048,
+                            "num_predict": ROUTER_BACKGROUND_MAX_TOKENS})
             if ROUTER_ON_CPU and target_model == ROUTER_MODEL:
                 options["num_gpu"] = 0
             # If the expert is warm or a build is active, force the Router to unload
@@ -2694,8 +2714,15 @@ async def _orchestrate(request: Request):
 
         if not is_streaming:
             try:
-                resp = await http_client.post(target_url, json=dispatch_body, timeout=700.0,
-                                              headers=_auth_headers(target_url))
+                post = http_client.post(target_url, json=dispatch_body, timeout=700.0,
+                                        headers=_auth_headers(target_url))
+                try:
+                    resp = await (asyncio.wait_for(post, timeout=ROUTER_BACKGROUND_TIMEOUT)
+                                  if is_background_task else post)
+                except asyncio.TimeoutError:
+                    logger.error(f"Background call to {target_model} exceeded "
+                                 f"{ROUTER_BACKGROUND_TIMEOUT:.0f}s; abandoning it.")
+                    return JSONResponse(status_code=504, content={"error": "Background task timed out."})
                 if resp.status_code != 200:
                     error_text = ""
                     try:
@@ -2734,7 +2761,8 @@ async def _orchestrate(request: Request):
             stream_proxy(target_url, dispatch_body, gpu_lock,
                          is_native=is_native, backend_is_ollama=target_is_ollama,
                          request_headers=dict(request.headers),
-                         turn_id=tracer.current_turn()),
+                         turn_id=tracer.current_turn(),
+                         max_seconds=ROUTER_BACKGROUND_TIMEOUT if is_background_task else 0.0),
             media_type="application/x-ndjson" if is_native else "text/event-stream"
         )
     except Exception as e:
