@@ -516,6 +516,15 @@ setup_git_safety() {
         return 0
     fi
     
+    # A CI fix (ship.py, `!approve` after a red pull request) has to land on the
+    # branch that pull request is open from. A fresh agent/build-* here would put
+    # the fix where no PR, and no CI run, would ever see it.
+    if [ -n "${BUILD_BRANCH:-}" ] && \
+       [ "$(git symbolic-ref --short HEAD 2>/dev/null)" = "$BUILD_BRANCH" ]; then
+        echo "  🌿 Continuing on branch: ${BUILD_BRANCH} (CI fix for its open pull request)"
+        return 0
+    fi
+
     # Always work on a branch, never on main/master
     local MAIN_BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null || echo "main")
     local BRANCH_NAME="agent/build-$(date +%s)"

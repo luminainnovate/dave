@@ -345,6 +345,7 @@ Do this instead:
 | 6. Commit | `!approve` | Engineer → test → safety → implementation. |
 | 7. Watch | `!logs`, `!status` | `!stop` force-stops everything and clears VRAM. |
 | 8. Ship it | `!ship`, then `!ship confirm` | The build leaves its work uncommitted on `agent/build-<ts>`. `!ship` shows what would be committed, pushed and squash-merged; only `!ship confirm` does it. |
+| 9. CI gate | automatic; `!approve` on a failure | The PR is squash-merged only once every check on the pushed commit passes, then the base branch's run of the squash commit must pass too. A failure at either point is written to `.cline_context/ci_failure.md` and shown in chat; `!approve` builds a fix scoped to the approved design and puts it back through the gate. The PR stays open until CI is green. |
 | 9. Iterate narrowly | `!build` with a focused request | The next round reads what round 1 actually produced. Ask for one thing. |
 
 Corollaries worth stating plainly:
@@ -484,7 +485,10 @@ than try to install one. Copy it to the workspace root as `.builder_env.md`.
 | `!build` | Full 4-pass pipeline plus implementation. | Extra text in the same message steers it. |
 | `!status` / `!logs` | Container status / last 200 lines of the active build. | `!logs` is also an Expert tool. |
 | `!ship [title]` | Describes the commit, PR and squash-merge that would ship the finished build's branch. | Changes nothing. Refuses off an `agent/build-*` branch, on a clean tree, or without `origin` and `gh`. |
-| `!ship confirm` | Commits the build's files, pushes, opens the PR and **squash-merges** it into the base branch. | **Must open the message.** Irreversible from chat. `.cline_context/` is never staged. |
+| `!ship confirm` | Commits the build's files, pushes and opens the PR. The CI gate **squash-merges** it once every check on that commit passes, then checks the base branch's run of the squash commit. | **Must open the message.** The merge is irreversible from chat. `.cline_context/`, `.build_complete` and `.clinerules` are never staged. |
+| `!ship status` | Where the CI gate is: waiting on PR checks, merged and waiting on the base branch, failed, fixing, stalled or integrated. Polls GitHub once. | A failure shows its root causes again. |
+| `!ship watch` | Puts a stalled gate (timeout, refused merge, branch pushed from elsewhere) back to waiting. | Adopts the PR's current head, so a commit you pushed by hand gets its own CI verdict. |
+| `!approve` *(after a CI failure)* | Builds a fix for `.cline_context/ci_failure.md` on the PR's branch — or, for a red base branch, on a new branch with its own PR — and pushes it back through the CI gate. | Takes precedence over approving a design while a failure waits. The fix is held to `.cline_context/ship_design.md`, the design frozen at `!ship confirm`. |
 | `!stop` | Force-stops all pipelines and clears VRAM. | |
 
 ### Repository editing & pull requests
@@ -943,7 +947,9 @@ ComfyUI's `/history`. A background task sweeps idle ComfyUI RAM/VRAM every 5 min
 | `.clinerules` | The assembled plan the build agent executes |
 | `.cline_context/distill_*.md` | Per-pass design documents — **this is what `!architect` / `!bugfix` write and `!approve` reuses** |
 | `.cline_context/.design_pass` | Which design pass the last gate ran (`architect` or `bugfix`), so `!approve` and `!review` target the right document |
-| `.cline_context/.ship_pending` | Written when a build container exits with work on its branch — the branch, its base, and whether the offer has been shown. Survives an orchestrator restart, which is why `!ship` is still available hours later. Distinct from the root `.build_complete`, which is the agent's verdict on its own work |
+| `.cline_context/.ship_pending` | Written when a build container exits with work on its branch — the branch, its base, and whether the offer has been shown. After `!ship confirm` it also holds the CI gate's state: the PR, the commit being checked, the squash commit, and any failure. Survives an orchestrator restart, which resumes the gate from it. Distinct from the root `.build_complete`, which is the agent's verdict on its own work |
+| `.cline_context/ci_failure.md` | The CI gate's failure record: each failed check, the step and command that failed, and the error lines from its log. Reviewed before `!approve`, and edited to steer the fix. Flipped to RESOLVED once CI passes |
+| `.cline_context/ship_design.md` | The approved design a shipped PR implements, frozen at `!ship confirm` so a fix build (which deletes `distill_*.md`) is still scoped by it |
 | `.cline_context/.session_state.md` | Regenerated each phase; the agent's first read every step |
 | `.cline_context/.build_issues.md` | Accumulated failures; drives re-planning and the next iteration |
 | `.cline_context/quality_audit.md` | Correctness / security / performance / quality findings from the review phase, reconciled during verify |

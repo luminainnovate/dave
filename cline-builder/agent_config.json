@@ -123,6 +123,11 @@
 
         "_bugfix_help": "`!bugfix` swaps the architect for the bugfix pass, which must declare a COMMAND that actually fails before its diagnosis is accepted. bugfix_max_repro_attempts is how many times the pass may be re-run with the observed output fed back; 1 means run the repro once and never retry, 0 disables verification entirely and the diagnosis becomes self-reported. Each attempt after the first costs a design pass plus at most one round of blocker evidence, so 3 is roughly 15-25 minutes of GPU and the review gate will usually return 'still running' before it finishes - that is expected, and `!review` picks it up. bugfix_repro_timeout_secs caps a single run of the declared command.",
         "bugfix_max_repro_attempts": 3,
-        "bugfix_repro_timeout_secs": 300
+        "bugfix_repro_timeout_secs": 300,
+
+        "_ci_gate_help": "`!ship confirm` opens the pull request and stops; the CI gate squash-merges it only once every check on the pushed commit has passed, then waits for the base branch's own run of the squash commit. A failure at either point is written to .cline_context/ci_failure.md and shown in chat, and `!approve` builds a fix scoped to the approved design (frozen at confirm as .cline_context/ship_design.md), which goes back through the gate. ci_gate_timeout_secs caps each wait before the gate stops and asks (`!ship watch` resumes it). ci_gate_appear_grace_secs is how long 'no checks yet' is read as GitHub still attaching them rather than as no CI.",
+        "ci_gate_timeout_secs": 3600,
+        "ci_gate_poll_secs": 30,
+        "ci_gate_appear_grace_secs": 120
     }
 }
