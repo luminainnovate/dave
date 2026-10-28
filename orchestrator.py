@@ -1053,6 +1053,12 @@ async def lifespan(app: FastAPI):
     # Start periodic background cleanup
     cleanup_task = asyncio.create_task(periodic_cleanup())
 
+    # Pull requests waiting on CI outlive the process that opened them.
+    try:
+        _resume_ci_gate()
+    except Exception as e:
+        logger.error(f"[CI Gate] Could not resume: {e}")
+
     yield
     cleanup_task.cancel()
     await http_client.aclose()
@@ -2296,6 +2302,28 @@ async def _orchestrate(request: Request):
             return await _maybe_await(_progress_command_response(
                 _run_design_review(messages, "bugfix", streaming=is_streaming),
                 is_streaming, is_native))
+        elif "!approve" in prompt_lower and _ci_failure_waiting(messages):
+            project_dir = _get_bound_project_dir(messages)
+            logger.info("Command: CI failure approved; launching the fix build.")
+            instruction, fix_env, refusal = await asyncio.to_thread(
+                ship.ci_fix_request, project_dir)
+            if refusal:
+                return _command_response(refusal, is_streaming, is_native)
+            # The fix is a `!build` of the failure document, appended for the
+            # container only: OpenWebUI's history never sees this message.
+            fix_msg = await _trigger_build_pipeline_safe(
+                messages + [{"role": "user", "content": instruction}],
+                extra_env={**fix_env, "CI_FIX": "1"},
+                mode_label="CI fix (approved)",
+                skip_cooldown=True,
+            )
+            if "Build pipeline triggered" not in fix_msg:
+                ship.abort_fix(project_dir)
+            else:
+                fix_msg += ("\n\nWhen it passes its own gates it is pushed to the pull "
+                            "request, and merged only once CI passes. `!ship status` "
+                            "follows it.")
+            return _command_response(fix_msg, is_streaming, is_native)
         elif "!approve" in prompt_lower:
             design_pass = _read_design_pass(messages)
             ui = _DESIGN_PASS_UI[design_pass]
@@ -2397,9 +2425,19 @@ async def _orchestrate(request: Request):
             # and cannot be undone from chat, so the bare command only ever
             # describes what it would do.
             rest = messages[-1].get("content", "").strip()[len("!ship"):].strip()
-            if rest.lower().lstrip("-") in ("confirm", "yes", "y"):
-                logger.info("Command: Ship confirmed; committing and squash-merging.")
+            word = rest.lower().lstrip("-")
+            if word in ("confirm", "yes", "y"):
+                logger.info("Command: Ship confirmed; opening the PR for the CI gate.")
                 ship_msg = await asyncio.to_thread(ship.confirm, project_dir)
+                _start_ci_watch_if_due(project_dir)
+            elif word == "status":
+                logger.info("Command: Ship status requested.")
+                ship_msg = await asyncio.to_thread(ship.status, project_dir)
+                _start_ci_watch_if_due(project_dir)
+            elif word == "watch":
+                logger.info("Command: Ship watch requested.")
+                ship_msg = await asyncio.to_thread(ship.resume_watch, project_dir)
+                _start_ci_watch_if_due(project_dir)
             else:
                 logger.info("Command: Ship proposal requested.")
                 ship_msg = await asyncio.to_thread(ship.propose, project_dir, rest)
@@ -3577,8 +3615,9 @@ async def _trigger_build_pipeline(messages: list, extra_env: Optional[dict] = No
         build_base = ""
         try:
             build_base = ship.base_branch(abs_target_dir)
-            # A previous build's offer is stale the moment this one starts.
-            ship.clear_marker(abs_target_dir)
+            # A previous build's offer is stale the moment this one starts. A PR
+            # still going through the CI gate is not an offer, and survives.
+            ship.clear_offer(abs_target_dir)
         except Exception as e:
             logger.warning(f"Could not prepare the build marker: {e}")
 
@@ -3589,6 +3628,9 @@ async def _trigger_build_pipeline(messages: list, extra_env: Optional[dict] = No
         # sleeps 10s before its first poll, and the builder's own EXIT trap can
         # fire inside that window on a fast failure.
         _live_builds.add(container_name)
+        if extra_env and extra_env.get("CI_FIX"):
+            # So a restart can find this container and finish the fix's bookkeeping.
+            ship.note_fix_container(abs_target_dir, container_name)
 
         # Launch the Safety Monitor to ensure VRAM is released when container stops/deleted
         asyncio.create_task(_docker_safety_monitor(
@@ -3673,14 +3715,97 @@ async def is_pipeline_active() -> bool:
         return False
 
 
-def _record_finished_build(container_name: str, workspace: str, base_branch: str) -> None:
-    """Write the marker `!ship` reads, without letting git trouble kill the monitor."""
+def _record_finished_build(container_name: str, workspace: str, base_branch: str) -> bool:
+    """
+    Write the marker `!ship` reads, without letting git trouble kill the monitor.
+
+    A CI fix build finishing is a different event: its result is pushed back to
+    the pull request instead of offered. Returns True when the CI gate should
+    start watching again.
+    """
     if not workspace:
-        return
+        return False
     try:
+        marker = ship.read_marker(workspace)
+        if marker and marker.get("state") == ship.STATE_FIXING:
+            return ship.fix_build_finished(workspace) in ship.WATCHED_STATES
         ship.record_build_complete(workspace, container=container_name, base=base_branch)
     except Exception as e:
         logger.warning(f"[Safety Monitor] Could not record the finished build: {e}")
+    return False
+
+
+# One CI watcher per workspace, so `!ship status`, a restart and a fix build
+# finishing can all ask for one without polling GitHub twice over.
+_ci_watchers: dict = {}
+
+# Consecutive poll exceptions before a watcher gives up. `ship.advance` absorbs
+# gh trouble itself, so reaching this is a bug, and spinning on it forever is not
+# a better outcome than `!ship watch`.
+CI_WATCH_MAX_ERRORS = 10
+
+
+def _start_ci_watch(workspace: str) -> None:
+    workspace = os.path.abspath(workspace)
+    task = _ci_watchers.get(workspace)
+    if task and not task.done():
+        return
+    _ci_watchers[workspace] = asyncio.create_task(_ci_watch(workspace))
+
+
+async def _ci_watch(workspace: str) -> None:
+    """Drive ship.advance until the CI gate leaves the states it can wait in."""
+    logger.info(f"[CI Gate] Watching {workspace}")
+    errors = 0
+    try:
+        while True:
+            try:
+                state = await asyncio.to_thread(ship.advance, workspace)
+                errors = 0
+            except Exception as e:
+                errors += 1
+                logger.error(f"[CI Gate] Poll failed for {workspace} ({errors}): {e}")
+                if errors >= CI_WATCH_MAX_ERRORS:
+                    break
+                state = ship.STATE_AWAITING_CHECKS
+            if state not in ship.WATCHED_STATES:
+                logger.info(f"[CI Gate] {workspace}: {state or 'no marker'}. Watcher done.")
+                break
+            await asyncio.sleep(ship.ci_limits()["ci_gate_poll_secs"])
+    except asyncio.CancelledError:
+        logger.info(f"[CI Gate] Watcher for {workspace} cancelled.")
+
+
+def _resume_ci_gate() -> None:
+    """
+    Pick the CI gate back up after a restart.
+
+    A watched state needs its watcher back. A fix build needs its container
+    monitor back: that monitor is the only thing that pushes the fix when the
+    container exits, and it died with the previous process.
+    """
+    for workspace, state, marker in ship.watched_workspaces("conversations"):
+        if state in ship.WATCHED_STATES:
+            _start_ci_watch(workspace)
+        elif state == ship.STATE_FIXING and marker.get("container"):
+            logger.info(f"[CI Gate] Re-attaching to fix build {marker['container']}")
+            _live_builds.add(marker["container"])
+            asyncio.create_task(_docker_safety_monitor(marker["container"], workspace=workspace))
+
+
+def _ci_failure_waiting(messages: list) -> bool:
+    """True when `!approve` should mean "fix the CI failure", not "build the design"."""
+    project_dir = _get_bound_project_dir(messages)
+    if not project_dir:
+        return False
+    marker = ship.read_marker(project_dir)
+    return bool(marker) and marker.get("state") == ship.STATE_CI_FAILED
+
+
+def _start_ci_watch_if_due(project_dir: str) -> None:
+    marker = ship.read_marker(project_dir)
+    if marker and marker.get("state") in ship.WATCHED_STATES:
+        _start_ci_watch(project_dir)
 
 
 async def _docker_safety_monitor(container_name: str, workspace: str = "",
@@ -3711,7 +3836,9 @@ async def _docker_safety_monitor(container_name: str, workspace: str = "",
             if proc.returncode != 0:
                 # Container likely deleted or vanished
                 logger.info(f"[Safety Monitor] Container {container_name} vanished. Releasing VRAM.")
-                _record_finished_build(container_name, workspace, base_branch)
+                if await asyncio.to_thread(
+                        _record_finished_build, container_name, workspace, base_branch):
+                    _start_ci_watch(workspace)
                 _live_builds.discard(container_name)
                 await shutdown_expert()
                 break
@@ -3719,7 +3846,9 @@ async def _docker_safety_monitor(container_name: str, workspace: str = "",
             status = stdout.decode().strip().lower()
             if status == "false":
                 logger.info(f"[Safety Monitor] Container {container_name} stopped. Releasing VRAM.")
-                _record_finished_build(container_name, workspace, base_branch)
+                if await asyncio.to_thread(
+                        _record_finished_build, container_name, workspace, base_branch):
+                    _start_ci_watch(workspace)
                 _live_builds.discard(container_name)
                 await shutdown_expert()
                 break

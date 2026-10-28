@@ -83,34 +83,87 @@ class Workspace:
     def branch(self):
         return git(self.root, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
 
+    def head(self, ref="HEAD"):
+        return git(self.root, "rev-parse", ref).stdout.strip()
+
 
 class FakeGh:
-    """`gh` on PATH, recording every call. Restores PATH on exit."""
+    """
+    `gh` on PATH, recording every call. Restores PATH on exit.
+
+    Responses are scripted per subcommand ("pr view", "run list", ...) with
+    `script`, and can be changed between calls: the first queued response is
+    used and dropped, and the last one repeats. Unscripted calls get the old
+    canned answers.
+    """
 
     def __init__(self, merge_fails=False):
         self.tmp = tempfile.TemporaryDirectory()
         self.log = os.path.join(self.tmp.name, "calls.log")
+        self.argv_log = os.path.join(self.tmp.name, "argv.jsonl")
+        self.responses = os.path.join(self.tmp.name, "responses.json")
         script = os.path.join(self.tmp.name, "gh")
         with open(script, "w") as f:
             f.write(
-                "#!/bin/sh\n"
-                f'echo "$@" >> {self.log}\n'
-                'case "$1 $2" in\n'
-                '  "pr create") echo https://github.test/pr/1 ;;\n'
-                '  "pr merge") '
-                + ("echo 'protected branch' >&2; exit 1 ;;\n" if merge_fails else "echo merged ;;\n") +
-                '  "pr view") echo https://github.test/pr/1 ;;\n'
-                'esac\n'
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                "d = os.path.dirname(os.path.abspath(__file__))\n"
+                "args = sys.argv[1:]\n"
+                "open(os.path.join(d, 'calls.log'), 'a').write(' '.join(args) + '\\n')\n"
+                "open(os.path.join(d, 'argv.jsonl'), 'a').write(json.dumps(args) + '\\n')\n"
+                "path = os.path.join(d, 'responses.json')\n"
+                "try:\n"
+                "    responses = json.load(open(path))\n"
+                "except Exception:\n"
+                "    responses = {}\n"
+                "queue = responses.get(' '.join(args[:2]))\n"
+                "if queue:\n"
+                "    r = queue[0]\n"
+                "    if len(queue) > 1:\n"
+                "        queue.pop(0)\n"
+                "        json.dump(responses, open(path, 'w'))\n"
+                "    sys.stdout.write(r.get('out', ''))\n"
+                "    sys.stderr.write(r.get('err', ''))\n"
+                "    sys.exit(r.get('code', 0))\n"
+                "key = ' '.join(args[:2])\n"
+                "if key == 'pr create':\n"
+                "    print('https://github.test/pull/1')\n"
+                "elif key == 'pr merge':\n"
+                + ("    sys.stderr.write('protected branch\\n'); sys.exit(1)\n" if merge_fails
+                   else "    print('merged')\n") +
+                "elif key == 'pr view':\n"
+                "    print('https://github.test/pull/1')\n"
             )
         os.chmod(script, os.stat(script).st_mode | stat.S_IEXEC)
         self._path = os.environ["PATH"]
         os.environ["PATH"] = self.tmp.name + os.pathsep + self._path
+
+    def script(self, key, *responses):
+        """Queue responses for a subcommand: dicts with out/err/code, or JSON-able data."""
+        try:
+            with open(self.responses) as f:
+                current = json.load(f)
+        except Exception:
+            current = {}
+        current[key] = [r if isinstance(r, dict) and {"out", "err", "code"} & set(r)
+                        else {"out": json.dumps(r)} for r in responses]
+        with open(self.responses, "w") as f:
+            json.dump(current, f)
 
     def calls(self):
         if not os.path.exists(self.log):
             return []
         with open(self.log) as f:
             return [ln.strip() for ln in f if ln.strip()]
+
+    def argvs(self):
+        if not os.path.exists(self.argv_log):
+            return []
+        with open(self.argv_log) as f:
+            return [json.loads(ln) for ln in f if ln.strip()]
+
+    def merges(self):
+        return [a for a in self.argvs() if a[:2] == ["pr", "merge"]]
 
     def __enter__(self):
         return self
@@ -226,7 +279,7 @@ def test_the_title_comes_from_the_design_document():
     check("the design heading is the title", "Add the widget cache" in out, out)
 
 
-def test_confirm_commits_pushes_and_squash_merges():
+def test_confirm_commits_pushes_and_opens_a_pr_without_merging():
     w = Workspace()
     w.build()
     ship.record_build_complete(w.root, base="main")
@@ -234,9 +287,9 @@ def test_confirm_commits_pushes_and_squash_merges():
         out = ship.confirm(w.root)
     calls = gh.calls()
 
-    check("it reports the squash-merge", "Squash-merged into `main`" in out, out)
+    check("it reports the PR waiting on CI", "waiting for CI before merging" in out, out)
     check("a PR was opened", any(c.startswith("pr create") for c in calls), calls)
-    check("and squash-merged", any("pr merge" in c and "--squash" in c for c in calls), calls)
+    check("and NOT merged before CI ran", not gh.merges(), calls)
     check("the branch reached origin",
           "agent/build-1700000000" in git(w.root, "ls-remote", "origin").stdout)
 
@@ -244,8 +297,12 @@ def test_confirm_commits_pushes_and_squash_merges():
     check("the build's file is in the commit", "widget.py" in committed, committed)
     check("the conversation transcript is not", "conversation.json" not in committed, committed)
     check("nor the design document", "distill_architect.md" not in committed, committed)
-    check("the marker is spent", ship.read_marker(w.root) is None)
-    check("and the workspace is back on main", w.branch() == "main", w.branch())
+    marker = ship.read_marker(w.root)
+    check("the marker now waits on checks",
+          marker and marker["state"] == ship.STATE_AWAITING_CHECKS, marker)
+    check("for the exact commit pushed",
+          marker and marker["head_sha"] == w.head("agent/build-1700000000"), marker)
+    check("and the workspace stays on the branch", w.branch() == "agent/build-1700000000", w.branch())
 
 
 def test_confirm_works_when_gitignore_already_covers_the_scratch_dirs():
@@ -268,7 +325,7 @@ def test_confirm_works_when_gitignore_already_covers_the_scratch_dirs():
     with FakeGh():
         out = ship.confirm(w.root)
     check("the push is not refused", "Could not push" not in out, out)
-    check("it merges", "Squash-merged into `main`" in out, out)
+    check("it opens the PR", "waiting for CI before merging" in out, out)
 
     committed = git(w.root, "show", "--name-only", "--format=", "agent/build-1700000000").stdout
     check("the build's file is committed", "widget.py" in committed, committed)
@@ -292,7 +349,7 @@ def test_confirm_skips_an_ignored_path_the_branch_already_touched():
     with FakeGh():
         out = ship.confirm(w.root)
     check("the push is not refused", "Could not push" not in out, out)
-    check("it merges", "Squash-merged into `main`" in out, out)
+    check("it opens the PR", "waiting for CI before merging" in out, out)
 
 
 def test_paths_with_spaces_and_renames_survive_staging():
@@ -308,29 +365,13 @@ def test_paths_with_spaces_and_renames_survive_staging():
     ship.record_build_complete(w.root, base="main")
     with FakeGh():
         out = ship.confirm(w.root)
-    check("it merges", "Squash-merged into `main`" in out, out)
+    check("it opens the PR", "waiting for CI before merging" in out, out)
 
     committed = git(w.root, "show", "--name-only", "--format=", "agent/build-1700000000").stdout
     check("the spaced new file is committed", "a file with spaces.py" in committed, committed)
     check("the rename's new half is committed", "new name.py" in committed, committed)
     tree = git(w.root, "ls-tree", "-r", "--name-only", "agent/build-1700000000").stdout
     check("and the old half is gone from the tree", "old name.py" not in tree, tree)
-
-
-def test_a_refused_merge_still_reports_the_open_pull_request():
-    w = Workspace()
-    w.build()
-    ship.record_build_complete(w.root, base="main")
-    with FakeGh(merge_fails=True):
-        out = ship.confirm(w.root)
-
-    check("it does not claim a merge", "Squash-merged" not in out, out)
-    check("it gives the PR url", "https://github.test/pr/1" in out, out)
-    check("it explains why", "branch protection" in out, out)
-    check("and the offer is still live for a retry",
-          ship.read_marker(w.root) is not None)
-    check("the commit was still made",
-          "widget.py" in git(w.root, "show", "--name-only", "--format=", "HEAD").stdout)
 
 
 def test_confirm_ships_work_the_agent_already_committed():
@@ -342,8 +383,314 @@ def test_confirm_ships_work_the_agent_already_committed():
           ship.record_build_complete(w.root, base="main") == "agent/build-1700000000")
     with FakeGh() as gh:
         out = ship.confirm(w.root)
-    check("it merges without a second commit", "Squash-merged" in out, out)
+    check("it ships without a second commit", "waiting for CI before merging" in out, out)
     check("the PR was opened", any(c.startswith("pr create") for c in gh.calls()))
+
+
+# =============================================================================
+# CI GATE
+# =============================================================================
+
+import time  # noqa: E402
+
+RUFF_LOG = "\n".join(
+    f"test-proxy\tLint with Ruff\t2026-10-28T10:00:0{i}.0000000Z {line}"
+    for i, line in enumerate([
+        "##[group]Run ruff check .",
+        "ruff check .",
+        "shell: /usr/bin/bash -e {0}",
+        "##[endgroup]",
+        "widget.py:1:1: F401 `os` imported but unused",
+        "Found 1 error.",
+        "##[error]Process completed with exit code 1.",
+    ])
+) + "\n"
+
+JOB_URL = "https://github.test/o/r/actions/runs/111/job/222"
+
+
+def pr_view(head, checks=(), state="OPEN", mergeable="MERGEABLE", merge_oid=""):
+    return {"number": 1, "url": "https://github.test/pull/1", "state": state,
+            "mergeable": mergeable, "headRefOid": head,
+            "statusCheckRollup": list(checks),
+            "mergeCommit": {"oid": merge_oid} if merge_oid else None}
+
+
+def check_run(conclusion="SUCCESS", status="COMPLETED", name="test-proxy"):
+    return {"__typename": "CheckRun", "name": name, "workflowName": "CI",
+            "status": status, "conclusion": conclusion if status == "COMPLETED" else "",
+            "detailsUrl": JOB_URL}
+
+
+def age(w, secs):
+    """Pretend the current checkpoint started `secs` ago."""
+    marker = ship.read_marker(w.root)
+    marker["since"] = time.time() - secs
+    ship._save_marker(w.root, marker)
+
+
+def shipped(gh, design=True):
+    """A workspace whose PR is open and waiting on CI."""
+    w = Workspace()
+    w.build()
+    if not design:
+        os.remove(os.path.join(w.ctx, "distill_architect.md"))
+    ship.record_build_complete(w.root, base="main")
+    ship.confirm(w.root)
+    return w
+
+
+def failed_on_pr(gh):
+    w = shipped(gh)
+    head = w.head()
+    gh.script("pr view", pr_view(head, [check_run("FAILURE")]))
+    gh.script("run view", {"out": RUFF_LOG, "err": "", "code": 0})
+    ship.advance(w.root)
+    return w, head
+
+
+def test_pending_checks_do_not_merge():
+    with FakeGh() as gh:
+        w = shipped(gh)
+        gh.script("pr view", pr_view(w.head(), [check_run(status="IN_PROGRESS")]))
+        state = ship.advance(w.root)
+    check("still waiting", state == ship.STATE_AWAITING_CHECKS, state)
+    check("nothing merged", not gh.merges(), gh.calls())
+
+
+def test_green_checks_merge_exactly_the_commit_they_tested():
+    with FakeGh() as gh:
+        w = shipped(gh)
+        head = w.head()
+        gh.script("pr view", pr_view(head, [check_run()]), pr_view(head, merge_oid="m" * 40))
+        state = ship.advance(w.root)
+    merges = gh.merges()
+    check("it merged once", len(merges) == 1, merges)
+    check("as a squash", merges and "--squash" in merges[0], merges)
+    check("pinned to the tested head",
+          merges and merges[0][merges[0].index("--match-head-commit") + 1] == head, merges)
+    check("and now waits on main", state == ship.STATE_AWAITING_BASE, state)
+    check("with the squash commit recorded",
+          ship.read_marker(w.root)["merge_sha"] == "m" * 40)
+    check("on main", w.branch() == "main", w.branch())
+
+
+def test_green_main_after_merge_is_integrated_and_announced_once():
+    with FakeGh() as gh:
+        w = shipped(gh)
+        head = w.head()
+        gh.script("pr view", pr_view(head, [check_run()]), pr_view(head, merge_oid="m" * 40))
+        ship.advance(w.root)
+        gh.script("run list", [{"databaseId": 9, "status": "completed", "conclusion": "success",
+                                "workflowName": "CI", "name": "CI", "url": "u"}])
+        state = ship.advance(w.root)
+        run_lists = [a for a in gh.argvs() if a[:2] == ["run", "list"]]
+    check("integrated", state == ship.STATE_INTEGRATED, state)
+    check("it asked about the squash commit", run_lists and "m" * 40 in run_lists[0], run_lists)
+    offer = ship.pending_offer(w.root)
+    check("the user is told", offer and "Integrated into `main`" in offer, offer)
+    check("once", ship.pending_offer(w.root) is None)
+    check("and the marker is spent", ship.read_marker(w.root) is None)
+
+
+def test_a_failed_check_writes_the_root_causes_and_keeps_the_pr_open():
+    with FakeGh() as gh:
+        w, head = failed_on_pr(gh)
+        merges = gh.merges()
+    marker = ship.read_marker(w.root)
+    check("not merged", not merges, merges)
+    check("waiting for approval", marker["state"] == ship.STATE_CI_FAILED, marker["state"])
+    with open(ship.ci_failure_path(w.root)) as f:
+        doc = f.read()
+    check("the doc is unresolved", "**Status:** UNRESOLVED" in doc, doc)
+    check("it names the failing step", "Lint with Ruff" in doc, doc)
+    check("and the command it ran", "ruff check ." in doc, doc)
+    check("and the error line", "F401" in doc, doc)
+    check("and scopes the fix to the approved design", "ship_design.md" in doc, doc)
+    notice = ship.pending_offer(w.root)
+    check("chat shows the cause", notice and "F401" in notice, notice)
+    check("and offers !approve", notice and "`!approve`" in notice, notice)
+    check("with no fenced block mover could turn into a file",
+          notice and "```" not in notice, notice)
+
+
+def test_the_approved_design_is_frozen_where_a_fix_build_cannot_delete_it():
+    with FakeGh() as gh:
+        w = shipped(gh)
+    frozen = os.path.join(w.ctx, ship.SHIP_DESIGN_NAME)
+    check("a copy exists", os.path.exists(frozen))
+    import fnmatch
+    check("outside the container's distill_*.md glob",
+          not fnmatch.fnmatch(ship.SHIP_DESIGN_NAME, "distill_*.md"))
+
+
+def test_approve_turns_the_failure_into_a_scoped_fix_build():
+    with FakeGh() as gh:
+        w, head = failed_on_pr(gh)
+        w.write(".build_complete", "VERIFIED\nSAFE\n")  # the original build's
+        instruction, env, refusal = ship.ci_fix_request(w.root)
+    check("no refusal", refusal is None, refusal)
+    check("it is a build trigger", instruction.startswith("!build "), instruction[:80])
+    check("carrying the cause", "F401" in instruction, instruction)
+    check("and the approved design as scope",
+          "APPROVED DESIGN:" in instruction and "Add the widget cache" in instruction, instruction)
+    check("the container stays on the PR branch",
+          env == {"BUILD_BRANCH": "agent/build-1700000000"}, env)
+    check("the marker is fixing", ship.read_marker(w.root)["state"] == ship.STATE_FIXING)
+    check("a stale completion cannot vouch for the fix",
+          not os.path.exists(os.path.join(w.root, ".build_complete")))
+
+
+def test_without_a_design_the_fix_is_not_handed_an_empty_scope():
+    with FakeGh() as gh:
+        w = shipped(gh, design=False)
+        gh.script("pr view", pr_view(w.head(), [check_run("FAILURE")]))
+        gh.script("run view", {"out": RUFF_LOG, "err": "", "code": 0})
+        ship.advance(w.root)
+        instruction, _, _ = ship.ci_fix_request(w.root)
+    check("no design block", "APPROVED DESIGN" not in instruction, instruction)
+
+
+def test_a_fix_that_failed_its_own_gates_is_not_pushed():
+    with FakeGh() as gh:
+        w, head = failed_on_pr(gh)
+        ship.ci_fix_request(w.root)
+        w.write("widget.py", "cache = {}  # half done\n")
+        state = ship.fix_build_finished(w.root)
+    remote = git(w.root, "ls-remote", "origin", "agent/build-1700000000").stdout.split()[0]
+    check("back to waiting for approval", state == ship.STATE_CI_FAILED, state)
+    check("the PR branch did not move", remote == head, (remote, head))
+    notice = ship.pending_offer(w.root)
+    check("the user is told", notice and "without passing its own gates" in notice, notice)
+
+
+def test_a_passing_fix_is_pushed_to_the_same_pr_and_rechecked():
+    with FakeGh() as gh:
+        w, head = failed_on_pr(gh)
+        ship.ci_fix_request(w.root)
+        w.write("widget.py", "cache = {}\n# fixed\n")
+        w.write(".build_complete", "VERIFIED\nSAFE\n")
+        state = ship.fix_build_finished(w.root)
+        new_head = w.head()
+        creates = [c for c in gh.calls() if c.startswith("pr create")]
+        gh.script("pr view", pr_view(new_head, [check_run()]),
+                  pr_view(new_head, merge_oid="m" * 40))
+        ship.advance(w.root)
+        merges = gh.merges()
+    check("waiting on CI again", state == ship.STATE_AWAITING_CHECKS, state)
+    check("a new commit", new_head != head)
+    check("on the same PR, not a new one", len(creates) == 1, creates)
+    remote = git(w.root, "ls-remote", "origin", "agent/build-1700000000").stdout.split()[0]
+    check("pushed", remote == new_head)
+    committed = git(w.root, "show", "--name-only", "--format=", new_head).stdout
+    check("the completion flag is not committed", ".build_complete" not in committed, committed)
+    check("merged only now, at the fixed head",
+          len(merges) == 1 and new_head in merges[0], merges)
+    with open(ship.ci_failure_path(w.root)) as f:
+        doc = f.read()
+    check("and the failure record is resolved", "**Status:** RESOLVED" in doc, doc[:200])
+
+
+def test_red_main_after_merge_is_a_failure_with_a_fix_loop():
+    with FakeGh() as gh:
+        w = shipped(gh)
+        head = w.head()
+        gh.script("pr view", pr_view(head, [check_run()]), pr_view(head, merge_oid="m" * 40))
+        ship.advance(w.root)
+        gh.script("run list", [{"databaseId": 9, "status": "completed", "conclusion": "failure",
+                                "workflowName": "CI", "name": "CI", "url": "u"}])
+        gh.script("run view", {"out": RUFF_LOG, "err": "", "code": 0})
+        state = ship.advance(w.root)
+        notice = ship.pending_offer(w.root)
+        instruction, env, refusal = ship.ci_fix_request(w.root)
+    check("a failure", state == ship.STATE_CI_FAILED, state)
+    check("that says main is red", notice and "`main` is red" in notice, notice)
+    check("and how to revert", notice and "git revert mmmmmmm" in notice, notice)
+    check("the fix starts from main", refusal is None and w.branch() == "main", refusal)
+    check("on a branch of its own", env == {}, env)
+
+
+def test_a_red_main_fix_opens_its_own_pull_request():
+    with FakeGh() as gh:
+        w = shipped(gh)
+        head = w.head()
+        gh.script("pr view", pr_view(head, [check_run()]), pr_view(head, merge_oid="m" * 40))
+        ship.advance(w.root)
+        gh.script("run list", [{"databaseId": 9, "status": "completed", "conclusion": "failure",
+                                "workflowName": "CI", "name": "CI", "url": "u"}])
+        ship.advance(w.root)
+        ship.ci_fix_request(w.root)
+        git(w.root, "checkout", "-q", "-b", "agent/build-1700000999")
+        w.write("widget.py", "cache = {}\n# fixed on main\n")
+        w.write(".build_complete", "VERIFIED\nSAFE\n")
+        gh.script("pr create", {"out": "https://github.test/pull/2\n", "err": "", "code": 0})
+        state = ship.fix_build_finished(w.root)
+    marker = ship.read_marker(w.root)
+    check("waiting on the new PR", state == ship.STATE_AWAITING_CHECKS, state)
+    check("PR #2", marker["pr_number"] == "2", marker.get("pr_number"))
+    check("for the fix branch", marker["branch"] == "agent/build-1700000999", marker["branch"])
+
+
+def test_a_conflict_with_main_is_reported_before_waiting_on_ci():
+    with FakeGh() as gh:
+        w = shipped(gh)
+        gh.script("pr view", pr_view(w.head(), [check_run(status="QUEUED")],
+                                     mergeable="CONFLICTING"))
+        state = ship.advance(w.root)
+    check("a failure", state == ship.STATE_CI_FAILED, state)
+    check("marked as a conflict", ship.read_marker(w.root)["failure"]["conflict"])
+    check("not merged", not gh.merges())
+
+
+def test_a_branch_moved_by_someone_else_stalls_until_adopted():
+    with FakeGh() as gh:
+        w = shipped(gh)
+        gh.script("pr view", pr_view("f" * 40, [check_run()]))
+        check("waits during the grace period",
+              ship.advance(w.root) == ship.STATE_AWAITING_CHECKS)
+        age(w, 1000)
+        state = ship.advance(w.root)
+        check("then stalls", state == ship.STATE_STALLED, state)
+        check("without merging code it never checked", not gh.merges(), gh.calls())
+        gh.script("pr view", {"out": json.dumps({"headRefOid": "f" * 40,
+                                                 "url": "https://github.test/pull/1"}),
+                              "err": "", "code": 0})
+        ship.resume_watch(w.root)
+    marker = ship.read_marker(w.root)
+    check("!ship watch adopts the new head",
+          marker["state"] == ship.STATE_AWAITING_CHECKS and marker["head_sha"] == "f" * 40, marker)
+
+
+def test_no_checks_and_no_workflows_never_merges():
+    with FakeGh() as gh:
+        w = shipped(gh)
+        gh.script("pr view", pr_view(w.head(), []))
+        age(w, 1000)
+        state = ship.advance(w.root)
+    check("stalls", state == ship.STATE_STALLED, state)
+    check("not merged", not gh.merges())
+
+
+def test_a_refused_merge_stalls_with_the_pr_still_open():
+    with FakeGh(merge_fails=True) as gh:
+        w = shipped(gh)
+        gh.script("pr view", pr_view(w.head(), [check_run()]))
+        state = ship.advance(w.root)
+    notice = ship.pending_offer(w.root)
+    check("stalled", state == ship.STATE_STALLED, state)
+    check("it gives the PR url", notice and "https://github.test/pull/1" in notice, notice)
+    check("and GitHub's reason", notice and "protected branch" in notice, notice)
+
+
+def test_a_new_build_does_not_orphan_a_ship_in_flight():
+    with FakeGh() as gh:
+        w = shipped(gh)
+    ship.clear_offer(w.root)
+    check("the CI record survives a new build starting",
+          ship.read_marker(w.root)["state"] == ship.STATE_AWAITING_CHECKS)
+    check("and that build's finish does not overwrite it",
+          ship.record_build_complete(w.root, base="main") is None)
+    check("!ship refuses to start a second ship", "Already shipping" in ship.propose(w.root))
 
 
 if __name__ == "__main__":
