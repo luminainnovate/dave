@@ -2304,9 +2304,12 @@ async def _orchestrate(request: Request):
                 is_streaming, is_native))
         elif "!approve" in prompt_lower and _ci_failure_waiting(messages):
             project_dir = _get_bound_project_dir(messages)
-            logger.info("Command: CI failure approved; launching the fix build.")
+            # `!approve all` also takes on the failures that predate this change.
+            widen = bool(re.search(r"!approve\s+all\b", prompt_lower))
+            logger.info(f"Command: CI failure approved{' (all)' if widen else ''}; "
+                        f"launching the fix build.")
             instruction, fix_env, refusal = await asyncio.to_thread(
-                ship.ci_fix_request, project_dir)
+                ship.ci_fix_request, project_dir, widen)
             if refusal:
                 return _command_response(refusal, is_streaming, is_native)
             # The fix is a `!build` of the failure document, appended for the
@@ -2433,6 +2436,10 @@ async def _orchestrate(request: Request):
             elif word == "status":
                 logger.info("Command: Ship status requested.")
                 ship_msg = await asyncio.to_thread(ship.status, project_dir)
+                _start_ci_watch_if_due(project_dir)
+            elif word == "recheck":
+                logger.info("Command: Ship recheck requested.")
+                ship_msg = await asyncio.to_thread(ship.recheck, project_dir)
                 _start_ci_watch_if_due(project_dir)
             elif word == "watch":
                 logger.info("Command: Ship watch requested.")
