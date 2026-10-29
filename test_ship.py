@@ -208,6 +208,14 @@ def test_a_build_that_changed_nothing_records_nothing():
           ship.record_build_complete(w.root, base="main") is None)
 
 
+def test_an_unstaged_edit_listed_first_keeps_its_whole_path():
+    """`git status --porcelain` starts " M path"; stripping that ate a letter."""
+    w = Workspace()
+    w.write("README.md", "changed\n")
+    paths = ship._status_paths(w.root)
+    check("the path is intact", "README.md" in paths, paths)
+
+
 def test_the_offer_is_made_once_and_survives_a_restart():
     w = Workspace()
     w.build()
@@ -611,7 +619,8 @@ def test_a_fix_that_failed_its_own_gates_is_not_pushed():
     check("back to waiting for approval", state == ship.STATE_CI_FAILED, state)
     check("the PR branch did not move", remote == head, (remote, head))
     notice = ship.pending_offer(w.root)
-    check("the user is told", notice and "without passing its own gates" in notice, notice)
+    check("the user is told", notice and "None of this round's 1 issue(s) was fixed" in notice, notice)
+    check("with the reason", notice and "never reached VERIFIED, SAFE" in notice, notice)
 
 
 def test_a_passing_fix_is_pushed_to_the_same_pr_and_rechecked():
@@ -800,6 +809,10 @@ def red_pr(gh, baseline=True):
     return w
 
 
+def planned_commands(w):
+    return [i["command"] for i in ship.read_marker(w.root)["fix"]["issues"]]
+
+
 def origins(w):
     causes = ship.read_marker(w.root)["failure"]["causes"]
     return {c["workflow"]: c.get("origin") for c in causes}
@@ -845,7 +858,7 @@ def test_approve_all_takes_on_the_older_failures_but_never_the_runner():
     with FakeGh() as gh:
         w = red_pr(gh)
         instruction, _, _ = ship.ci_fix_request(w.root, include_preexisting=True)
-    check("lint is now in scope", "npm run lint" in instruction, instruction)
+    check("lint is now in scope", "npm run lint" in planned_commands(w), planned_commands(w))
     check("the runner is still not", "playwright" not in instruction, instruction)
 
 
@@ -886,7 +899,7 @@ def test_without_a_baseline_every_failure_is_treated_as_ours():
         instruction, _, _ = ship.ci_fix_request(w.root)
     found = origins(w)
     check("unverified, not pre-existing", found.get("test") == "unverified", found)
-    check("so lint stays in scope", "npm run lint" in instruction, instruction)
+    check("so lint stays in scope", "npm run lint" in planned_commands(w), planned_commands(w))
     check("the runner is still recognised from its log", found.get("ui") == "environment", found)
 
 
@@ -918,6 +931,213 @@ def test_recheck_hands_a_now_green_pr_back_to_the_gate():
         out = ship.recheck(w.root)
     check("back to waiting on checks",
           ship.read_marker(w.root)["state"] == ship.STATE_AWAITING_CHECKS, out)
+
+
+# =============================================================================
+# ONE ISSUE AT A TIME
+# =============================================================================
+
+def suite_log():
+    """A backend suite failing in two test files, as vitest prints it."""
+    return step_log("backend", "Backend test suite", "npm run test:coverage", [
+        "FAIL  test/record-attestation.test.ts > attests the role on confirm",
+        "AssertionError: expected 'corroborated' to be 'attested'",
+        "❯ src/routes/attestations.ts:120:9",
+        "FAIL  test/org-binding.test.ts > binds the org",
+        "TypeError: Cannot read properties of undefined (reading 'id')",
+        "Test Files  2 failed | 10 passed (12)",
+    ])
+
+
+def queued(gh, all_=True):
+    """A PR red on a two-file suite, an RLS test and lint, approved as a queue."""
+    w = shipped(gh)
+    head = w.head()
+    w.write("Backend/test/record-attestation.test.ts", "x\n")
+    w.write("Backend/src/routes/attestations.ts", "x\n")
+    git(w.root, "add", "Backend")
+    git(w.root, "commit", "-q", "-m", "backend")
+    git(w.root, "push", "-q", "origin", "agent/build-1700000000")
+    head = w.head()
+    marker = ship.read_marker(w.root)
+    marker["head_sha"] = head
+    ship._save_marker(w.root, marker)
+    gh.script("pr view", pr_view(head, [
+        triage_check("test", "unit", 11, 21),
+        triage_check("ci", "backend", 14, 24),
+        triage_check("tenant-isolation", "isolation", 12, 22),
+    ]))
+    gh.script("run view 11 --job 21 --log-failed", {"out": step_log(
+        "unit", "Run npm run lint", "npm run lint",
+        ["/home/runner/work/r/r/src/a.ts",
+         "##[error]  1:1  error  Insert `;`  prettier/prettier"]), "err": "", "code": 0})
+    gh.script("run view 14 --job 24 --log-failed", {"out": suite_log(), "err": "", "code": 0})
+    gh.script("run view 12 --job 22 --log-failed", {"out": step_log(
+        "isolation", "Routes under enforced RLS", "npm run test:rls",
+        ["FAIL  test/rls-enforced.test.ts > finds the owner's claim"]), "err": "", "code": 0})
+    ship.advance(w.root)
+    first = ship.ci_fix_request(w.root, include_preexisting=all_)
+    return w, first
+
+
+def finish_issue(w, change=None, passed=True):
+    """What a container leaves behind for one issue."""
+    if change:
+        for rel, content in change.items():
+            w.write(rel, content)
+    if passed:
+        w.write(".build_complete", "VERIFIED\nSAFE\n")
+    return ship.fix_build_finished(w.root)
+
+
+def test_each_failure_becomes_its_own_issue_with_lint_last():
+    with FakeGh() as gh:
+        w, _ = queued(gh)
+    titles = [i["title"] for i in ship.read_marker(w.root)["fix"]["issues"]]
+    check("four issues: two suite files, RLS, lint", len(titles) == 4, titles)
+    check("the suite is split by failing test file",
+          any("record-attestation" in t for t in titles) and any("org-binding" in t for t in titles), titles)
+    check("lint runs last", "npm run lint" in titles[-1] or "lint" in titles[-1].lower(), titles)
+
+
+def test_an_issue_instruction_is_scoped_and_points_at_the_source():
+    with FakeGh() as gh:
+        w, (instruction, env, refusal) = queued(gh)
+    check("no refusal", refusal is None, refusal)
+    check("issue 1 of 4", "Fix CI issue 1 of 4" in instruction, instruction[:120])
+    check("only that test file's errors",
+          "expected 'corroborated'" in instruction and "Cannot read properties" not in instruction,
+          instruction)
+    check("others are named as separate builds", "separate issues" in instruction, instruction)
+    check("the stack frame's source file, resolved under Backend/",
+          "- `Backend/src/routes/attestations.ts`" in instruction, instruction)
+    check("and the test file, resolved the same way",
+          "- `Backend/test/record-attestation.test.ts`" in instruction, instruction)
+    check("a faster way to verify", "on `test/record-attestation.test.ts` alone" in instruction, instruction)
+    check("the PR branch is kept", env == {"BUILD_BRANCH": "agent/build-1700000000"}, env)
+
+
+def test_a_fixed_issue_is_committed_locally_and_the_next_one_starts():
+    with FakeGh() as gh:
+        w, _ = queued(gh)
+        remote_before = git(w.root, "ls-remote", "origin", "agent/build-1700000000").stdout.split()[0]
+        state = finish_issue(w, {"Backend/src/routes/attestations.ts": "fixed\n"})
+        nxt = ship.next_fix_request(w.root)
+    issues = ship.read_marker(w.root)["fix"]["issues"]
+    remote_after = git(w.root, "ls-remote", "origin", "agent/build-1700000000").stdout.split()[0]
+    check("still fixing", state == ship.STATE_FIXING, state)
+    check("issue 1 is fixed", issues[0]["status"] == "fixed", issues[0])
+    check("as its own commit", git(w.root, "log", "-1", "--format=%s").stdout.startswith("Fix CI:"))
+    check("not pushed mid-round", remote_before == remote_after)
+    check("the next instruction is issue 2", nxt and "Fix CI issue 2 of 4" in nxt[0], nxt and nxt[0][:80])
+    check("the completion flag is cleared for it",
+          not os.path.exists(os.path.join(w.root, ".build_complete")))
+
+
+def test_a_failed_issue_is_kept_as_a_diff_and_rolled_back():
+    with FakeGh() as gh:
+        w, _ = queued(gh)
+        head = w.head()
+        state = finish_issue(w, {"Backend/src/routes/attestations.ts": "half done\n",
+                                 "scratch.py": "junk\n"}, passed=False)
+    issue = ship.read_marker(w.root)["fix"]["issues"][0]
+    check("the queue moves on", state == ship.STATE_FIXING, state)
+    check("the issue is not fixed", issue["status"] == "not fixed", issue)
+    check("its diff is kept", issue.get("diff") and os.path.exists(os.path.join(w.root, issue["diff"])), issue)
+    with open(os.path.join(w.root, issue["diff"])) as f:
+        diff = f.read()
+    check("including the new file", "scratch.py" in diff and "half done" in diff, diff)
+    check("the branch is back at its last commit", w.head() == head)
+    dirty = [ln for ln in git(w.root, "status", "--porcelain").stdout.splitlines()
+             if ".cline_context" not in ln]
+    check("with a clean tree", not dirty, dirty)
+    check("and the orchestration scratch untouched",
+          os.path.exists(ship.ci_failure_path(w.root))
+          and os.path.exists(os.path.join(w.ctx, "ship_design.md")))
+
+
+def test_the_round_is_pushed_once_every_issue_has_had_its_build():
+    with FakeGh() as gh:
+        w, _ = queued(gh)
+        finish_issue(w, {"Backend/src/routes/attestations.ts": "fixed\n"})
+        finish_issue(w, passed=False)
+        finish_issue(w, {"Backend/src/routes/attestations.ts": "fixed again\n"})
+        state = finish_issue(w, {"src/a.ts": "formatted;\n"})
+    marker = ship.read_marker(w.root)
+    remote = git(w.root, "ls-remote", "origin", "agent/build-1700000000").stdout.split()[0]
+    check("back on the gate", state == ship.STATE_AWAITING_CHECKS, state)
+    check("pushed", remote == w.head())
+    check("waiting on the pushed head", marker["head_sha"] == w.head())
+    commits = git(w.root, "log", "--format=%s", "origin/main..HEAD").stdout
+    check("one commit per fixed issue", commits.count("Fix CI:") == 3, commits)
+    notice = ship.pending_offer(w.root)
+    check("the notice tallies the round", notice and "3 of 4 issue(s) fixed" in notice, notice)
+    check("and lists each issue's outcome", notice and "not fixed" in notice, notice)
+
+
+def test_a_round_that_fixed_nothing_pushes_nothing():
+    with FakeGh() as gh:
+        w, _ = queued(gh, all_=True)
+        head = w.head()
+        for _ in range(4):
+            state = finish_issue(w, passed=False)
+    check("back to waiting for approval", state == ship.STATE_CI_FAILED, state)
+    remote = git(w.root, "ls-remote", "origin", "agent/build-1700000000").stdout.split()[0]
+    check("nothing pushed", remote == head)
+
+
+def test_an_error_code_leads_to_the_code_that_raises_it():
+    w = Workspace()
+    w.write("Backend/src/routes/attestations.ts",
+            'throw conflict("DOMAIN_NOT_A_VERIFIED_CUSTOMER", "not a customer");\n')
+    w.write("Backend/test/rls-enforced.test.ts", 'expect(code).not.toBe("DOMAIN_NOT_A_VERIFIED_CUSTOMER")\n')
+    w.write("docs/errors.md", "DOMAIN_NOT_A_VERIFIED_CUSTOMER\n")
+    git(w.root, "add", ".")
+    git(w.root, "commit", "-q", "-m", "src")
+    found = ship._raising_files(w.root, [
+        'AssertionError: {"statusCode":409,"code":"DOMAIN_NOT_A_VERIFIED_CUSTOMER"}'])
+    check("the source that throws it", found == ["Backend/src/routes/attestations.ts"], found)
+
+
+def test_formatting_only_lint_is_told_to_run_the_formatter():
+    issue = {"id": 1, "title": "lint", "step": "Run npm run lint", "command": "npm run lint",
+             "errors": ["src/a.ts:1:1  error  Insert `;`  prettier/prettier",
+                        "src/b.ts:2:3  error  Delete `·`  prettier/prettier"],
+             "error_count": 667, "files": [], "test_file": ""}
+    with FakeGh():
+        w = Workspace()
+        text = ship._issue_instruction(w.root, {"failure": {"scope": "pr"}, "base": "main",
+                                               "branch": "b"}, issue, 1)
+    check("formatter, not hand edits", "FORMATTING ONLY" in text, text)
+    check("the real total is given", "…and 665 more in the log" in text, text)
+
+
+def test_on_a_red_base_the_first_issue_starts_the_branch_the_rest_continue():
+    with FakeGh() as gh:
+        w = shipped(gh)
+        head = w.head()
+        merge = "m" * 40
+        gh.script("pr view", pr_view(head, [check_run()]), pr_view(head, merge_oid=merge))
+        ship.advance(w.root)
+        gh.script(f"run list --commit {merge}", [
+            {"databaseId": 9, "status": "completed", "conclusion": "failure",
+             "workflowName": "ci", "name": "ci", "url": "u"}])
+        gh.script("run view 9 --log-failed", {"out": suite_log(), "err": "", "code": 0})
+        ship.advance(w.root)
+        _, env, _ = ship.ci_fix_request(w.root)
+        check("the first issue starts its own branch", env == {}, env)
+        git(w.root, "checkout", "-q", "-b", "agent/build-1700000999")
+        state = finish_issue(w, {"widget.py": "fixed\n"})
+        _, env2 = ship.next_fix_request(w.root)
+        check("still fixing", state == ship.STATE_FIXING, state)
+        check("the second continues on it", env2 == {"BUILD_BRANCH": "agent/build-1700000999"}, env2)
+        gh.script("pr create", {"out": "https://github.test/pull/2\n", "err": "", "code": 0})
+        state = finish_issue(w, {"widget.py": "fixed twice\n"})
+    marker = ship.read_marker(w.root)
+    check("one PR for the round", state == ship.STATE_AWAITING_CHECKS and marker["pr_number"] == "2", marker.get("pr_number"))
+    notice = ship.pending_offer(w.root)
+    check("and the wording is about main, not a PR",
+          notice and "fixed for `main`" in notice, notice)
 
 
 if __name__ == "__main__":
