@@ -746,12 +746,22 @@ _STATE_LABELS = {
 # A GitHub Actions log line from `gh run view --log-failed`:
 # "<job>\t<step>\t<timestamp> <text>".
 _LOG_TIMESTAMP_RE = re.compile(r"^﻿?\d{4}-\d\d-\d\dT[\d:.]+Z ?")
+# Runners colour their output, and `--log-failed` keeps the escapes. Left in,
+# they land in ci_failure.md and in chat as `[36;1mnpm run lint[0m`.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 _ERROR_LINE_RE = re.compile(
     r"##\[error\]|\berror\b|\bfailed\b|\bfailure\b|traceback|exception"
-    r"|^\S+:\d+:\d+: [A-Z]{1,4}\d+|^E\s{2,}",
+    r"|^\S+:\d+:\d+: [A-Z]{1,4}\d+|^E\s{2,}|\d+ problems? \(",
     re.IGNORECASE,
 )
 _JOB_URL_RE = re.compile(r"/actions/runs/(\d+)/job/(\d+)")
+
+# ESLint, tsc --pretty and stylelint print a file's path on a line of its own
+# and then that file's problems as bare `line:col  error  message`. Kept alone,
+# those lines tell a fix build what is wrong but not where.
+_FILE_HEADER_RE = re.compile(r"^(?:/home/runner/work/[^/\s]+/[^/\s]+/)?(?P<path>[\w.$@+\-]+(?:/[\w.$@+\-\[\]]+)+\.\w+)$")
+_LOCATION_ONLY_RE = re.compile(r"^\d+:\d+\s")
+_RUNNER_CHECKOUT_RE = re.compile(r"/home/runner/work/[^/\s]+/[^/\s]+/")
 
 
 def ci_limits() -> dict:
@@ -1067,7 +1077,8 @@ def _parse_failed_log(text: str) -> dict:
         if len(parts) != 3:
             continue
         job, step, rest = parts
-        steps.setdefault((job, step), []).append(_LOG_TIMESTAMP_RE.sub("", rest))
+        steps.setdefault((job, step), []).append(
+            _LOG_TIMESTAMP_RE.sub("", _ANSI_RE.sub("", rest)))
     return steps
 
 
@@ -1084,17 +1095,29 @@ def _step_summary(lines: list) -> dict:
             command = "\n".join(b for b in body if b)[:500] or line[len("##[group]Run "):]
             break
 
-    errors, seen = [], set()
+    errors, seen, current_file = [], set(), ""
     for line in lines:
-        if line.startswith(("##[group]", "##[endgroup]")) or not _ERROR_LINE_RE.search(line):
+        if line.startswith(("##[group]", "##[endgroup]")):
             continue
-        cleaned = line.replace("##[error]", "").strip()
+        header = _FILE_HEADER_RE.match(line.strip())
+        if header:
+            current_file = header.group("path")
+            continue
+        if not _ERROR_LINE_RE.search(line):
+            continue
+        cleaned = _RUNNER_CHECKOUT_RE.sub("", line.replace("##[error]", "")).strip()
+        if current_file and _LOCATION_ONLY_RE.match(cleaned):
+            cleaned = f"{current_file}:{cleaned}"
         if cleaned and cleaned not in seen:
             seen.add(cleaned)
             errors.append(cleaned)
-    tail = [ln for ln in lines if not ln.startswith(("##[group]", "##[endgroup]"))]
+    tail = [_RUNNER_CHECKOUT_RE.sub("", ln) for ln in lines
+            if not ln.startswith(("##[group]", "##[endgroup]"))]
+    # The cap keeps the last lines, where the summary ("✖ 674 problems", the
+    # exit code) is - but the count is kept, so the record never reads as if
+    # the 15 shown were all there is.
     return {"command": command, "errors": errors[-MAX_ERROR_LINES:],
-            "tail": tail[-MAX_TAIL_LINES:]}
+            "error_count": len(errors), "tail": tail[-MAX_TAIL_LINES:]}
 
 
 def _steps_from_log(text: str) -> list:
@@ -1180,8 +1203,9 @@ def _causes_markdown(causes: list, fenced: bool, max_errors: int = MAX_ERROR_LIN
                           if step.get("command") else ""))
             for line in step.get("errors", [])[:max_errors]:
                 out.append(f"     - `{_one_line(line)}`")
-            if len(step.get("errors", [])) > max_errors:
-                out.append(f"     - …and {len(step['errors']) - max_errors} more")
+            total = max(step.get("error_count", 0), len(step.get("errors", [])))
+            if total > max_errors:
+                out.append(f"     - …and {total - max_errors} more error lines in the log")
             if fenced and step.get("tail"):
                 out += ["", "     ```text"]
                 out += [f"     {ln}" for ln in step["tail"]]
