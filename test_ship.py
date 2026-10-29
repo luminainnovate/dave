@@ -90,10 +90,10 @@ class FakeGh:
     """
     `gh` on PATH, recording every call. Restores PATH on exit.
 
-    Responses are scripted per subcommand ("pr view", "run list", ...) with
-    `script`, and can be changed between calls: the first queued response is
-    used and dropped, and the last one repeats. Unscripted calls get the old
-    canned answers.
+    Responses are scripted per argv prefix ("pr view", "run view 9 --json")
+    with `script`; the longest scripted prefix wins. They can be changed
+    between calls: the first queued response is used and dropped, and the last
+    one repeats. Unscripted calls get the old canned answers.
     """
 
     def __init__(self, merge_fails=False):
@@ -115,7 +115,9 @@ class FakeGh:
                 "    responses = json.load(open(path))\n"
                 "except Exception:\n"
                 "    responses = {}\n"
-                "queue = responses.get(' '.join(args[:2]))\n"
+                "key = next((' '.join(args[:n]) for n in range(len(args), 1, -1)\n"
+                "            if ' '.join(args[:n]) in responses), ' '.join(args[:2]))\n"
+                "queue = responses.get(key)\n"
                 "if queue:\n"
                 "    r = queue[0]\n"
                 "    if len(queue) > 1:\n"
@@ -565,6 +567,22 @@ def test_lint_errors_keep_the_file_they_belong_to():
           any(e.startswith("\u2716 674 problems") for e in step["errors"]), step["errors"])
 
 
+def test_test_runner_chatter_is_not_reported_as_an_error():
+    log = step_log("backend", "Backend test suite", "npm test", [
+        "stdout | test/prelude.test.ts > maps failure outcome",
+        '{"msg":"prelude call","outcome":"failure"}',
+        "\u2713 lets the owner write, which is the same statement that just failed 3ms",
+        "\u00d7 POST /claims/:id/domain-challenges finds the owner's claim 26ms",
+        "AssertionError: expected 404 to be 200",
+    ])
+    errors = ship._steps_from_log(log)[0]["errors"]
+    check("captured output is dropped", not any(e.startswith("stdout |") for e in errors), errors)
+    check("logged JSON is dropped", not any(e.startswith("{") for e in errors), errors)
+    check("a passing test is dropped", not any(e.startswith("\u2713") for e in errors), errors)
+    check("the failing test is kept", any("finds the owner's claim" in e for e in errors), errors)
+    check("and its assertion", "AssertionError: expected 404 to be 200" in errors, errors)
+
+
 def test_the_record_says_how_many_errors_were_left_out():
     step = {"job": "unit", "step": "lint", "command": "npm run lint",
             "errors": [f"e{i}" for i in range(15)], "error_count": 665, "tail": []}
@@ -723,6 +741,183 @@ def test_a_new_build_does_not_orphan_a_ship_in_flight():
     check("and that build's finish does not overwrite it",
           ship.record_build_complete(w.root, base="main") is None)
     check("!ship refuses to start a second ship", "Already shipping" in ship.propose(w.root))
+
+
+# =============================================================================
+# TRIAGE
+# =============================================================================
+
+BASE_SHA = "b" * 40
+
+
+def step_log(job, step, command, lines):
+    rows = [f"##[group]Run {command}", command, "shell: /usr/bin/bash -e {0}", "##[endgroup]"]
+    rows += lines + ["##[error]Process completed with exit code 1."]
+    return "\n".join(f"{job}\t{step}\t2026-10-29T12:30:00.0Z {r}" for r in rows) + "\n"
+
+
+def triage_check(workflow, job, run_id, job_id):
+    return {"__typename": "CheckRun", "name": job, "workflowName": workflow,
+            "status": "COMPLETED", "conclusion": "FAILURE",
+            "detailsUrl": f"https://github.test/o/r/actions/runs/{run_id}/job/{job_id}"}
+
+
+def red_pr(gh, baseline=True):
+    """
+    The veriform-ui shape: lint already red on main, an RLS test this change
+    broke, and a runner image Playwright will not install on.
+    """
+    w = shipped(gh)
+    head = w.head()
+    gh.script("pr view", pr_view(head, [
+        triage_check("test", "unit", 11, 21),
+        triage_check("tenant-isolation", "isolation", 12, 22),
+        triage_check("ui", "verify", 13, 23),
+    ]))
+    gh.script("run view 11 --job 21 --log-failed", {"out": step_log(
+        "unit", "Run npm run lint", "npm run lint",
+        ["/home/runner/work/r/r/src/services/org.service.ts",
+         "##[error]  609:30  error  Replace that  prettier/prettier"]), "err": "", "code": 0})
+    gh.script("run view 12 --job 22 --log-failed", {"out": step_log(
+        "isolation", "Routes under enforced RLS", "npm run test:rls",
+        ["FAIL  test/rls-enforced.test.ts > finds the owner's claim"]), "err": "", "code": 0})
+    gh.script("run view 13 --job 23 --log-failed", {"out": step_log(
+        "verify", "Install Chromium", "npx playwright install --with-deps chromium",
+        ["Error: ERROR: Playwright does not support chromium-headless-shell on ubuntu26.04-x64"]),
+        "err": "", "code": 0})
+    if baseline:
+        gh.script("api repos/{owner}/{repo}/commits/main", {"out": BASE_SHA + "\n", "err": "", "code": 0})
+        gh.script(f"run list --commit {BASE_SHA}", [
+            {"databaseId": 1, "workflowName": "test", "status": "completed", "conclusion": "failure"},
+            {"databaseId": 2, "workflowName": "tenant-isolation", "status": "completed", "conclusion": "success"},
+            {"databaseId": 3, "workflowName": "ui", "status": "completed", "conclusion": "failure"},
+        ])
+        gh.script("run view 1 --json", {"jobs": [{"name": "unit", "conclusion": "failure", "steps": [
+            {"name": "Run npm run lint", "conclusion": "failure"}]}]})
+        gh.script("run view 3 --json", {"jobs": [{"name": "verify", "conclusion": "failure", "steps": [
+            {"name": "Install Chromium", "conclusion": "failure"}]}]})
+    ship.advance(w.root)
+    return w
+
+
+def origins(w):
+    causes = ship.read_marker(w.root)["failure"]["causes"]
+    return {c["workflow"]: c.get("origin") for c in causes}
+
+
+def test_failures_are_triaged_against_the_base_branch():
+    with FakeGh() as gh:
+        w = red_pr(gh)
+    found = origins(w)
+    check("lint red on main too is pre-existing", found.get("test") == "preexisting", found)
+    check("the RLS test is this change's", found.get("tenant-isolation") == "introduced", found)
+    check("the runner image is the environment", found.get("ui") == "environment", found)
+
+
+def test_the_record_separates_what_is_ours_from_what_was_already_red():
+    with FakeGh() as gh:
+        w = red_pr(gh)
+    with open(ship.ci_failure_path(w.root)) as f:
+        doc = f.read()
+    ours = doc.index("## What has to change")
+    before = doc.index("## Already failing on `main`")
+    machine = doc.index("## CI environment, not code")
+    check("this change's failure is under what has to change",
+          ours < doc.index("test:rls") < before, doc)
+    check("lint is under already failing", before < doc.index("npm run lint") < machine, doc)
+    check("the runner is under environment", doc.index("playwright install") > machine, doc)
+    check("it names the baseline it compared against", "`bbbbbbb`" in doc, doc[:600])
+
+
+def test_approve_fixes_only_what_this_change_broke():
+    with FakeGh() as gh:
+        w = red_pr(gh)
+        instruction, _, refusal = ship.ci_fix_request(w.root)
+    check("no refusal", refusal is None, refusal)
+    check("the RLS failure is in scope", "test:rls" in instruction, instruction)
+    check("main's lint debt is not", "npm run lint" not in instruction, instruction)
+    check("nor the runner image", "playwright" not in instruction, instruction)
+    check("the fix must run CI's own command before it is done",
+          "VERIFY:" in instruction and "- `npm run test:rls`" in instruction, instruction)
+
+
+def test_approve_all_takes_on_the_older_failures_but_never_the_runner():
+    with FakeGh() as gh:
+        w = red_pr(gh)
+        instruction, _, _ = ship.ci_fix_request(w.root, include_preexisting=True)
+    check("lint is now in scope", "npm run lint" in instruction, instruction)
+    check("the runner is still not", "playwright" not in instruction, instruction)
+
+
+def test_a_red_main_that_was_already_red_is_not_blamed_on_the_merge():
+    with FakeGh() as gh:
+        w = shipped(gh)
+        head = w.head()
+        merge = "m" * 40
+        gh.script("pr view", pr_view(head, [check_run()]), pr_view(head, merge_oid=merge))
+        ship.advance(w.root)
+        gh.script(f"run list --commit {merge}", [{"databaseId": 9, "status": "completed",
+                                                  "conclusion": "failure", "workflowName": "test",
+                                                  "name": "test", "url": "u"}])
+        gh.script("run view 9 --log-failed", {"out": step_log(
+            "unit", "Run npm run lint", "npm run lint", ["src/a.ts", "1:1  error  x"]),
+            "err": "", "code": 0})
+        gh.script(f"api repos/{{owner}}/{{repo}}/commits/{merge}",
+                  {"out": BASE_SHA + "\n", "err": "", "code": 0})
+        gh.script(f"run list --commit {BASE_SHA}", [
+            {"databaseId": 1, "workflowName": "test", "status": "completed", "conclusion": "failure"}])
+        gh.script("run view 1 --json", {"jobs": [{"name": "unit", "conclusion": "failure", "steps": [
+            {"name": "Run npm run lint", "conclusion": "failure"}]}]})
+        state = ship.advance(w.root)
+        notice = ship.pending_offer(w.root)
+        _, _, refusal = ship.ci_fix_request(w.root)
+    check("still recorded as a failure", state == ship.STATE_CI_FAILED, state)
+    check("compared against the commit before the squash",
+          ship.read_marker(w.root)["failure"]["baseline"] == BASE_SHA)
+    check("the notice says it was red before", notice and "was red before" in notice, notice)
+    check("and does not suggest reverting the merge", notice and "git revert" not in notice, notice)
+    check("plain !approve has nothing to fix", refusal and "Nothing here is this change's" in refusal, refusal)
+    check("and points at !approve all", refusal and "`!approve all`" in refusal, refusal)
+
+
+def test_without_a_baseline_every_failure_is_treated_as_ours():
+    with FakeGh() as gh:
+        w = red_pr(gh, baseline=False)
+        instruction, _, _ = ship.ci_fix_request(w.root)
+    found = origins(w)
+    check("unverified, not pre-existing", found.get("test") == "unverified", found)
+    check("so lint stays in scope", "npm run lint" in instruction, instruction)
+    check("the runner is still recognised from its log", found.get("ui") == "environment", found)
+
+
+def test_recheck_rewrites_a_record_from_before_triage():
+    with FakeGh() as gh:
+        w = red_pr(gh)
+        marker = ship.read_marker(w.root)
+        for cause in marker["failure"]["causes"]:  # what an old parser left
+            cause.pop("origin", None)
+            for st in cause["steps"]:
+                st.pop("origin", None)
+        ship._save_marker(w.root, marker)
+        with open(ship.ci_failure_path(w.root), "w") as f:
+            f.write("# old record\n")
+        out = ship.recheck(w.root)
+    with open(ship.ci_failure_path(w.root)) as f:
+        doc = f.read()
+    check("the record is rewritten", doc.startswith("# CI failure"), doc[:80])
+    check("with triage", "## Already failing on `main`" in doc, doc)
+    check("and the reply is the new summary", "introduced by this change" in out, out)
+    check("still waiting for approval",
+          ship.read_marker(w.root)["state"] == ship.STATE_CI_FAILED)
+
+
+def test_recheck_hands_a_now_green_pr_back_to_the_gate():
+    with FakeGh() as gh:
+        w = red_pr(gh)
+        gh.script("pr view", pr_view(w.head(), [check_run()]))
+        out = ship.recheck(w.root)
+    check("back to waiting on checks",
+          ship.read_marker(w.root)["state"] == ship.STATE_AWAITING_CHECKS, out)
 
 
 if __name__ == "__main__":

@@ -751,7 +751,8 @@ _LOG_TIMESTAMP_RE = re.compile(r"^﻿?\d{4}-\d\d-\d\dT[\d:.]+Z ?")
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 _ERROR_LINE_RE = re.compile(
     r"##\[error\]|\berror\b|\bfailed\b|\bfailure\b|traceback|exception"
-    r"|^\S+:\d+:\d+: [A-Z]{1,4}\d+|^E\s{2,}|\d+ problems? \(",
+    r"|^\S+:\d+:\d+: [A-Z]{1,4}\d+|^E\s{2,}|\d+ problems? \("
+    r"|^\s*[×✗✕]\s|\bFAIL\b|\w+Error:",
     re.IGNORECASE,
 )
 _JOB_URL_RE = re.compile(r"/actions/runs/(\d+)/job/(\d+)")
@@ -761,6 +762,12 @@ _JOB_URL_RE = re.compile(r"/actions/runs/(\d+)/job/(\d+)")
 # those lines tell a fix build what is wrong but not where.
 _FILE_HEADER_RE = re.compile(r"^(?:/home/runner/work/[^/\s]+/[^/\s]+/)?(?P<path>[\w.$@+\-]+(?:/[\w.$@+\-\[\]]+)+\.\w+)$")
 _LOCATION_ONLY_RE = re.compile(r"^\d+:\d+\s")
+
+# Lines that match _ERROR_LINE_RE without reporting a failure: a test runner's
+# captured-output banners, structured log lines the code under test printed,
+# and passing tests whose names happen to say "fails". On the first real backend
+# run these were five of the five lines shown in chat, ahead of the failures.
+_ERROR_NOISE_RE = re.compile(r"^(?:stdout|stderr) \||^[✓√]\s|^\{\s*\"")
 _RUNNER_CHECKOUT_RE = re.compile(r"/home/runner/work/[^/\s]+/[^/\s]+/")
 
 
@@ -896,6 +903,7 @@ def _classify_checks(rollup) -> tuple:
             name = item.get("name") or "check"
             workflow = item.get("workflowName")
             entry = {"name": f"{workflow} / {name}" if workflow else name,
+                     "workflow": workflow or "", "job": name,
                      "url": item.get("detailsUrl") or "",
                      "conclusion": (item.get("conclusion") or "").upper()}
             if (item.get("status") or "").upper() != "COMPLETED":
@@ -1106,6 +1114,8 @@ def _step_summary(lines: list) -> dict:
         if not _ERROR_LINE_RE.search(line):
             continue
         cleaned = _RUNNER_CHECKOUT_RE.sub("", line.replace("##[error]", "")).strip()
+        if _ERROR_NOISE_RE.search(cleaned):
+            continue
         if current_file and _LOCATION_ONLY_RE.match(cleaned):
             cleaned = f"{current_file}:{cleaned}"
         if cleaned and cleaned not in seen:
@@ -1147,6 +1157,7 @@ def _run_causes(root: str, runs: list) -> list:
     causes = []
     for run in runs:
         cause = {"name": run.get("workflowName") or run.get("name") or "workflow",
+                 "workflow": run.get("workflowName") or run.get("name") or "",
                  "url": run.get("url") or "",
                  "conclusion": (run.get("conclusion") or "").upper(), "steps": []}
         code, out, err = _gh(root, "run", "view", str(run.get("databaseId")), "--log-failed")
@@ -1177,6 +1188,154 @@ def _conflict_cause(root: str, marker: dict) -> dict:
     }
 
 
+# -----------------------------------------------------------------------------
+# Triage
+# -----------------------------------------------------------------------------
+#
+# Not every red check is this change's to fix. The first real run of the gate
+# went red on four workflows, and every one of them had failed the same way on
+# the two base commits before it: a fix build handed that record would have been
+# asked to clear 665 lint errors and a CI runner image under a migration's name.
+# So each failed step is placed before anything is built:
+#
+#   introduced   - passed on the baseline, fails here. This change's to fix.
+#   preexisting  - the same workflow, job and step failed on the baseline too.
+#   environment  - the log says the runner or a service failed, not the code.
+#                  No code change fixes it; a human does.
+#   unverified   - no completed baseline run to compare against. Treated as
+#                  introduced, because the safe guess is "ours".
+#
+# The baseline is the base branch's head for a pull request, and the commit the
+# squash landed on for a red base branch - the state of the world the change
+# was made against in each case.
+
+ORIGIN_INTRODUCED = "introduced"
+ORIGIN_PREEXISTING = "preexisting"
+ORIGIN_ENVIRONMENT = "environment"
+ORIGIN_UNVERIFIED = "unverified"
+
+# What a fix build is pointed at by default, and with `!approve all`.
+FIXABLE_DEFAULT = (ORIGIN_INTRODUCED, ORIGIN_UNVERIFIED)
+FIXABLE_ALL = (ORIGIN_INTRODUCED, ORIGIN_UNVERIFIED, ORIGIN_PREEXISTING)
+
+# Failures of the machine rather than the code. Matched against a step's error
+# lines and log tail. Kept to messages that cannot come from a project's own
+# tests: "timed out" alone is as often a slow test as a slow runner.
+_ENVIRONMENT_RE = re.compile(
+    r"does not support|is not supported on|No space left on device"
+    r"|API rate limit|secondary rate limit|ECONNRESET|Could not resolve host"
+    r"|Service Unavailable|Bad Gateway|lost communication with the server"
+    r"|runner has received a shutdown signal|The operation was canceled"
+    r"|Unable to locate executable|exceeded the maximum execution time",
+    re.IGNORECASE,
+)
+
+_ORIGIN_LABELS = {
+    ORIGIN_INTRODUCED: "introduced by this change",
+    ORIGIN_UNVERIFIED: "not on the baseline's record — treated as this change's",
+    ORIGIN_PREEXISTING: "already failing before this change",
+    ORIGIN_ENVIRONMENT: "CI environment, not code",
+}
+
+
+def _baseline_sha(root: str, marker: dict, scope: str, sha: str) -> str:
+    """The commit this change was made against: base's head, or the squash's parent."""
+    if scope == "pr":
+        path = f"repos/{{owner}}/{{repo}}/commits/{marker.get('base', '')}"
+        jq = ".sha"
+    else:
+        path = f"repos/{{owner}}/{{repo}}/commits/{sha}"
+        jq = ".parents[0].sha"
+    code, out, err = _gh(root, "api", path, "--jq", jq)
+    value = out.strip() if code == 0 else ""
+    if not re.fullmatch(r"[0-9a-f]{40}", value):
+        logger.warning(f"CI gate: no baseline commit for {sha[:7]}: {(err or out).strip()[:200]}")
+        return ""
+    return value
+
+
+def _failing_steps_at(root: str, sha: str) -> tuple:
+    """
+    ({(workflow, job, step)}, {workflows with a completed run}) at `sha`.
+
+    Read from the jobs API, not the logs: step conclusions are all triage needs,
+    and logs age out long before the run record does. A job that failed with no
+    failed step (a setup failure) is recorded with step "".
+    """
+    failing, completed = set(), set()
+    if not sha:
+        return failing, completed
+    runs, _ = _gh_json(root, "run", "list", "--commit", sha, "--limit", "50", "--json",
+                       "databaseId,workflowName,status,conclusion")
+    for run in runs or []:
+        if (run.get("status") or "").lower() != "completed":
+            continue
+        workflow = run.get("workflowName") or ""
+        completed.add(workflow)
+        if (run.get("conclusion") or "").upper() in _PASSING:
+            continue
+        view, _ = _gh_json(root, "run", "view", str(run.get("databaseId")), "--json", "jobs")
+        for job in (view or {}).get("jobs", []):
+            if (job.get("conclusion") or "").lower() in ("success", "skipped", "neutral"):
+                continue
+            steps = [st.get("name", "") for st in job.get("steps", [])
+                     if (st.get("conclusion") or "").lower() == "failure"]
+            for step in steps or [""]:
+                failing.add((workflow, job.get("name", ""), step))
+    return failing, completed
+
+
+def _step_origin(workflow: str, job: str, step: dict, failing: set, completed: set) -> str:
+    text = "\n".join(step.get("errors", []) + step.get("tail", []))
+    if _ENVIRONMENT_RE.search(text):
+        return ORIGIN_ENVIRONMENT
+    if workflow not in completed:
+        return ORIGIN_UNVERIFIED
+    if (workflow, job, step.get("step", "")) in failing or (workflow, job, "") in failing:
+        return ORIGIN_PREEXISTING
+    return ORIGIN_INTRODUCED
+
+
+def _triage(root: str, marker: dict, scope: str, sha: str, causes: list) -> str:
+    """Label every failed step with its origin, in place. Returns the baseline sha."""
+    baseline = _baseline_sha(root, marker, scope, sha)
+    failing, completed = _failing_steps_at(root, baseline)
+    for cause in causes:
+        if cause.get("kind") == "conflict":
+            cause["origin"] = ORIGIN_INTRODUCED
+            for step in cause.get("steps", []):
+                step["origin"] = ORIGIN_INTRODUCED
+            continue
+        workflow = cause.get("workflow", "")
+        for step in cause.get("steps", []):
+            step["origin"] = _step_origin(workflow, step.get("job") or cause.get("job", ""),
+                                          step, failing, completed)
+        origins = {st["origin"] for st in cause.get("steps", [])}
+        if not origins:
+            # No log to read: judge the check as a whole by its job.
+            job = cause.get("job", "")
+            origins = {ORIGIN_UNVERIFIED if workflow not in completed else
+                       ORIGIN_PREEXISTING if any(f[0] == workflow and (not job or f[1] == job)
+                                                 for f in failing)
+                       else ORIGIN_INTRODUCED}
+        # A check is as much this change's as its most-ours step.
+        for origin in (ORIGIN_INTRODUCED, ORIGIN_UNVERIFIED, ORIGIN_PREEXISTING, ORIGIN_ENVIRONMENT):
+            if origin in origins:
+                cause["origin"] = origin
+                break
+    return baseline
+
+
+def _select(causes: list, origins: tuple) -> list:
+    """The causes, and within them the steps, whose origin is in `origins`."""
+    selected = []
+    for cause in causes:
+        steps = [st for st in cause.get("steps", []) if st.get("origin") in origins]
+        if steps or (not cause.get("steps") and cause.get("origin") in origins):
+            selected.append({**cause, "steps": steps})
+    return selected
+
+
 def _causes_markdown(causes: list, fenced: bool, max_errors: int = MAX_ERROR_LINES) -> str:
     """
     The "what has to change" list.
@@ -1200,7 +1359,9 @@ def _causes_markdown(causes: list, fenced: bool, max_errors: int = MAX_ERROR_LIN
         for step in cause.get("steps", []):
             out.append(f"   - step `{_one_line(step['step'], 100)}`"
                        + (f" running `{_one_line(step['command'], 160)}`"
-                          if step.get("command") else ""))
+                          if step.get("command") else "")
+                       + (f" — *{_ORIGIN_LABELS[step['origin']]}*"
+                          if step.get("origin") in _ORIGIN_LABELS else ""))
             for line in step.get("errors", [])[:max_errors]:
                 out.append(f"     - `{_one_line(line)}`")
             total = max(step.get("error_count", 0), len(step.get("errors", [])))
@@ -1218,18 +1379,30 @@ def ci_failure_path(workspace: str) -> str:
 
 
 def _fail(workspace: str, marker: dict, scope: str, sha: str, causes: list) -> None:
-    """Write the failure document, and stop for review."""
+    """Triage the failures, write the failure document, and stop for review."""
+    root = os.path.abspath(workspace)
+    baseline = _triage(root, marker, scope, sha, causes)
     attempt = int(marker.get("fix_attempts", 0)) + 1
     base, branch = marker.get("base", ""), marker.get("branch", "")
     where = (f"{_pr_label(marker)} (`{branch}` → `{base}`), head `{sha[:7]}`"
              if scope == "pr" else
              f"`{base}` after merging {_pr_label(marker)}, squash commit `{sha[:7]}`")
+    ours = _select(causes, FIXABLE_DEFAULT)
+    before = _select(causes, (ORIGIN_PREEXISTING,))
+    machine = _select(causes, (ORIGIN_ENVIRONMENT,))
+
     if scope == "pr":
         resolve = (f"builds a fix on `{branch}`, pushes it to {_pr_label(marker)}, and "
                    f"merges only once CI passes on the new commit.")
     else:
         resolve = (f"builds a fix on a new branch off `{base}`, opens a pull request "
                    f"for it, and merges that only once CI passes on it.")
+    baseline_label = f"`{baseline[:7]}`" if baseline else "unknown"
+
+    def section(title, intro, items):
+        if not items:
+            return []
+        return [f"## {title}", "", intro, "", _causes_markdown(items, fenced=True), ""]
 
     doc = "\n".join([
         f"# CI failure — {where}",
@@ -1238,15 +1411,28 @@ def _fail(workspace: str, marker: dict, scope: str, sha: str, causes: list) -> N
         f"**Detected:** {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}",
         f"**Failure:** {attempt}" + (" (after a fix attempt)" if attempt > 1 else ""),
         f"**Pull request:** {marker.get('pr_url', '?')}",
+        f"**Compared against:** {baseline_label} "
+        + ("(the head of " if scope == "pr" else "(the commit the squash landed on, on ")
+        + f"`{base}`)",
         "",
-        "## What has to change for CI to pass",
-        "",
-        "Each item is a check that failed, the step inside it that failed, the "
-        "command that step ran, and the error lines from its log. Fix the cause; "
-        "do not skip, weaken or delete a check to make it pass.",
-        "",
-        _causes_markdown(causes, fenced=True),
-        "",
+        *section(
+            "What has to change for CI to pass",
+            "Failures this change introduced: each failed check, the step inside it, the "
+            "command that step ran, and the error lines from its log. `!approve` fixes "
+            "these. Fix the cause; do not skip, weaken or delete a check to make it pass.",
+            ours),
+        *section(
+            f"Already failing on `{base}` before this change",
+            f"The same workflow, job and step failed on {baseline_label} too, so nothing "
+            f"in this change caused them. `!approve` leaves them alone; `!approve all` "
+            f"takes them on as well, which widens this change beyond its design.",
+            before),
+        *section(
+            "CI environment, not code",
+            "The log shows the runner or a service failing, not the project. No code "
+            "change fixes these and no fix build is pointed at them: they need a person, "
+            "usually a workflow or runner change.",
+            machine),
         "## Scope",
         "",
         (f"The fix is held to the approved design this PR implements, "
@@ -1259,7 +1445,11 @@ def _fail(workspace: str, marker: dict, scope: str, sha: str, causes: list) -> N
         "",
         "## Next",
         "",
-        f"- `!approve` {resolve}",
+        (f"- `!approve` {resolve}" if ours else
+         "- `!approve` has nothing to fix: no failure here is this change's."),
+        *([f"- `!approve all` does the same, including the {len(before)} check(s) that "
+           f"were already failing."] if before else []),
+        "- `!ship recheck` re-reads CI and rewrites this file.",
         "- Edit this file first if the causes above are wrong or incomplete: the fix "
         "build reads it as written.",
         "",
@@ -1276,26 +1466,93 @@ def _fail(workspace: str, marker: dict, scope: str, sha: str, causes: list) -> N
         headline = (f"🔴 **CI failed on {_pr_label(marker)} — not merged.**\n\n"
                     f"The pull request stays open. Nothing merges until every check "
                     f"passes on the commit being merged.")
-    else:
+    elif ours:
         headline = (f"🔴 **`{base}` is red after merging {_pr_label(marker)}.**\n\n"
                     f"The squash commit `{sha[:7]}` failed CI on `{base}`. To undo it "
                     f"now instead of fixing forward: `git revert {sha[:7]}`.")
+    else:
+        headline = (f"🟠 **`{base}` is red after merging {_pr_label(marker)} — but it "
+                    f"was red before, too.**\n\n"
+                    f"Every failure on `{sha[:7]}` also failed on {baseline_label}, or "
+                    f"is the CI environment. This merge did not cause them.")
+    counts = [f"{len(ours)} introduced by this change", f"{len(before)} already failing",
+              f"{len(machine)} CI environment"]
+    summary_causes = ours or before or machine
     notice = "\n".join([
         headline, "",
-        "**What has to change:**", "",
-        _causes_markdown(causes, fenced=False, max_errors=MAX_NOTICE_ERRORS), "",
+        f"**Failing checks:** {', '.join(counts)}.", "",
+        ("**What has to change:**" if ours else
+         "**Already failing:**" if before else "**CI environment:**"), "",
+        _causes_markdown(summary_causes, fenced=False, max_errors=MAX_NOTICE_ERRORS), "",
         f"**Full record:** `{CONTEXT_DIR}/{CI_FAILURE_NAME}`", "",
-        f"- **Resolve it:** `!approve` {resolve}",
-        "- **Re-read this:** `!ship status`",
+        *([f"- **Resolve it:** `!approve` {resolve}"] if ours else []),
+        *(["- **Fix the older failures too:** `!approve all`"] if before else []),
+        *(["- **Needs a person:** the CI environment failures — no build can fix those."]
+          if machine else []),
+        "- **Re-read CI:** `!ship recheck`",
         (f"- **Fix it yourself:** push to `{branch}`, then `!ship watch`"
          if scope == "pr" else
          f"- **Fix it yourself:** merge a fix to `{base}` by hand, then `!ship watch`"),
     ])
     _notify(workspace, marker, STATE_CI_FAILED, notice,
-            failure={"scope": scope, "sha": sha, "causes": causes,
+            failure={"scope": scope, "sha": sha, "baseline": baseline, "causes": causes,
                      "conflict": any(c.get("kind") == "conflict" for c in causes),
-                     "summary": _causes_markdown(causes, fenced=False,
+                     "summary": _causes_markdown(summary_causes, fenced=False,
                                                  max_errors=MAX_NOTICE_ERRORS)})
+
+
+def recheck(workspace: str) -> str:
+    """
+    `!ship recheck` — read CI again for the recorded failure and rewrite the record.
+
+    For a record written by an older parser, or after a check was re-run by hand
+    on GitHub. A recheck that finds the failing checks now passing hands the ship
+    back to the watcher rather than writing an empty failure.
+    """
+    marker = read_marker(workspace)
+    if not marker or marker.get("state") != STATE_CI_FAILED:
+        return status(workspace)
+    root = os.path.abspath(workspace)
+    failure = marker.get("failure") or {}
+    scope, sha = failure.get("scope", "pr"), failure.get("sha", "")
+
+    if scope == "pr":
+        data, err = _gh_json(root, "pr", "view", str(marker.get("pr_number") or marker.get("branch")),
+                             "--json", "headRefOid,mergeable,statusCheckRollup")
+        if data is None:
+            return f"❌ **Could not read {_pr_label(marker)} from GitHub.**\n\n> {_one_line(err, 400)}"
+        sha = data.get("headRefOid") or sha
+        if (data.get("mergeable") or "").upper() == "CONFLICTING":
+            causes = [_conflict_cause(root, marker)]
+        else:
+            pending, failed, _ = _classify_checks(data.get("statusCheckRollup"))
+            causes = _check_causes(root, failed)
+            if not failed and not pending:
+                marker["head_sha"] = sha
+                _await_checks(marker, marker.get("pr_url", ""), sha)
+                _save_marker(workspace, marker)
+                return (f"✅ **{_pr_label(marker)}'s checks pass now.** Back on the gate: it "
+                        f"merges once every check on `{sha[:7]}` is green.")
+    else:
+        runs, err = _gh_json(root, "run", "list", "--commit", sha, "--limit", "50", "--json",
+                             "databaseId,status,conclusion,workflowName,name,url")
+        if runs is None:
+            return f"❌ **Could not read `{marker.get('base')}`'s CI from GitHub.**\n\n> {_one_line(err, 400)}"
+        failed = [r for r in runs if (r.get("status") or "").lower() == "completed"
+                  and (r.get("conclusion") or "").upper() not in _PASSING]
+        causes = _run_causes(root, failed)
+        if not failed:
+            marker.update({"state": STATE_AWAITING_BASE, "since": time.time(),
+                           "notice": None, "announced": True})
+            _save_marker(workspace, marker)
+            return (f"✅ **Nothing is failing on `{sha[:7]}` now.** Back on the gate, "
+                    f"waiting for `{marker.get('base')}`'s runs to finish.")
+
+    _fail(workspace, marker, scope, sha, causes)
+    marker = read_marker(workspace) or marker
+    marker["announced"] = True
+    _save_marker(workspace, marker)
+    return marker.get("notice") or status(workspace)
 
 
 def _mark_failure_resolved(workspace: str, marker: dict, how: str) -> None:
@@ -1322,9 +1579,13 @@ def _mark_failure_resolved(workspace: str, marker: dict, how: str) -> None:
 # The fix loop
 # -----------------------------------------------------------------------------
 
-def ci_fix_request(workspace: str) -> Optional[tuple]:
+def ci_fix_request(workspace: str, include_preexisting: bool = False) -> Optional[tuple]:
     """
     For `!approve`: (instruction, extra_env, refusal), or None if no CI failure waits.
+
+    Only the failures this change introduced are handed over, unless
+    `include_preexisting` (`!approve all`). CI-environment failures never are:
+    no edit to the project fixes a runner image.
 
     Puts the workspace where the fix belongs - the PR's branch, or a fresh base
     for a red base branch - and moves the marker to FIXING. The instruction is a
@@ -1338,6 +1599,24 @@ def ci_fix_request(workspace: str) -> Optional[tuple]:
     root = os.path.abspath(workspace)
     failure = marker.get("failure") or {}
     scope, base, branch = failure.get("scope", "pr"), marker.get("base", ""), marker.get("branch", "")
+
+    causes = failure.get("causes", [])
+    if any("origin" in c for c in causes):
+        targets = _select(causes, FIXABLE_ALL if include_preexisting else FIXABLE_DEFAULT)
+    else:
+        targets = causes  # Recorded before triage existed: all of it, as before.
+    if not targets:
+        before = _select(causes, (ORIGIN_PREEXISTING,))
+        return "", {}, (
+            "🟠 **Nothing here is this change's to fix.**\n\n"
+            + (f"{len(before)} failing check(s) were already failing before it, and the "
+               f"rest are the CI environment. `!approve all` points a fix build at the "
+               f"older failures anyway — that widens this change beyond its design.\n\n"
+               if before else
+               "Every failure is the CI environment, which no code change fixes.\n\n")
+            + f"- **Read them:** `{CONTEXT_DIR}/{CI_FAILURE_NAME}`\n"
+            "- **Re-read CI:** `!ship recheck`"
+        )
 
     try:
         _git(root, "fetch", "origin", check=True)
@@ -1369,7 +1648,8 @@ def ci_fix_request(workspace: str) -> Optional[tuple]:
         f"Do not skip, weaken or delete a check, test or lint rule to make it pass.",
         "",
         "What has to change:",
-        _causes_markdown(failure.get("causes", []), fenced=False),
+        _causes_markdown(targets, fenced=False),
+        *_verify_lines(targets),
         *_scope_lines(workspace, marker),
     ]).replace("--repo", "-repo").replace("--kb", "-kb")
 
@@ -1387,6 +1667,33 @@ def ci_fix_request(workspace: str) -> Optional[tuple]:
     _save_marker(workspace, marker)
     env = {"BUILD_BRANCH": branch} if scope == "pr" else {}
     return instruction, env, None
+
+
+def _verify_lines(targets: list) -> list:
+    """
+    The failing commands, as the fix build's own definition of done.
+
+    The container's test gate runs the project's test command, which is not
+    what CI ran: a lint step can fail in CI while `npm test` passes in the
+    container, and a fix build would then report success on a change GitHub
+    rejects minutes later.
+    """
+    commands = []
+    for cause in targets:
+        for step in cause.get("steps", []):
+            command = (step.get("command") or "").strip()
+            if command and command not in commands and not command.startswith("git merge"):
+                commands.append(command)
+    if not commands:
+        return []
+    return [
+        "",
+        "VERIFY: before writing .build_complete, run each command below the way CI ran "
+        "it (in the directory its workflow step uses) and confirm it exits 0. A command "
+        "that cannot run here - a missing tool or an unreachable service - is reported "
+        "as such, not as passing.",
+        *[f"- `{_one_line(c, 300)}`" for c in commands],
+    ]
 
 
 def _scope_lines(workspace: str, marker: dict) -> list:
