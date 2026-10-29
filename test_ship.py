@@ -9,7 +9,6 @@ staging pathspec, the branch checks, the marker file - is the real code.
 import importlib.util
 import json
 import os
-import shutil
 import stat
 import subprocess
 import sys
@@ -540,6 +539,38 @@ def test_approve_turns_the_failure_into_a_scoped_fix_build():
     check("the marker is fixing", ship.read_marker(w.root)["state"] == ship.STATE_FIXING)
     check("a stale completion cannot vouch for the fix",
           not os.path.exists(os.path.join(w.root, ".build_complete")))
+
+
+def test_lint_errors_keep_the_file_they_belong_to():
+    """ESLint prints the path once, above bare `line:col` problems."""
+    log = "\n".join(f"unit\tRun npm run lint\t2026-10-29T12:30:0{i}.0Z {line}" for i, line in enumerate([
+        "##[group]Run npm run lint",
+        "npm run lint",
+        "##[endgroup]",
+        "/home/runner/work/veriform-ui/veriform-ui/src/routes/employer-verify.$token.tsx",
+        "##[error]  232:22  error  Replace this  prettier/prettier",
+        "",
+        "/home/runner/work/veriform-ui/veriform-ui/src/services/org.service.ts",
+        "##[error]  609:30  error  Replace that  prettier/prettier",
+        "\u2716 674 problems (665 errors, 9 warnings)",
+    ])) + "\n"
+    step = ship._steps_from_log(log)[0]
+    check("the first error names its file",
+          step["errors"][0].startswith("src/routes/employer-verify.$token.tsx:232:22"), step["errors"])
+    check("and the second its own",
+          step["errors"][1].startswith("src/services/org.service.ts:609:30"), step["errors"])
+    check("the runner's checkout path is gone",
+          not any("/home/runner" in e for e in step["errors"] + step["tail"]), step)
+    check("a summary line is not mistaken for a location",
+          any(e.startswith("\u2716 674 problems") for e in step["errors"]), step["errors"])
+
+
+def test_the_record_says_how_many_errors_were_left_out():
+    step = {"job": "unit", "step": "lint", "command": "npm run lint",
+            "errors": [f"e{i}" for i in range(15)], "error_count": 665, "tail": []}
+    out = ship._causes_markdown([{"name": "test", "conclusion": "FAILURE", "steps": [step]}],
+                                fenced=False, max_errors=5)
+    check("the true remainder is reported", "…and 660 more error lines" in out, out)
 
 
 def test_without_a_design_the_fix_is_not_handed_an_empty_scope():
