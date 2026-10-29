@@ -396,7 +396,7 @@ import time  # noqa: E402
 RUFF_LOG = "\n".join(
     f"test-proxy\tLint with Ruff\t2026-10-28T10:00:0{i}.0000000Z {line}"
     for i, line in enumerate([
-        "##[group]Run ruff check .",
+        "##[group]Run \x1b[36;1mruff check .\x1b[0m",
         "ruff check .",
         "shell: /usr/bin/bash -e {0}",
         "##[endgroup]",
@@ -505,6 +505,7 @@ def test_a_failed_check_writes_the_root_causes_and_keeps_the_pr_open():
     check("the doc is unresolved", "**Status:** UNRESOLVED" in doc, doc)
     check("it names the failing step", "Lint with Ruff" in doc, doc)
     check("and the command it ran", "ruff check ." in doc, doc)
+    check("with the runner's colour codes stripped", "\x1b" not in doc and "[36;1m" not in doc, doc)
     check("and the error line", "F401" in doc, doc)
     check("and scopes the fix to the approved design", "ship_design.md" in doc, doc)
     notice = ship.pending_offer(w.root)

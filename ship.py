@@ -746,6 +746,9 @@ _STATE_LABELS = {
 # A GitHub Actions log line from `gh run view --log-failed`:
 # "<job>\t<step>\t<timestamp> <text>".
 _LOG_TIMESTAMP_RE = re.compile(r"^﻿?\d{4}-\d\d-\d\dT[\d:.]+Z ?")
+# Runners colour their output, and `--log-failed` keeps the escapes. Left in,
+# they land in ci_failure.md and in chat as `[36;1mnpm run lint[0m`.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 _ERROR_LINE_RE = re.compile(
     r"##\[error\]|\berror\b|\bfailed\b|\bfailure\b|traceback|exception"
     r"|^\S+:\d+:\d+: [A-Z]{1,4}\d+|^E\s{2,}",
@@ -1067,7 +1070,8 @@ def _parse_failed_log(text: str) -> dict:
         if len(parts) != 3:
             continue
         job, step, rest = parts
-        steps.setdefault((job, step), []).append(_LOG_TIMESTAMP_RE.sub("", rest))
+        steps.setdefault((job, step), []).append(
+            _LOG_TIMESTAMP_RE.sub("", _ANSI_RE.sub("", rest)))
     return steps
 
 
