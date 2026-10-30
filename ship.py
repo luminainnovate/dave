@@ -911,6 +911,16 @@ def _gh(root: str, *args: str) -> tuple:
     return result.returncode, result.stdout, result.stderr
 
 
+def _gh_retry(root: str, *args: str, attempts: int = 3) -> tuple:
+    """_gh, retried on a GitHub 5xx. Those come in bursts and clear in seconds."""
+    for attempt in range(attempts):
+        code, out, err = _gh(root, *args)
+        if code == 0 or not re.search(r"HTTP 5\d\d", err + out) or attempt == attempts - 1:
+            return code, out, err
+        time.sleep(3 * (attempt + 1))
+    return code, out, err
+
+
 def _gh_json(root: str, *args: str) -> tuple:
     """(parsed, error). parsed is None on any failure."""
     code, out, err = _gh(root, *args)
@@ -1285,6 +1295,94 @@ def _steps_from_log(text: str) -> list:
             for (job, step), lines in _parse_failed_log(text).items()]
 
 
+def _failed_steps_from_full_log(root: str, run_id: str, job_id: str) -> list:
+    """
+    A failed job's failing steps, read from its FULL log.
+
+    `gh run view --log-failed` returns only steps the API marks failed, and the
+    API can leave a step that exited non-zero at "in_progress" after its job
+    has finished - seen on a real run whose backend suite failed: the job was
+    `failure`, its test step `in_progress`, every later step `pending` though
+    they had run. --log-failed then printed nothing, and the record said "no
+    failed step reported", giving a fix build no errors, no command and no files.
+
+    The full log has no step columns, but every step opens with a
+    `##[group]Run ...` header and a step that exits non-zero ends with an
+    `##[error]` line. The segments holding one are the failed steps; each is
+    named after the job's next step the API does not call successful.
+    """
+    code, out, _ = _gh_retry(root, "api", f"repos/{{owner}}/{{repo}}/actions/jobs/{job_id}/logs")
+    if code != 0 or not out.strip():
+        return []
+    segments, current = [], None
+    for raw in out.splitlines():
+        line = _LOG_TIMESTAMP_RE.sub("", _ANSI_RE.sub("", raw))
+        if line.startswith("##[group]Run "):
+            current = [line]
+            segments.append(current)
+        elif current is not None:
+            current.append(line)
+    failed = [seg for seg in segments if any(ln.startswith("##[error]") for ln in seg)]
+    if not failed:
+        return []
+
+    steps = [{"job": "", "step": seg[0][len("##[group]"):], **_step_summary(seg)} for seg in failed]
+    return _name_steps(root, run_id, job_id, steps)
+
+
+def _job_with_steps(root: str, run_id: str, job_id: str, attempts: int = 4) -> Optional[dict]:
+    """
+    The job, with its step list - asked for until GitHub includes one.
+
+    Observed on one finished job, back to back: the same endpoint returned all
+    16 steps, then 0, then 0. An empty list is a bad answer, not a fact.
+    """
+    for attempt in range(attempts):
+        code, out, _ = _gh_retry(root, "api", f"repos/{{owner}}/{{repo}}/actions/jobs/{job_id}")
+        try:
+            job = json.loads(out) if code == 0 else None
+        except ValueError:
+            job = None
+        if job and job.get("steps"):
+            return job
+        code, out, _ = _gh_retry(root, "run", "view", str(run_id), "--json", "jobs")
+        try:
+            jobs = (json.loads(out) if code == 0 else {}).get("jobs", [])
+        except ValueError:
+            jobs = []
+        job = next((j for j in jobs if str(j.get("databaseId")) == str(job_id)), None)
+        if job and job.get("steps"):
+            return job
+        if attempt < attempts - 1:
+            time.sleep(2)
+    logger.warning(f"CI gate: GitHub returned no steps for job {job_id}; keeping log names.")
+    return None
+
+
+def _name_steps(root: str, run_id: str, job_id: str, steps: list) -> list:
+    """
+    Give each step the name the jobs API knows it by.
+
+    Triage matches steps against the baseline BY NAME, and the logs do not
+    reliably carry it: for a step the API left "in_progress", gh labels its
+    --log-failed lines with the raw `Run <command>` header, and the full log has
+    no names at all. A step whose name the API does not list takes the job's
+    next step that the API does not call successful.
+    """
+    job = _job_with_steps(root, run_id, job_id)
+    if not job:
+        return steps
+    known = {st.get("name", "") for st in job.get("steps", [])}
+    unfinished = [st.get("name", "") for st in job.get("steps", [])
+                  if (st.get("conclusion") or "").lower() not in ("success", "skipped")
+                  and not st.get("name", "").startswith(("Post ", "Stop containers", "Complete job"))]
+    for step in steps:
+        step["job"] = step.get("job") or job.get("name", "")
+        if step.get("step") not in known and unfinished:
+            step["step"] = unfinished.pop(0)
+    return steps
+
+
 def _check_causes(root: str, failed: list) -> list:
     """One cause per failed PR check, with its failed steps where Actions ran it."""
     causes = []
@@ -1293,10 +1391,14 @@ def _check_causes(root: str, failed: list) -> list:
         match = _JOB_URL_RE.search(check.get("url", ""))
         if match:
             run_id, job_id = match.groups()
-            code, out, err = _gh(root, "run", "view", run_id, "--job", job_id, "--log-failed")
+            code, out, err = _gh_retry(root, "run", "view", run_id, "--job", job_id, "--log-failed")
             if code == 0:
                 cause["steps"] = _steps_from_log(out)
-            else:
+                if any(not st["step"] or st["step"].startswith("Run ") for st in cause["steps"]):
+                    cause["steps"] = _name_steps(root, run_id, job_id, cause["steps"])
+            if not cause["steps"]:
+                cause["steps"] = _failed_steps_from_full_log(root, run_id, job_id)
+            if not cause["steps"] and code != 0:
                 cause["log_error"] = (err or out).strip()
         causes.append(cause)
     return causes
@@ -1310,10 +1412,17 @@ def _run_causes(root: str, runs: list) -> list:
                  "workflow": run.get("workflowName") or run.get("name") or "",
                  "url": run.get("url") or "",
                  "conclusion": (run.get("conclusion") or "").upper(), "steps": []}
-        code, out, err = _gh(root, "run", "view", str(run.get("databaseId")), "--log-failed")
+        run_id = str(run.get("databaseId"))
+        code, out, err = _gh(root, "run", "view", run_id, "--log-failed")
         if code == 0:
             cause["steps"] = _steps_from_log(out)
-        else:
+        if not cause["steps"]:
+            # The same API lag as for a PR check; see _failed_steps_from_full_log.
+            view, _ = _gh_json(root, "run", "view", run_id, "--json", "jobs")
+            for job in (view or {}).get("jobs", []):
+                if (job.get("conclusion") or "").lower() not in ("success", "skipped", "neutral"):
+                    cause["steps"] += _failed_steps_from_full_log(root, run_id, str(job.get("databaseId")))
+        if not cause["steps"] and code != 0:
             cause["log_error"] = (err or out).strip()
         causes.append(cause)
     return causes
