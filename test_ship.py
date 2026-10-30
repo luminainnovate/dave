@@ -1225,6 +1225,58 @@ def test_a_long_gap_is_summarised_not_dumped():
     check("older ones are counted", "…25 earlier" in shown and "event 24" not in shown, shown)
 
 
+def test_a_log_failed_step_labelled_by_its_command_gets_its_real_name():
+    """gh labels an in_progress step's --log-failed lines with the `Run ...` header."""
+    log = step_log("backend", "Run npm run test:coverage", "npm run test:coverage",
+                   [" FAIL  test/a.test.ts > x", "AssertionError: expected 1 to be 2"])
+    with FakeGh() as gh:
+        w = shipped(gh)
+        gh.script("pr view", pr_view(w.head(), [triage_check("ci", "backend", 41, 124)]))
+        gh.script("run view 41 --job 124 --log-failed", {"out": log, "err": "", "code": 0})
+        gh.script("run view 41 --json", {"jobs": [{"databaseId": 124, "name": "backend", "conclusion": "failure",
+                                                   "steps": [{"name": "Backend test suite", "conclusion": ""}]}]})
+        ship.advance(w.root)
+    step = ship.read_marker(w.root)["failure"]["causes"][0]["steps"][0]
+    check("named as the API names it", step["step"] == "Backend test suite", step["step"])
+
+
+def test_a_step_the_api_left_in_progress_is_read_from_the_full_log():
+    """
+    The shape of a real run: the job failed, its test step still says
+    in_progress, so --log-failed prints nothing.
+    """
+    full_log = "\n".join(f"2026-10-30T17:3{i % 10}:00.0Z {line}" for i, line in enumerate([
+        "##[group]Run npm ci", "npm ci", "##[endgroup]", "added 900 packages",
+        "##[group]Run npm run test:coverage", "npm run test:coverage", "##[endgroup]",
+        " FAIL  test/policy-notices.test.ts > TC1: returns correct counts",
+        "AssertionError: expected 2 to be +0 // Object.is equality",
+        " FAIL  test/employer-verification-recipient.test.ts > AC10b",
+        "AssertionError: expected 200 to be 409 // Object.is equality",
+        " Test Files  2 failed | 173 passed (175)",
+        "##[error]Process completed with exit code 1.",
+        "##[group]Run actions/upload-artifact@v4", "uploading", "##[endgroup]",
+    ])) + "\n"
+    with FakeGh() as gh:
+        w = shipped(gh)
+        gh.script("pr view", pr_view(w.head(), [triage_check("ci", "backend", 41, 124)]))
+        gh.script("run view 41 --job 124 --log-failed", {"out": "", "err": "", "code": 0})
+        gh.script("api repos/{owner}/{repo}/actions/jobs/124/logs", {"out": full_log, "err": "", "code": 0})
+        gh.script("run view 41 --json", {"jobs": [{"databaseId": 124, "name": "backend", "conclusion": "failure",
+                                                   "steps": [{"name": "Install dependencies", "conclusion": "success"},
+                                                             {"name": "Backend test suite", "conclusion": ""},
+                                                             {"name": "Upload coverage report", "conclusion": ""}]}]})
+        ship.advance(w.root)
+        ship.ci_fix_request(w.root, include_preexisting=True)
+    step = ship.read_marker(w.root)["failure"]["causes"][0]["steps"][0]
+    check("the step is named as GitHub names it", step["step"] == "Backend test suite", step["step"])
+    check("its command is recovered", step["command"] == "npm run test:coverage", step["command"])
+    check("its failing tests are recovered",
+          set(step["test_files"]) == {"test/policy-notices.test.ts",
+                                      "test/employer-verification-recipient.test.ts"}, step.get("test_files"))
+    issues = ship.read_marker(w.root)["fix"]["issues"]
+    check("one issue per failing test file", len(issues) == 2, [i["title"] for i in issues])
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
