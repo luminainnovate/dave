@@ -385,6 +385,10 @@ expert_last_used = time.time()
 # engine is somebody's backend: an exiting sibling container may not sleep it
 # and neither may the idle janitor. _docker_safety_monitor owns the removals.
 _live_builds: set = set()
+
+# Which workspace each build container is working on, so an event it posts to
+# /internal/build/event lands in that conversation's log.
+_build_workspaces: dict = {}
 expert_mode = "coding"  # "general" or "coding"
 last_comfy_history_count = 0  # Track ComfyUI history count for automated pings
 
@@ -2044,12 +2048,15 @@ async def _attach_build_offer(request: Request, response):
         project_dir = _get_bound_project_dir(messages)
         if not project_dir:
             return response
-        offer = ship.pending_offer(project_dir)
-        if not offer:
+        # What builds did since the last message, then any one-time offer.
+        # Unprompted messages are impossible in OpenWebUI, so this is the
+        # earliest a background event can reach the chat.
+        parts = [p for p in (ship.unseen_events(project_dir), ship.pending_offer(project_dir)) if p]
+        if not parts:
             return response
 
         is_native = "/api/chat" in str(request.url.path)
-        return _prefix_response(response, f"{offer}\n\n---\n\n", is_native)
+        return _prefix_response(response, "\n\n".join(parts) + "\n\n---\n\n", is_native)
     except Exception as e:
         # An offer is a courtesy. It never costs the user their reply.
         logger.warning(f"Could not attach the build offer: {e}")
@@ -3237,6 +3244,28 @@ async def internal_model_load(request: Request):
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
+@app.post("/internal/build/event")
+async def internal_build_event(request: Request):
+    """
+    A progress line from inside a build container (entrypoint.sh's report_event).
+
+    Recorded in the build's workspace and shown above the next reply in that
+    conversation. An unknown container is ignored: the event is a courtesy.
+    """
+    try:
+        body = await request.json()
+        container = str(body.get("container", ""))
+        text = str(body.get("text", "")).strip()
+        workspace = _build_workspaces.get(container)
+        if not workspace or not text:
+            return JSONResponse(status_code=404, content={"error": "unknown container"})
+        await asyncio.to_thread(ship.record_event, workspace, text)
+        return JSONResponse(content={"status": "ok"})
+    except Exception as e:
+        logger.warning(f"Could not record a build event: {e}")
+        return JSONResponse(status_code=400, content={"error": str(e)})
+
+
 @app.post("/internal/model/unload")
 async def internal_model_unload(request: Request):
     """Unload a model for a given provider config. Called by distill.py from inside Docker."""
@@ -3665,6 +3694,9 @@ async def _trigger_build_pipeline(messages: list, extra_env: Optional[dict] = No
             "-e", f"EXPERT_CTX={DISTILL_CTX}",
             "-e", f"CLINE_CTX={CLINE_CTX}",
             "-e", "ORCHESTRATOR_URL=http://host.docker.internal:8000",
+            # Its own name, for the progress events it posts back: a container
+            # in another's network namespace does not even have its own hostname.
+            "-e", f"BUILD_CONTAINER={container_name}",
         ]
         for key, value in (extra_env or {}).items():
             cmd += ["-e", f"{key}={value}"]
@@ -3690,6 +3722,8 @@ async def _trigger_build_pipeline(messages: list, extra_env: Optional[dict] = No
         # sleeps 10s before its first poll, and the builder's own EXIT trap can
         # fire inside that window on a fast failure.
         _live_builds.add(container_name)
+        _build_workspaces[container_name] = abs_target_dir
+        ship.record_event(abs_target_dir, f"🏗️ Build started: `{container_name}` ({mode_label}).")
         if extra_env and extra_env.get("CI_FIX"):
             # So a restart can find this container and finish the fix's bookkeeping.
             ship.note_fix_container(abs_target_dir, container_name)
@@ -3718,6 +3752,10 @@ async def _trigger_build_pipeline(messages: list, extra_env: Optional[dict] = No
         return f"❌ **Build Trigger Failed:** {e}"
 
 
+# Terminal colour and cursor-control sequences.
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07")
+
+
 def _check_build_logs() -> str:
     """Fetches the latest logs from the active or most recent build pipeline."""
     try:
@@ -3732,6 +3770,9 @@ def _check_build_logs() -> str:
         
         logs_output = (result.stdout + "\n" + result.stderr).strip()
         
+        # Cline streams its thinking with colour and cursor escapes around every
+        # token; in chat they arrived as `␛[0m␛[2m` between words.
+        logs_output = _ANSI_ESCAPE_RE.sub("", logs_output)
         if not logs_output:
             logs_output = "[No logs generated yet or container is empty]"
             
@@ -3892,6 +3933,7 @@ def _resume_ci_gate() -> None:
         elif state == ship.STATE_FIXING and marker.get("container"):
             logger.info(f"[CI Gate] Re-attaching to fix build {marker['container']}")
             _live_builds.add(marker["container"])
+            _build_workspaces[marker["container"]] = workspace
             asyncio.create_task(_docker_safety_monitor(
                 marker["container"], workspace=workspace,
                 compose_files=_compose_files(workspace)))
@@ -3940,6 +3982,8 @@ async def _docker_safety_monitor(container_name: str, workspace: str = "",
             if proc.returncode != 0:
                 # Container likely deleted or vanished
                 logger.info(f"[Safety Monitor] Container {container_name} vanished. Releasing VRAM.")
+                if workspace:
+                    ship.record_event(workspace, f"⏹️ Build container `{container_name}` ended.")
                 action = await asyncio.to_thread(
                     _record_finished_build, container_name, workspace, base_branch)
                 if action == "watch":
@@ -3956,6 +4000,8 @@ async def _docker_safety_monitor(container_name: str, workspace: str = "",
             status = stdout.decode().strip().lower()
             if status == "false":
                 logger.info(f"[Safety Monitor] Container {container_name} stopped. Releasing VRAM.")
+                if workspace:
+                    ship.record_event(workspace, f"⏹️ Build container `{container_name}` ended.")
                 action = await asyncio.to_thread(
                     _record_finished_build, container_name, workspace, base_branch)
                 if action == "watch":
@@ -3981,6 +4027,7 @@ async def _docker_safety_monitor(container_name: str, workspace: str = "",
         # name behind would pin the expert awake for the life of the process -
         # the opposite failure to the one above, and just as quiet.
         _live_builds.discard(container_name)
+        _build_workspaces.pop(container_name, None)
 
 
 async def _trigger_build_pipeline_safe(
