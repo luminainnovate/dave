@@ -1,0 +1,118 @@
+# Ephemeral services for a veriform build: a Postgres and a Redis of its own,
+# started fresh for every build and thrown away when it ends.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.ephemeral-veriform.yml \
+#     --profile build run --rm cline-builder
+#
+# WHY NOT THE DEVELOPER'S STACK (docker-compose.veriform.yml)
+# That override joins the build to veriform's dev network and its shared
+# `veriform_build` database. It works only while the developer's stack is up and
+# br.ai.n/.env carries the role passwords, and a build that ran while either
+# was missing had every DB-backed test refused - which the test gate reports as
+# an environment fault and skips, so the build passed on tests that never ran.
+# State also leaked between builds: one build's half-applied migration was the
+# next build's starting schema.
+#
+# WHY IT MIRRORS CI RATHER THAN THE DEV STACK
+# A CI fix is verified by running CI's own failing command. veriform-ui's
+# workflows reach Postgres and Redis at localhost, as `vif`, in `veriform_test`
+# (.github/workflows/ci.yml, isolation.yml). Here the build container joins the
+# Postgres container's network namespace, so localhost:5432 and localhost:6379
+# are true inside the build exactly as they are on a runner, and every URL in
+# those workflows works unchanged. ci.yml's Redis note is why this matters: the
+# suite expects Redis at the 127.0.0.1:6379 default with REDIS_URL UNSET -
+# setting it switches api-limits to live enforcement the suite is not written
+# against. Only a shared namespace makes the default address right.
+#
+# DISPOSABLE BY CONSTRUCTION
+# Postgres keeps its data on tmpfs, Redis runs with persistence off, and the
+# orchestrator removes both containers before each build and after it ends.
+# The role passwords are throwaways on a database that exists for one build;
+# there is no secret to manage.
+
+services:
+  build-postgres:
+    image: postgres:16
+    profiles:
+      - build
+    environment:
+      POSTGRES_USER: vif
+      POSTGRES_PASSWORD: vif
+      POSTGRES_DB: veriform_test
+    tmpfs:
+      - /var/lib/postgresql/data
+    volumes:
+      # Runs once, on the empty cluster: the second database, and the roles
+      # pre-created WITH LOGIN. See the file for why that survives migrations.
+      - ./cline-builder/ephemeral/veriform-init.sql:/docker-entrypoint-initdb.d/10-veriform.sql:ro
+    # The namespace the build joins. Its network and host mapping are the
+    # build's: the models are reached at host.docker.internal.
+    networks:
+      - ai-workspace-net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      # Against the TCP listener, as the build will connect. pg_isready over the
+      # socket answers during initdb's temporary server, before the init script
+      # has created the roles.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U vif -d veriform_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  build-redis:
+    image: redis:7-alpine
+    profiles:
+      - build
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    network_mode: "service:build-postgres"
+    depends_on:
+      build-postgres:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  cline-builder:
+    network_mode: "service:build-postgres"
+    # A container that joins another's namespace cannot set its own networks or
+    # host entries; it inherits build-postgres's.
+    networks: !reset []
+    extra_hosts: !reset []
+    depends_on:
+      build-postgres:
+        condition: service_healthy
+      build-redis:
+        condition: service_healthy
+    volumes:
+      # The environment fact sheet for THIS setup. The workspace's own
+      # `.builder_env.md` describes the developer's stack, and its hostnames do
+      # not exist here; BUILDER_ENV_FILE makes distill.py read this instead.
+      - ./builder-env.ephemeral-veriform.md:/app/builder_env.md:ro
+      # CI runs with no Backend/.env, and so does this build. The developer's
+      # .env sits in the bind-mounted tree, and its loader fills every key not
+      # already set: VAULT_ADDR sent `db:migrate` to a Vault the container cannot
+      # reach (so no build could ever migrate), and FGA_URL, the Zitadel
+      # credentials and a pooled RLS probe URL would have pointed the suite at
+      # services that are not here - ci.yml requires FGA_URL unset. An empty
+      # file in its place is CI's condition exactly, and it also makes "never edit
+      # Backend/.env" a fact rather than an instruction: writes land in /dev/null
+      # and the host file is untouched.
+      - /dev/null:/workspace/Backend/.env:ro
+    environment:
+      - BUILDER_ENV_FILE=/app/builder_env.md
+      # As ci.yml states them: every connection, the same database.
+      - TEST_DATABASE_URL=postgres://vif:vif@localhost:5432/veriform_test
+      - MIGRATION_DATABASE_URL=postgres://vif:vif@localhost:5432/veriform_test
+      - DATABASE_URL=postgres://vif:vif@localhost:5432/veriform_test
+      - PUBLIC_DATABASE_URL=postgres://vif:vif@localhost:5432/veriform_test
+      - SYNC_DATABASE_URL=postgres://vif:vif@localhost:5432/veriform_test
+      - INSPECT_DATABASE_URL=postgres://vif:vif@localhost:5432/veriform_test
+      # The tenant-isolation probes, as isolation.yml states them: the
+      # unprivileged roles, so RLS actually applies to what they run.
+      - RLS_PROBE_DATABASE_URL=postgres://veriform_app:build-throwaway@localhost:5432/veriform_test
+      - RLS_PROBE_PUBLIC_DATABASE_URL=postgres://veriform_public:build-throwaway@localhost:5432/veriform_test
+      # REDIS_URL is deliberately absent - see the header. These entries
+      # replace the base file's DATABASE_URL and TEST_DATABASE_URL by name.

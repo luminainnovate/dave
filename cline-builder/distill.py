@@ -5969,7 +5969,11 @@ def read_builder_env(path: str = None) -> str:
     external services and the block is simply omitted. A read failure is also
     non-fatal - a build must not die because an optional file was unreadable.
     """
-    path = path or BUILDER_ENV_PATH
+    # BUILDER_ENV_FILE lets a compose override supply the sheet for the services
+    # IT provides. The workspace's own .builder_env.md describes the developer's
+    # stack, and handed to a build with ephemeral services it would name hosts
+    # that do not exist there.
+    path = path or os.environ.get("BUILDER_ENV_FILE") or BUILDER_ENV_PATH
     try:
         with open(path, "r", encoding="utf-8") as f:
             content = f.read()

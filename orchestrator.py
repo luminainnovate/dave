@@ -318,6 +318,19 @@ PIPELINE_COMPOSE_FILE = "docker-compose.yml"
 PIPELINE_COMPOSE_OVERRIDE = "docker-compose.veriform.yml"
 PIPELINE_COMPOSE_OVERRIDE_NET = "backend_default"
 
+# Projects whose builds get services of their own, keyed by the project name a
+# workspace folder starts with (`veriform-ui_e6b3b8906f60` -> `veriform-ui`).
+# Preferred over PIPELINE_COMPOSE_OVERRIDE: a fresh, CI-shaped Postgres and
+# Redis per build, instead of the developer's dev stack - which has to be up,
+# has to have its passwords copied into .env, and carries one build's schema
+# into the next. See docker-compose.ephemeral-veriform.yml.
+EPHEMERAL_SERVICES = {
+    "veriform-ui": "docker-compose.ephemeral-veriform.yml",
+}
+# The services those overrides define. Removed before each build so it starts
+# on an empty database, and after it ends so nothing outlives it.
+EPHEMERAL_SERVICE_NAMES = ("build-postgres", "build-redis")
+
 # Tool-calling budget for one turn. Each hop is a full Expert inference over the
 # whole conversation, so this is the main lever on how long a tool-using turn
 # takes. Write turns need more: read -> edit -> verify is three hops for a single
@@ -3486,9 +3499,39 @@ def _handle_clone_command(messages: list) -> str:
         return f"❌ **Error during clone:** {e}"
 
 
-def _compose_files() -> list[str]:
+def _ephemeral_override(workspace: str) -> str:
+    """The ephemeral-services override for this workspace's project, or ""."""
+    name = os.path.basename(os.path.abspath(workspace or ""))
+    project = name.rsplit("_", 1)[0] if "_" in name else name
+    override = EPHEMERAL_SERVICES.get(project, "")
+    return override if override and os.path.exists(override) else ""
+
+
+def _reset_ephemeral_services(files: list[str]) -> None:
+    """
+    Remove a build's ephemeral services, data and all. Safe when there are none.
+
+    Run before a build, so it never inherits a database a previous build (or a
+    crashed one) left behind, and after it, so a finished build holds nothing.
+    """
+    if not any(f in EPHEMERAL_SERVICES.values() for f in files):
+        return
+    try:
+        subprocess.run(
+            ["docker", "compose", *files, "--profile", "build",
+             "rm", "--stop", "--force", "--volumes", *EPHEMERAL_SERVICE_NAMES],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120, check=True,
+        )
+    except (subprocess.SubprocessError, OSError) as e:
+        logger.warning(f"Pipeline: could not remove the ephemeral build services: {e}")
+
+
+def _compose_files(workspace: str = "") -> list[str]:
     """
     The -f flags for the build container launch.
+
+    A project listed in EPHEMERAL_SERVICES gets its own services and nothing
+    else; every other build falls through to the developer-stack override below.
 
     Adds PIPELINE_COMPOSE_OVERRIDE only when its external network is actually
     present, so a box with veriform's stack down still builds normally instead of
@@ -3501,6 +3544,11 @@ def _compose_files() -> list[str]:
     chance to fail.
     """
     files = ["-f", PIPELINE_COMPOSE_FILE]
+
+    ephemeral = _ephemeral_override(workspace)
+    if ephemeral:
+        logger.info(f"Pipeline: {ephemeral} applies; the build gets a fresh Postgres and Redis.")
+        return files + ["-f", ephemeral]
 
     if not os.path.exists(PIPELINE_COMPOSE_OVERRIDE):
         return files
@@ -3603,8 +3651,12 @@ async def _trigger_build_pipeline(messages: list, extra_env: Optional[dict] = No
         # We mount the SPECIFIC conversation folder as /workspace
         container_name = f"cline-builder-{int(time.time())}"
         project_name = os.path.basename(abs_target_dir)
+        compose_files = _compose_files(abs_target_dir)
+        # A fresh database for every build: nothing a previous build migrated,
+        # seeded or broke carries over. `compose run` starts them again below.
+        _reset_ephemeral_services(compose_files)
         cmd = [
-            "docker", "compose", *_compose_files(),
+            "docker", "compose", *compose_files,
             "--profile", "build", "run", "-d", "--rm",
             "--name", container_name,
             "-v", f"{abs_target_dir}:/workspace",
@@ -3644,7 +3696,8 @@ async def _trigger_build_pipeline(messages: list, extra_env: Optional[dict] = No
 
         # Launch the Safety Monitor to ensure VRAM is released when container stops/deleted
         asyncio.create_task(_docker_safety_monitor(
-            container_name, workspace=abs_target_dir, base_branch=build_base))
+            container_name, workspace=abs_target_dir, base_branch=build_base,
+            compose_files=compose_files))
 
         if extra_env and extra_env.get("PIPELINE_MODE") == "distill_only":
             # The caller polls for the architect output and reports to chat itself.
@@ -3839,7 +3892,9 @@ def _resume_ci_gate() -> None:
         elif state == ship.STATE_FIXING and marker.get("container"):
             logger.info(f"[CI Gate] Re-attaching to fix build {marker['container']}")
             _live_builds.add(marker["container"])
-            asyncio.create_task(_docker_safety_monitor(marker["container"], workspace=workspace))
+            asyncio.create_task(_docker_safety_monitor(
+                marker["container"], workspace=workspace,
+                compose_files=_compose_files(workspace)))
 
 
 def _ci_failure_waiting(messages: list) -> bool:
@@ -3858,7 +3913,7 @@ def _start_ci_watch_if_due(project_dir: str) -> None:
 
 
 async def _docker_safety_monitor(container_name: str, workspace: str = "",
-                                 base_branch: str = ""):
+                                 base_branch: str = "", compose_files: Optional[list] = None):
     """
     Background task that monitors a specific Docker container.
     When the container stops, it automatically triggers a VRAM cleanup.
@@ -3890,6 +3945,7 @@ async def _docker_safety_monitor(container_name: str, workspace: str = "",
                 if action == "watch":
                     _start_ci_watch(workspace)
                 _live_builds.discard(container_name)
+                await asyncio.to_thread(_reset_ephemeral_services, compose_files or [])
                 await shutdown_expert()
                 if action == "next":
                     # After the cleanup above: the next build takes the GPU lock
@@ -3905,6 +3961,7 @@ async def _docker_safety_monitor(container_name: str, workspace: str = "",
                 if action == "watch":
                     _start_ci_watch(workspace)
                 _live_builds.discard(container_name)
+                await asyncio.to_thread(_reset_ephemeral_services, compose_files or [])
                 await shutdown_expert()
                 if action == "next":
                     # After the cleanup above: the next build takes the GPU lock
