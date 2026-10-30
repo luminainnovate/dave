@@ -1963,6 +1963,58 @@ _REPRO_UNRUNNABLE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Output a test runner prints only when tests RAN and at least one FAILED:
+# vitest/jest totals, pytest's `N failed`, mocha's `N failing`, TAP's `# fail N`,
+# per-test FAIL/× lines and assertion errors. Case-sensitive on purpose:
+# "Failed to install browsers" is a setup failure, not a FAIL line.
+#
+# It decides between "the code is broken" and "the command could not run", and
+# both callers got that wrong without it. `npm error` - one of the runner-missing
+# patterns - is also what npm prints for EVERY failing script ("npm error
+# Lifecycle script `test` failed"), so any red `npm test` read as a missing
+# runner. And a suite whose background jobs log ECONNREFUSED as harmless,
+# fail-open noise read as an unreachable service. The test gate then skipped,
+# and a build whose tests were failing reported "TESTS PASSING".
+_TESTS_FAILED_RE = re.compile(
+    r"(?:Tests?|Test Files|Test Suites):?\s+[1-9]\d*\s+failed"
+    r"|\b[1-9]\d*\s+(?:failed|failing)\b"
+    r"|^\s*(?:FAIL|FAILED)\s+\S"
+    r"|^\s*[×✗✕]\s"
+    r"|\bAssertionError\b"
+    r"|^#\s*fail\s+[1-9]",
+    re.MULTILINE,
+)
+
+# The service-unreachable half of _REPRO_UNRUNNABLE_RE, on its own.
+_SERVICE_UNREACHABLE_RE = re.compile(
+    r"econnrefused|connection refused|could not connect to server|getaddrinfo|eai_again",
+    re.IGNORECASE,
+)
+
+
+def tests_failed(output: str) -> bool:
+    """True when the output shows tests ran and some failed - a code verdict."""
+    return bool(_TESTS_FAILED_RE.search(output or ""))
+
+
+def _unrunnable(exit_code: int, output: str) -> bool:
+    """
+    The reproduction could not run, as opposed to ran and failed.
+
+    A refused connection stays an environment fault even beside failing tests:
+    here the failure is matched against the diagnosis's signature, and a test
+    that failed BECAUSE a service was down would tell the pass its correct root
+    cause is wrong. The runner-missing patterns yield to evidence that tests ran.
+    """
+    if exit_code == 127:
+        return True
+    if exit_code == 0:
+        return False
+    if _SERVICE_UNREACHABLE_RE.search(output):
+        return True
+    return bool(_REPRO_UNRUNNABLE_RE.search(output)) and not tests_failed(output)
+
+
 # Horizontal whitespace only. `\s` would match the newline, so `- COMMAND:` with
 # an empty value silently captured the SIGNATURE line below it - a malformed
 # document that parsed cleanly into the wrong command.
@@ -2199,7 +2251,7 @@ def _run_reproduction_command(argv, command: str, signature: str,
                            f"The command could not be run: {e}")
 
     tail = output[-4000:]
-    if exit_code == 127 or (exit_code != 0 and _REPRO_UNRUNNABLE_RE.search(output)):
+    if _unrunnable(exit_code, output):
         return ReproResult(
             False, f"the runner could not execute (exit {exit_code})",
             f"The command exited {exit_code}, but the output shows a missing runner, "
@@ -6276,6 +6328,13 @@ if __name__ == "__main__":
     # build loop calls this once per iteration rather than reading a value cached
     # at distillation time, because on a fresh build the suite does not exist yet
     # when Phase 1 runs - it is written during Phase 2, by the agent being gated.
+    if len(sys.argv) > 2 and sys.argv[1] == "--tests-failed":
+        # For the build loop's test gate: exit 0 when the log shows failing tests.
+        try:
+            with open(sys.argv[2], "r", encoding="utf-8", errors="replace") as f:
+                sys.exit(0 if tests_failed(f.read()) else 1)
+        except OSError:
+            sys.exit(1)
     if len(sys.argv) > 2 and sys.argv[1] == "--test-command":
         print(detect_test_command(sys.argv[2]))
         raise SystemExit(0)

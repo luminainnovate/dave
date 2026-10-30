@@ -151,6 +151,94 @@ def clear_marker(workspace: str) -> None:
         logger.warning(f"Could not clear the build marker: {e}")
 
 
+# =============================================================================
+# BUILD EVENTS
+# =============================================================================
+#
+# What a build and the CI-fix queue did while nobody was asking: each issue
+# starting and finishing, each iteration inside a container. OpenWebUI cannot
+# be written to unprompted - every word reaches the chat as part of a reply -
+# so events are written here the moment they happen, and the next reply in
+# that conversation carries every one not yet shown, in order. On disk, next to
+# the marker, so a restart between the event and the next message loses none.
+
+EVENTS_NAME = "build_events.jsonl"
+EVENTS_SEEN_NAME = "build_events.seen"
+
+# How many unseen events one reply shows; older ones are counted, not listed.
+MAX_EVENTS_SHOWN = 15
+
+
+def _events_path(workspace: str, name: str = EVENTS_NAME) -> str:
+    return os.path.join(os.path.abspath(workspace), CONTEXT_DIR, name)
+
+
+def record_event(workspace: str, text: str) -> None:
+    """Append one event. Never raises: a progress line must not cost a build."""
+    if not workspace or not text:
+        return
+    try:
+        path = _events_path(workspace)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"at": time.time(), "text": str(text)[:500]}) + "\n")
+    except Exception as e:
+        logger.warning(f"Could not record a build event: {e}")
+
+
+def _read_events(workspace: str) -> list:
+    try:
+        with open(_events_path(workspace), "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return []
+    events = []
+    for line in lines:
+        try:
+            events.append(json.loads(line))
+        except ValueError:
+            continue
+    return events
+
+
+def unseen_events(workspace: str) -> str:
+    """Every event since the last call, formatted for chat - and marks them seen."""
+    events = _read_events(workspace)
+    try:
+        with open(_events_path(workspace, EVENTS_SEEN_NAME), "r", encoding="utf-8") as f:
+            seen = int(f.read().strip() or 0)
+    except (OSError, ValueError):
+        seen = 0
+    if seen > len(events):  # the log was cleared under us
+        seen = 0
+    new = events[seen:]
+    if not new:
+        return ""
+    try:
+        with open(_events_path(workspace, EVENTS_SEEN_NAME), "w", encoding="utf-8") as f:
+            f.write(str(len(events)))
+    except OSError as e:
+        logger.warning(f"Could not mark build events seen: {e}")
+    return _format_events(new, "📋 **Since your last message:**")
+
+
+def recent_events(workspace: str, count: int = 8) -> str:
+    """The last few events, seen or not, for `!ship status`."""
+    events = _read_events(workspace)[-count:]
+    return _format_events(events, "**Recent activity:**") if events else ""
+
+
+def _format_events(events: list, heading: str) -> str:
+    shown = events[-MAX_EVENTS_SHOWN:]
+    lines = [heading, ""]
+    if len(events) > len(shown):
+        lines.append(f"- …{len(events) - len(shown)} earlier")
+    for event in shown:
+        stamp = time.strftime("%H:%M", time.localtime(event.get("at", 0)))
+        lines.append(f"- `{stamp}` {event.get('text', '')}")
+    return "\n".join(lines)
+
+
 def in_flight(marker: Optional[dict]) -> bool:
     """True once `!ship confirm` has run and the CI gate has not finished with it."""
     return bool(marker) and marker.get("state", STATE_READY) not in (STATE_READY, STATE_INTEGRATED)
@@ -1890,11 +1978,15 @@ def ci_fix_request(workspace: str, include_preexisting: bool = False) -> Optiona
         "fix_attempts": int(marker.get("fix_attempts", 0)) + 1,
         "fix": {"issues": issues, "current": 0,
                 "branch": branch if scope == "pr" else "",
+                "start_sha": _head_sha(root),
                 "include_preexisting": include_preexisting},
         "notice": None, "announced": True,
     })
     _save_marker(workspace, marker)
     _clear_build_complete(root)
+    record_event(workspace, f"🔧 Fix round {marker['fix_attempts']} planned: {len(issues)} issue(s), "
+                            f"one build each.")
+    record_event(workspace, f"▶️ Issue 1 of {len(issues)} started: {issues[0]['title']}")
     return _issue_instruction(workspace, marker, issues[0], len(issues)), _issue_env(marker), None
 
 
@@ -1907,7 +1999,11 @@ def next_fix_request(workspace: str) -> Optional[tuple]:
     issues, current = fix.get("issues", []), fix.get("current", 0)
     if current >= len(issues):
         return None
-    _clear_build_complete(os.path.abspath(workspace))
+    root = os.path.abspath(workspace)
+    _clear_build_complete(root)
+    fix["start_sha"] = _head_sha(root)
+    _save_marker(workspace, marker)
+    record_event(workspace, f"▶️ Issue {current + 1} of {len(issues)} started: {issues[current]['title']}")
     return _issue_instruction(workspace, marker, issues[current], len(issues)), _issue_env(marker)
 
 
@@ -1991,7 +2087,7 @@ def _fix_did_not_land(workspace: str, marker: dict, headline: str, detail: str) 
     return STATE_CI_FAILED
 
 
-def _set_aside(workspace: str, issue: dict) -> str:
+def _set_aside(workspace: str, issue: dict, start_sha: str = "") -> str:
     """
     Keep a failed issue's edits as a diff, and return the branch to its last commit.
 
@@ -2012,7 +2108,14 @@ def _set_aside(workspace: str, issue: dict) -> str:
     untracked = [p for p in paths if p not in tracked and os.path.exists(os.path.join(root, p))]
     for i in range(0, len(untracked), ADD_BATCH):
         _git(root, "add", "--intent-to-add", "--", *untracked[i:i + ADD_BATCH])
-    code, diff = _git(root, "diff", "HEAD", "--", *paths) if paths else (0, "")
+    # From the issue's starting commit, so commits the build made itself are in
+    # the kept diff and are rolled back with everything else.
+    base_ref = start_sha or "HEAD"
+    code, diff = _git(root, "diff", base_ref, "--", *paths) if paths else (0, "")
+    if start_sha:
+        rc, committed = _git(root, "diff", start_sha, "HEAD")
+        if rc == 0 and committed.strip() and committed.strip() not in diff:
+            diff = (committed + "\n" + diff) if diff.strip() else committed
     if code == 0 and diff.strip():
         try:
             with open(os.path.join(root, rel), "w", encoding="utf-8") as f:
@@ -2022,7 +2125,7 @@ def _set_aside(workspace: str, issue: dict) -> str:
             rel = ""
     else:
         rel = ""
-    _git(root, "reset", "-q", "--hard", "HEAD")
+    _git(root, "reset", "-q", "--hard", base_ref)
     # reset drops the intent-to-add entries but leaves their files behind.
     for path in untracked:
         try:
@@ -2074,6 +2177,11 @@ def fix_build_finished(workspace: str) -> str:
     issues, current = fix["issues"], fix.get("current", 0)
     issue = issues[current]
     branch = _current_branch(root)
+    # The commit this issue's build started from. An agent that commits its own
+    # work leaves nothing for the commit step below, and judging by that step
+    # alone called a fixed issue "unchanged" - and, never recording the branch,
+    # sent the next issue's build off to start a second one.
+    start_sha = fix.get("start_sha", "")
     on_fix_branch = (branch == marker.get("branch")) if scope == "pr" \
         else branch.startswith(BUILD_BRANCH_PREFIX)
 
@@ -2099,21 +2207,33 @@ def fix_build_finished(workspace: str) -> str:
             _commit_and_push(root, branch, title, body, _changed_files(root, base), push=False)
         except RuntimeError as e:
             issue.update({"status": ISSUE_NOT_FIXED, "note": f"could not commit: {e}",
-                          "diff": _set_aside(workspace, issue)})
+                          "diff": _set_aside(workspace, issue, start_sha)})
         else:
             head = _head_sha(root)
-            if head == before:
+            if head == (start_sha or before):
                 issue["status"] = ISSUE_UNCHANGED
             else:
                 issue.update({"status": ISSUE_FIXED, "commit": head})
+                if head == before:
+                    issue["note"] = "committed by the build itself"
                 fix["branch"] = branch
     else:
         issue.update({"status": ISSUE_NOT_FIXED,
                       "note": "never reached VERIFIED, SAFE and a passing test gate "
                               "(a design-pass blocker is one way; `!logs` names it)",
-                      "diff": _set_aside(workspace, issue)})
+                      "diff": _set_aside(workspace, issue, start_sha)})
+
+    marks = {ISSUE_FIXED: "✅", ISSUE_UNCHANGED: "➖", ISSUE_NOT_FIXED: "⚠️"}
+    outcome = issue["status"] + (f" (`{issue['commit'][:7]}`)" if issue.get("commit") else "")
+    if issue.get("diff"):
+        outcome += f"; its edits are kept in `{issue['diff']}`"
+    record_event(workspace, f"{marks.get(issue['status'], '•')} Issue {current + 1} of {len(issues)} "
+                            f"{outcome}: {issue['title']}")
 
     fix["current"] = current + 1
+    # The next issue starts here, whatever launches it. A stale start would let
+    # the next failed issue roll back past this one's fix.
+    fix["start_sha"] = _head_sha(root)
     _save_marker(workspace, marker)
     if fix["current"] < len(issues):
         return STATE_FIXING
@@ -2268,6 +2388,9 @@ def status(workspace: str) -> str:
             lines += ["", _plan_markdown(fix["issues"])]
     elif state == STATE_READY:
         lines.append("- `!ship` shows what would be shipped.")
+    activity = recent_events(workspace)
+    if activity:
+        lines += ["", activity]
     return "\n".join(lines)
 
 

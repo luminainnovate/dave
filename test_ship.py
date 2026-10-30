@@ -1056,6 +1056,47 @@ def test_a_failed_issue_is_kept_as_a_diff_and_rolled_back():
           and os.path.exists(os.path.join(w.ctx, "ship_design.md")))
 
 
+def test_a_build_that_commits_its_own_fix_counts_as_fixed():
+    """The agent ran `git commit` itself: nothing left to stage, but the issue moved."""
+    with FakeGh() as gh:
+        w, _ = queued(gh)
+        start = w.head()
+        w.write("Backend/src/routes/attestations.ts", "fixed by the agent\n")
+        git(w.root, "commit", "-qam", "agent's own commit")
+        state = finish_issue(w)
+        _, env = ship.next_fix_request(w.root)
+    issue = ship.read_marker(w.root)["fix"]["issues"][0]
+    check("still fixing", state == ship.STATE_FIXING, state)
+    check("the issue is fixed, not unchanged", issue["status"] == "fixed", issue)
+    check("at the agent's commit", issue.get("commit") == w.head() != start, issue)
+    check("the next issue continues on this branch",
+          env == {"BUILD_BRANCH": "agent/build-1700000000"}, env)
+
+
+def test_a_failed_build_s_own_commits_are_rolled_back_too():
+    with FakeGh() as gh:
+        w, _ = queued(gh)
+        start = w.head()
+        w.write("Backend/src/routes/attestations.ts", "broken\n")
+        git(w.root, "commit", "-qam", "agent committed a broken attempt")
+        finish_issue(w, passed=False)
+    issue = ship.read_marker(w.root)["fix"]["issues"][0]
+    check("the branch is back where the issue started", w.head() == start)
+    with open(os.path.join(w.root, issue["diff"])) as f:
+        diff = f.read()
+    check("and the committed attempt is in the kept diff", "broken" in diff, diff)
+
+
+def test_a_failed_issue_never_rolls_back_past_the_previous_fix():
+    """Even when nothing refreshed the start between issues."""
+    with FakeGh() as gh:
+        w, _ = queued(gh)
+        finish_issue(w, {"Backend/src/routes/attestations.ts": "fixed\n"})
+        fixed_head = w.head()
+        finish_issue(w, {"Backend/src/routes/attestations.ts": "broken\n"}, passed=False)
+    check("the first fix survives the second failing", w.head() == fixed_head)
+
+
 def test_the_round_is_pushed_once_every_issue_has_had_its_build():
     with FakeGh() as gh:
         w, _ = queued(gh)
@@ -1138,6 +1179,50 @@ def test_on_a_red_base_the_first_issue_starts_the_branch_the_rest_continue():
     notice = ship.pending_offer(w.root)
     check("and the wording is about main, not a PR",
           notice and "fixed for `main`" in notice, notice)
+
+
+# =============================================================================
+# BUILD EVENTS
+# =============================================================================
+
+def test_each_issue_reports_when_it_starts_and_how_it_ended():
+    with FakeGh() as gh:
+        w, _ = queued(gh)
+        finish_issue(w, {"Backend/src/routes/attestations.ts": "fixed\n"})
+        ship.next_fix_request(w.root)
+        finish_issue(w, {"Backend/src/routes/attestations.ts": "half done\n"}, passed=False)
+    shown = ship.unseen_events(w.root)
+    check("the round's plan", "Fix round 1 planned: 4 issue(s)" in shown, shown)
+    check("issue 1 starting", "Issue 1 of 4 started" in shown, shown)
+    check("issue 1's outcome and commit", "Issue 1 of 4 fixed (`" in shown, shown)
+    check("issue 2 starting", "Issue 2 of 4 started" in shown, shown)
+    check("issue 2 not fixed, with where its edits went",
+          "Issue 2 of 4 not fixed" in shown and "ci_issue_2.diff" in shown, shown)
+    check("in the order they happened",
+          shown.index("Issue 1 of 4 started") < shown.index("Issue 1 of 4 fixed")
+          < shown.index("Issue 2 of 4 started"), shown)
+
+
+def test_events_are_shown_once():
+    w = Workspace()
+    ship.record_event(w.root, "first")
+    ship.record_event(w.root, "second")
+    once = ship.unseen_events(w.root)
+    check("both shown", "first" in once and "second" in once, once)
+    check("then nothing", ship.unseen_events(w.root) == "")
+    ship.record_event(w.root, "third")
+    again = ship.unseen_events(w.root)
+    check("only what is new", "third" in again and "first" not in again, again)
+    check("status still lists recent activity", "first" in ship.recent_events(w.root))
+
+
+def test_a_long_gap_is_summarised_not_dumped():
+    w = Workspace()
+    for n in range(40):
+        ship.record_event(w.root, f"event {n}")
+    shown = ship.unseen_events(w.root)
+    check("the latest are listed", "event 39" in shown and "event 25" in shown, shown)
+    check("older ones are counted", "…25 earlier" in shown and "event 24" not in shown, shown)
 
 
 if __name__ == "__main__":
