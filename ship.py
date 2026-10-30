@@ -290,9 +290,15 @@ def _status_paths(root: str) -> set:
     Ignored files never appear here at all, which is what makes staging exactly
     this list safe.
     """
-    code, out = _git(root, "status", "--porcelain", "-uall", "-z")
-    if code != 0:
+    # Not through _git: it strips its output, and porcelain's first record can
+    # begin with a space (" M path", an unstaged edit). Stripped, the status
+    # shifts left by one and the path loses its first character - `ackend/x.ts`
+    # - so that file silently fell out of every commit and diff built from here.
+    result = subprocess.run(["git", "-C", root, "status", "--porcelain", "-uall", "-z"],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
         return set()
+    out = result.stdout
 
     paths = set()
     records = [r for r in out.split("\0") if r]
@@ -528,7 +534,8 @@ def _stageable(root: str, files: list) -> list:
     return [p for p in candidates if p not in ignored]
 
 
-def _commit_and_push(root: str, branch: str, title: str, body: str, files: list) -> None:
+def _commit_and_push(root: str, branch: str, title: str, body: str, files: list,
+                     push: bool = True) -> None:
     """Stage `files`, commit them if anything is staged, push. Raises RuntimeError."""
     # Stage exactly the paths the proposal listed. Naming them, rather than
     # sweeping the workspace and excluding the scratch directories, keeps
@@ -555,7 +562,8 @@ def _commit_and_push(root: str, branch: str, title: str, body: str, files: list)
         # or the gate would have refused, so there is work to push.
         logger.info(f"Nothing left to stage on {branch}; it is already committed.")
 
-    _git(root, "push", "-u", "origin", branch, check=True)
+    if push:
+        _git(root, "push", "-u", "origin", branch, check=True)
 
 
 def confirm(workspace: str) -> str:
@@ -767,6 +775,23 @@ _LOCATION_ONLY_RE = re.compile(r"^\d+:\d+\s")
 # captured-output banners, structured log lines the code under test printed,
 # and passing tests whose names happen to say "fails". On the first real backend
 # run these were five of the five lines shown in chat, ahead of the failures.
+# A failing test file, as vitest/jest ("FAIL  test/a.test.ts > ...") and
+# pytest ("FAILED tests/test_a.py::test_x - ...") name it. A suite failing in
+# several files is several problems, and is split that way into issues.
+_FAILING_TEST_RE = re.compile(
+    r"^(?:FAIL|FAILED)\s+(?P<file>[\w.$@+\-\[\]]+(?:/[\w.$@+\-\[\]]+)*\.\w+)")
+# The runner's own totals, which belong to no single test file.
+_RUNNER_SUMMARY_RE = re.compile(
+    r"^\s*(?:Test Files|Tests|Test Suites|Snapshots)\b|^Process completed with exit code"
+    r"|^=+ .*\b(?:failed|passed)\b")
+# Source paths mentioned anywhere in a failure: test files, stack frames,
+# lint headers. Handed to the fix build as what to read first - a design pass
+# that has to ask for a function body it was never shown is a blocked build.
+_SOURCE_PATH_RE = re.compile(
+    r"(?<![\w/.])((?:[\w.$@+\-\[\]]+/)+[\w.$@+\-\[\]]+"
+    r"\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs|rb|java|kt|sql|vue|svelte|css|scss))\b")
+MAX_FILES_INVOLVED = 15
+
 _ERROR_NOISE_RE = re.compile(r"^(?:stdout|stderr) \||^[✓√]\s|^\{\s*\"")
 _RUNNER_CHECKOUT_RE = re.compile(r"/home/runner/work/[^/\s]+/[^/\s]+/")
 
@@ -1123,11 +1148,48 @@ def _step_summary(lines: list) -> dict:
             errors.append(cleaned)
     tail = [_RUNNER_CHECKOUT_RE.sub("", ln) for ln in lines
             if not ln.startswith(("##[group]", "##[endgroup]"))]
+
+    # Paths per failing test file, from every line - a stack frame such as
+    # `❯ src/routes/attestations.ts:120:9` is where the fix goes, and it never
+    # matches the error pattern.
+    paths_by_test, current = {}, None
+    for line in lines:
+        cleaned = _RUNNER_CHECKOUT_RE.sub("", line).strip()
+        match = _FAILING_TEST_RE.match(cleaned)
+        if match:
+            current = match.group("file")
+        if current:
+            paths_by_test.setdefault(current, []).append(cleaned)
+
+    # Grouped from every error line, not the capped list: a suite failing in six
+    # files names most of them before the last fifteen lines start.
+    by_test, current = {}, None
+    for line in errors:
+        match = _FAILING_TEST_RE.match(line)
+        if match:
+            current = match.group("file")
+            by_test.setdefault(current, [])
+        if current is None or _RUNNER_SUMMARY_RE.search(line):
+            continue
+        by_test[current].append(line)
+
     # The cap keeps the last lines, where the summary ("✖ 674 problems", the
     # exit code) is - but the count is kept, so the record never reads as if
     # the 15 shown were all there is.
     return {"command": command, "errors": errors[-MAX_ERROR_LINES:],
-            "error_count": len(errors), "tail": tail[-MAX_TAIL_LINES:]}
+            "error_count": len(errors), "tail": tail[-MAX_TAIL_LINES:],
+            "test_files": {f: ls[:MAX_ERROR_LINES] for f, ls in by_test.items()},
+            "test_paths": {f: _paths_in([f] + paths_by_test.get(f, [])) for f in by_test},
+            "files": _paths_in(errors + tail)}
+
+
+def _paths_in(lines: list) -> list:
+    found = []
+    for line in lines:
+        for path in _SOURCE_PATH_RE.findall(line):
+            if "node_modules/" not in path and path not in found:
+                found.append(path)
+    return found[:MAX_FILES_INVOLVED * 2]
 
 
 def _steps_from_log(text: str) -> list:
@@ -1579,19 +1641,203 @@ def _mark_failure_resolved(workspace: str, marker: dict, how: str) -> None:
 # The fix loop
 # -----------------------------------------------------------------------------
 
+# One build per issue. Handing a fix build every failure at once failed the
+# first time it was tried: three unrelated problems - a backend suite, 667 lint
+# errors, an RLS test - went into one design pass, the pass blocked on one of
+# them, and the build died with nothing committed for the other two. Each issue
+# now gets a build of its own on the same branch, a fixed issue is committed
+# before the next starts, and a failed one is kept as a diff and rolled back so
+# it cannot leak into the next. CI judges the whole round once it is pushed;
+# anything still red becomes the next round's record.
+
+ISSUE_PENDING = "pending"
+ISSUE_FIXED = "fixed"
+ISSUE_UNCHANGED = "unchanged"   # the build passed its gates without changing anything
+ISSUE_NOT_FIXED = "not fixed"   # the build never reached VERIFIED, SAFE and its tests
+ISSUE_SKIPPED = "skipped"       # the queue stopped before reaching it
+
+# Lint and formatting run last: they touch the most files, and going last means
+# the code the other issues changed is formatted too.
+_LINT_STEP_RE = re.compile(r"\b(?:lint|eslint|prettier|ruff|black|flake8|format|stylelint)\b",
+                           re.IGNORECASE)
+
+
+def _plan_issues(causes: list) -> list:
+    """Split triaged causes into issues: one per failed step, or per failing test file."""
+    issues = []
+    for cause in causes:
+        steps = cause.get("steps") or [{"step": "", "command": "", "errors": [],
+                                        "origin": cause.get("origin")}]
+        for step in steps:
+            common = {"check": cause.get("name", ""), "url": cause.get("url", ""),
+                      "origin": step.get("origin") or cause.get("origin", ""),
+                      "step": step.get("step", ""), "command": step.get("command", ""),
+                      "kind": cause.get("kind", "")}
+            label = f"{cause.get('name', 'check')} › {step.get('step') or 'failed'}"
+            tests = step.get("test_files") or {}
+            if len(tests) > 1:
+                for test_file, lines in tests.items():
+                    issues.append({**common, "title": f"{label}: {test_file}",
+                                   "test_file": test_file, "errors": lines,
+                                   "error_count": len(lines),
+                                   "files": (step.get("test_paths") or {}).get(test_file)
+                                   or _paths_in([test_file] + lines)})
+            else:
+                issues.append({**common, "title": label,
+                               "test_file": next(iter(tests), ""),
+                               "errors": step.get("errors", []),
+                               "error_count": step.get("error_count", len(step.get("errors", []))),
+                               "files": step.get("files", [])})
+    issues.sort(key=lambda i: bool(_LINT_STEP_RE.search(f"{i['step']} {i['command']}")))
+    for n, issue in enumerate(issues, 1):
+        issue.update({"id": n, "status": ISSUE_PENDING})
+    return issues
+
+
+def _plan_markdown(issues: list) -> str:
+    marks = {ISSUE_PENDING: "⏳", ISSUE_FIXED: "✅", ISSUE_UNCHANGED: "➖",
+             ISSUE_NOT_FIXED: "⚠️", ISSUE_SKIPPED: "⏭️"}
+    out = []
+    for issue in issues:
+        line = f"{issue['id']}. {marks.get(issue['status'], '')} {_one_line(issue['title'], 160)}"
+        if issue["status"] != ISSUE_PENDING:
+            line += f" — {issue['status']}"
+        if issue.get("commit"):
+            line += f" (`{issue['commit'][:7]}`)"
+        if issue.get("note"):
+            line += f": {_one_line(issue['note'], 200)}"
+        out.append(line)
+    return "\n".join(out)
+
+
+def _resolve_paths(root: str, paths: list) -> list:
+    """
+    Paths as the fix build will find them in the workspace.
+
+    CI prints paths relative to the step's working directory - `test/x.test.ts`
+    for a job that runs in `Backend/` - so a path that does not exist at the
+    root is matched against tracked files by suffix, and kept only if that
+    match is unique.
+    """
+    code, out = _git(root, "ls-files")
+    tracked = out.splitlines() if code == 0 else []
+    resolved = []
+    for path in paths:
+        if os.path.exists(os.path.join(root, path)):
+            hit = path
+        else:
+            matches = [t for t in tracked if t.endswith("/" + path)]
+            hit = matches[0] if len(matches) == 1 else ""
+        if hit and hit not in resolved:
+            resolved.append(hit)
+        if len(resolved) >= MAX_FILES_INVOLVED:
+            break
+    return resolved
+
+
+# Error codes such as DOMAIN_NOT_A_VERIFIED_CUSTOMER. A failure that names one
+# names the code that raises it, even when no stack frame does: the RLS issue's
+# log pointed only at its test file, and the design pass blocked asking for the
+# function that throws the code.
+_ERROR_CODE_RE = re.compile(r"\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+){2,}\b")
+_TEST_PATH_RE = re.compile(r"(^|/)(tests?|__tests__|spec)/|\.(test|spec)\.", re.IGNORECASE)
+MAX_RAISING_FILES = 5
+
+
+def _raising_files(root: str, errors: list) -> list:
+    """Non-test source files that contain an error code these errors report."""
+    codes = []
+    for line in errors:
+        for code in _ERROR_CODE_RE.findall(line):
+            if code not in codes:
+                codes.append(code)
+    found = []
+    for code in codes[:5]:
+        rc, out = _git(root, "grep", "-l", "-F", code)
+        for path in (out.splitlines() if rc == 0 else []):
+            if _TEST_PATH_RE.search(path) or not _SOURCE_PATH_RE.fullmatch(path):
+                continue
+            if path not in found:
+                found.append(path)
+    return found[:MAX_RAISING_FILES]
+
+
+def _formatting_only(issue: dict) -> bool:
+    errors = [e for e in issue.get("errors", []) if re.search(r":\d+:\d+\s", e)]
+    return bool(errors) and all("prettier/prettier" in e for e in errors)
+
+
+def _issue_instruction(workspace: str, marker: dict, issue: dict, total: int) -> str:
+    root = os.path.abspath(workspace)
+    failure = marker.get("failure") or {}
+    scope, base, branch = failure.get("scope", "pr"), marker.get("base", ""), marker.get("branch", "")
+    where = (f"pull request {_pr_label(marker)} (branch `{branch}`, into `{base}`)"
+             if scope == "pr" else f"the `{base}` branch after merging {_pr_label(marker)}")
+    lines = [
+        f"!build Fix CI issue {issue['id']} of {total} on {where}: {issue['title']}. "
+        f"Fix only this issue. The other failing checks are separate issues, each "
+        f"getting its own build: do not touch them. Change nothing else: no refactors, "
+        f"no unrelated improvements. Do not skip, weaken or delete a check, test or "
+        f"lint rule to make it pass. The full CI record is `{CONTEXT_DIR}/{CI_FAILURE_NAME}`.",
+        "",
+        f"Failing step: `{_one_line(issue['step'], 120)}`"
+        + (f" running `{_one_line(issue['command'], 300)}`" if issue.get("command") else ""),
+    ]
+    if issue.get("test_file"):
+        lines.append(f"Failing test file: `{issue['test_file']}`")
+    if issue.get("errors"):
+        lines += ["", "Error lines from the CI log:"]
+        lines += [f"- `{_one_line(e, 300)}`" for e in issue["errors"]]
+        if issue.get("error_count", 0) > len(issue["errors"]):
+            lines.append(f"- …and {issue['error_count'] - len(issue['errors'])} more in the log")
+    if _formatting_only(issue):
+        lines += ["", "FORMATTING ONLY: every error above is the prettier/prettier rule. Run "
+                  "the project's formatter over the affected files (its lint --fix or "
+                  "prettier --write) rather than editing by hand, and change no logic."]
+    files = _resolve_paths(root, issue.get("files", []))
+    files += [f for f in _raising_files(root, issue.get("errors", [])) if f not in files]
+    if files:
+        lines += ["", "FILES INVOLVED - read these before designing the fix; they are where "
+                  "the failure is reported or raised:"]
+        lines += [f"- `{f}`" for f in files]
+    if issue.get("command"):
+        lines += ["", "VERIFY: before writing .build_complete, run the failing command the way "
+                  "CI ran it (in the directory its workflow step uses) and confirm this issue "
+                  "no longer fails. A command that cannot run here - a missing tool or an "
+                  "unreachable service - is reported as such, not as passing.",
+                  f"- `{_one_line(issue['command'], 300)}`"]
+        if issue.get("test_file"):
+            lines.append(f"- To iterate faster, run the same runner on `{issue['test_file']}` alone.")
+    lines += _scope_lines(workspace, marker)
+    return "\n".join(lines).replace("--repo", "-repo").replace("--kb", "-kb")
+
+
+def _issue_env(marker: dict) -> dict:
+    """Every issue after the first continues on the branch the first one started."""
+    branch = (marker.get("fix") or {}).get("branch", "")
+    return {"BUILD_BRANCH": branch} if branch else {}
+
+
+def _clear_build_complete(root: str) -> None:
+    # The container clears this itself, but only once it gets that far. One that
+    # dies earlier must not be read as passing on the strength of an earlier
+    # build's VERIFIED SAFE.
+    try:
+        os.remove(os.path.join(root, ".build_complete"))
+    except OSError:
+        pass
+
+
 def ci_fix_request(workspace: str, include_preexisting: bool = False) -> Optional[tuple]:
     """
-    For `!approve`: (instruction, extra_env, refusal), or None if no CI failure waits.
+    For `!approve`: (instruction, extra_env, refusal) for the first issue, or None
+    if no CI failure waits.
 
-    Only the failures this change introduced are handed over, unless
+    Only the failures this change introduced are planned, unless
     `include_preexisting` (`!approve all`). CI-environment failures never are:
-    no edit to the project fixes a runner image.
-
-    Puts the workspace where the fix belongs - the PR's branch, or a fresh base
-    for a red base branch - and moves the marker to FIXING. The instruction is a
-    `!build` message for the conversation the container reads: the root causes
-    inline, the full record by path. No fenced blocks, for the reason in
-    `_causes_markdown`.
+    no edit to the project fixes a runner image. The instruction is a `!build`
+    message for the conversation the container reads. No fenced blocks, for the
+    reason in `_causes_markdown`.
     """
     marker = read_marker(workspace)
     if not marker or marker.get("state") != STATE_CI_FAILED:
@@ -1638,62 +1884,41 @@ def ci_fix_request(workspace: str, include_preexisting: bool = False) -> Optiona
             f"> {_one_line(str(e), 400)}"
         )
 
-    where = (f"pull request {_pr_label(marker)} (branch `{branch}`, into `{base}`)"
-             if scope == "pr" else f"the `{base}` branch after merging {_pr_label(marker)}")
-    instruction = "\n".join([
-        f"!build Make CI pass on {where}. GitHub Actions failed on commit "
-        f"`{failure.get('sha', '')[:7]}`. The full record, including log excerpts, is "
-        f"`{CONTEXT_DIR}/{CI_FAILURE_NAME}`. Fix the root cause of every failure "
-        f"below and change nothing else: no refactors and no unrelated improvements. "
-        f"Do not skip, weaken or delete a check, test or lint rule to make it pass.",
-        "",
-        "What has to change:",
-        _causes_markdown(targets, fenced=False),
-        *_verify_lines(targets),
-        *_scope_lines(workspace, marker),
-    ]).replace("--repo", "-repo").replace("--kb", "-kb")
-
-    # The container clears this itself, but only once it gets that far. One that
-    # dies earlier must not be read as passing on the strength of the original
-    # build's VERIFIED SAFE.
-    try:
-        os.remove(os.path.join(root, ".build_complete"))
-    except OSError:
-        pass
-
-    marker.update({"state": STATE_FIXING, "fix_started": time.time(),
-                   "fix_attempts": int(marker.get("fix_attempts", 0)) + 1,
-                   "notice": None, "announced": True})
+    issues = _plan_issues(targets)
+    marker.update({
+        "state": STATE_FIXING, "fix_started": time.time(),
+        "fix_attempts": int(marker.get("fix_attempts", 0)) + 1,
+        "fix": {"issues": issues, "current": 0,
+                "branch": branch if scope == "pr" else "",
+                "include_preexisting": include_preexisting},
+        "notice": None, "announced": True,
+    })
     _save_marker(workspace, marker)
-    env = {"BUILD_BRANCH": branch} if scope == "pr" else {}
-    return instruction, env, None
+    _clear_build_complete(root)
+    return _issue_instruction(workspace, marker, issues[0], len(issues)), _issue_env(marker), None
 
 
-def _verify_lines(targets: list) -> list:
-    """
-    The failing commands, as the fix build's own definition of done.
+def next_fix_request(workspace: str) -> Optional[tuple]:
+    """(instruction, extra_env) for the queue's current issue, or None if none is due."""
+    marker = read_marker(workspace)
+    if not marker or marker.get("state") != STATE_FIXING:
+        return None
+    fix = marker.get("fix") or {}
+    issues, current = fix.get("issues", []), fix.get("current", 0)
+    if current >= len(issues):
+        return None
+    _clear_build_complete(os.path.abspath(workspace))
+    return _issue_instruction(workspace, marker, issues[current], len(issues)), _issue_env(marker)
 
-    The container's test gate runs the project's test command, which is not
-    what CI ran: a lint step can fail in CI while `npm test` passes in the
-    container, and a fix build would then report success on a change GitHub
-    rejects minutes later.
-    """
-    commands = []
-    for cause in targets:
-        for step in cause.get("steps", []):
-            command = (step.get("command") or "").strip()
-            if command and command not in commands and not command.startswith("git merge"):
-                commands.append(command)
-    if not commands:
-        return []
-    return [
-        "",
-        "VERIFY: before writing .build_complete, run each command below the way CI ran "
-        "it (in the directory its workflow step uses) and confirm it exits 0. A command "
-        "that cannot run here - a missing tool or an unreachable service - is reported "
-        "as such, not as passing.",
-        *[f"- `{_one_line(c, 300)}`" for c in commands],
-    ]
+
+def fix_queue_progress(workspace: str) -> str:
+    """One line for chat when the next issue's build starts."""
+    marker = read_marker(workspace) or {}
+    fix = marker.get("fix") or {}
+    issues, current = fix.get("issues", []), fix.get("current", 0)
+    if current >= len(issues):
+        return ""
+    return f"Issue {current + 1} of {len(issues)}: {issues[current]['title']}"
 
 
 def _scope_lines(workspace: str, marker: dict) -> list:
@@ -1745,11 +1970,19 @@ def _build_passed_its_gates(root: str) -> bool:
     return "VERIFIED" in content and "SAFE" in content
 
 
+def _still_red(marker: dict) -> str:
+    if (marker.get("failure") or {}).get("scope") == "base":
+        return f"`{marker.get('base')}` is still red after {_pr_label(marker)}"
+    return f"CI is still failing on {_pr_label(marker)} and nothing was merged"
+
+
 def _fix_did_not_land(workspace: str, marker: dict, headline: str, detail: str) -> str:
     summary = (marker.get("failure") or {}).get("summary", "")
+    plan = (marker.get("fix") or {}).get("issues")
     notice = "\n".join([
         f"⚠️ **{headline}**", "", detail, "",
-        f"CI is still failing on {_pr_label(marker)} and nothing was merged.", "",
+        f"{_still_red(marker)}.", "",
+        *(["**Issues this round:**", "", _plan_markdown(plan), ""] if plan else []),
         "**What still has to change:**", "", summary, "",
         f"- **Try again:** `!approve` (edit `{CONTEXT_DIR}/{CI_FAILURE_NAME}` first to steer it)",
         "- **See what the build did:** `!logs`",
@@ -1758,13 +1991,73 @@ def _fix_did_not_land(workspace: str, marker: dict, headline: str, detail: str) 
     return STATE_CI_FAILED
 
 
+def _set_aside(workspace: str, issue: dict) -> str:
+    """
+    Keep a failed issue's edits as a diff, and return the branch to its last commit.
+
+    The next issue's build starts from this tree. Leaving a half-done attempt in
+    it would hand that build someone else's broken edits, and commit them under
+    the next issue's name if it passed.
+    """
+    root = os.path.abspath(workspace)
+    rel = f"{CONTEXT_DIR}/ci_issue_{issue['id']}.diff"
+    # Only the build's own paths. A blanket `git add -N .` would also mark the
+    # orchestration scratch in any workspace whose .gitignore does not cover it,
+    # and `reset --hard` deletes whatever the index has that HEAD does not -
+    # the CI record and the design documents included.
+    paths = [p for p in _status_paths(root)
+             if p.split("/")[0] not in EXCLUDED_DIRS and p not in EXCLUDED_FILES]
+    code, out = _git(root, "ls-files", "-z")
+    tracked = {p for p in out.split("\0") if p} if code == 0 else set()
+    untracked = [p for p in paths if p not in tracked and os.path.exists(os.path.join(root, p))]
+    for i in range(0, len(untracked), ADD_BATCH):
+        _git(root, "add", "--intent-to-add", "--", *untracked[i:i + ADD_BATCH])
+    code, diff = _git(root, "diff", "HEAD", "--", *paths) if paths else (0, "")
+    if code == 0 and diff.strip():
+        try:
+            with open(os.path.join(root, rel), "w", encoding="utf-8") as f:
+                f.write(diff + "\n")
+        except OSError as e:
+            logger.warning(f"Could not keep the diff for issue {issue['id']}: {e}")
+            rel = ""
+    else:
+        rel = ""
+    _git(root, "reset", "-q", "--hard", "HEAD")
+    # reset drops the intent-to-add entries but leaves their files behind.
+    for path in untracked:
+        try:
+            os.remove(os.path.join(root, path))
+        except OSError:
+            pass
+    return rel
+
+
+def _consume_build_complete(root: str) -> bool:
+    """
+    Read the build's verdict and delete it.
+
+    It is never committed (EXCLUDED_FILES), so a fixed issue's VERIFIED SAFE
+    would otherwise still be on disk when the next issue's build ends - and
+    vouch for that one too if it died before clearing it.
+    """
+    passed = _build_passed_its_gates(root)
+    _clear_build_complete(root)
+    return passed
+
+
+def _dirty(root: str) -> bool:
+    return any(p.split("/")[0] not in EXCLUDED_DIRS and p not in EXCLUDED_FILES
+               for p in _status_paths(root))
+
+
 def fix_build_finished(workspace: str) -> str:
     """
-    Called when a fix build's container exits. Returns the state afterwards.
+    Called when an issue's fix build exits. Returns the state afterwards.
 
-    A fix that passed the container's own gates is pushed and goes straight back
-    through checkpoint 1 - `!approve` was the consent to that, and the merge is
-    still CI's to allow. A fix that did not pass them is not pushed at all.
+    STATE_FIXING means another issue is due, and the caller starts its build
+    (`next_fix_request`). Otherwise the round is over: what was fixed is pushed
+    and goes back through checkpoint 1 - `!approve` was the consent to that, and
+    the merge is still CI's to allow.
     """
     marker = read_marker(workspace)
     if not marker or marker.get("state") != STATE_FIXING:
@@ -1772,73 +2065,134 @@ def fix_build_finished(workspace: str) -> str:
     root = os.path.abspath(workspace)
     failure = marker.get("failure") or {}
     scope, base = failure.get("scope", "pr"), marker.get("base", "")
-    attempt = marker.get("fix_attempts", 1)
-
-    if not _build_passed_its_gates(root):
-        return _fix_did_not_land(
-            workspace, marker, "The fix build ended without passing its own gates.",
-            "It never reached VERIFIED, SAFE and a passing test gate, so nothing was "
-            "committed or pushed. If the design pass stopped on a blocker - a fix that "
-            "would break the approved design is one - `!logs` names it.")
-
+    fix = marker.setdefault("fix", {})
+    if not fix.get("issues"):
+        # Started before the queue existed: one build for everything.
+        fix.update({"issues": [{"id": 1, "title": "all selected failures", "status": ISSUE_PENDING,
+                                "step": "", "command": "", "errors": [], "files": []}],
+                    "current": 0, "branch": marker.get("branch", "") if scope == "pr" else ""})
+    issues, current = fix["issues"], fix.get("current", 0)
+    issue = issues[current]
     branch = _current_branch(root)
-    files = _changed_files(root, base)
-    title = f"Resolve CI failure (attempt {attempt})"
-    body = "\n".join([
-        "Built by br.ai.n to resolve a CI failure.", "",
-        f"**Failure record:** `{CONTEXT_DIR}/{CI_FAILURE_NAME}`", "",
-        failure.get("summary", ""),
-    ])
+    on_fix_branch = (branch == marker.get("branch")) if scope == "pr" \
+        else branch.startswith(BUILD_BRANCH_PREFIX)
 
-    if scope == "pr":
-        if branch != marker.get("branch"):
-            return _fix_did_not_land(
-                workspace, marker, "The fix build finished on the wrong branch.",
-                f"It ended on `{branch}`, not `{marker.get('branch')}`, so nothing was "
-                f"pushed to {_pr_label(marker)}.")
-        before = marker.get("head_sha", "")
+    if not on_fix_branch:
+        issue.update({"status": ISSUE_NOT_FIXED,
+                      "note": f"the build ended on `{branch}`, not a fix branch"})
+        if _dirty(root):
+            # Nothing here is ours to roll back. Stop rather than build on it.
+            for later in issues[current + 1:]:
+                later["status"] = ISSUE_SKIPPED
+            fix["current"] = len(issues)
+            _save_marker(workspace, marker)
+            return _finish_fix_queue(workspace, marker)
+    elif _consume_build_complete(root):
+        before = _head_sha(root)
+        title = f"Fix CI: {_one_line(issue['title'], MAX_TITLE_CHARS - 9)}"[:MAX_TITLE_CHARS]
+        body = "\n".join([
+            "Built by br.ai.n to resolve one CI failure.", "",
+            f"**Issue {issue['id']} of {len(issues)}:** {issue['title']}",
+            f"**Failure record:** `{CONTEXT_DIR}/{CI_FAILURE_NAME}`",
+        ])
         try:
-            _commit_and_push(root, branch, title, body, files)
+            _commit_and_push(root, branch, title, body, _changed_files(root, base), push=False)
         except RuntimeError as e:
-            return _fix_did_not_land(workspace, marker, "The fix could not be pushed.",
-                                     f"> {_one_line(str(e), 400)}")
+            issue.update({"status": ISSUE_NOT_FIXED, "note": f"could not commit: {e}",
+                          "diff": _set_aside(workspace, issue)})
+        else:
+            head = _head_sha(root)
+            if head == before:
+                issue["status"] = ISSUE_UNCHANGED
+            else:
+                issue.update({"status": ISSUE_FIXED, "commit": head})
+                fix["branch"] = branch
+    else:
+        issue.update({"status": ISSUE_NOT_FIXED,
+                      "note": "never reached VERIFIED, SAFE and a passing test gate "
+                              "(a design-pass blocker is one way; `!logs` names it)",
+                      "diff": _set_aside(workspace, issue)})
+
+    fix["current"] = current + 1
+    _save_marker(workspace, marker)
+    if fix["current"] < len(issues):
+        return STATE_FIXING
+    return _finish_fix_queue(workspace, marker)
+
+
+def _finish_fix_queue(workspace: str, marker: dict) -> str:
+    """Push what this round fixed, and hand it to CI."""
+    root = os.path.abspath(workspace)
+    failure = marker.get("failure") or {}
+    scope, base = failure.get("scope", "pr"), marker.get("base", "")
+    fix = marker.get("fix") or {}
+    issues = fix.get("issues", [])
+    fixed = [i for i in issues if i["status"] == ISSUE_FIXED]
+    kept = [f"`{i['diff']}`" for i in issues if i.get("diff")]
+
+    if not fixed:
+        return _fix_did_not_land(
+            workspace, marker,
+            f"None of this round's {len(issues)} issue(s) was fixed.",
+            "Nothing was committed or pushed."
+            + (f" Each failed attempt's edits are kept: {', '.join(kept)}." if kept else ""))
+
+    branch = fix.get("branch") or _current_branch(root)
+    try:
+        _git(root, "push", "-u", "origin", branch, check=True)
+    except RuntimeError as e:
+        return _fix_did_not_land(workspace, marker, "The fixes could not be pushed.",
+                                 f"> {_one_line(str(e), 400)}")
+
+    plan = _plan_markdown(issues)
+    tail = ("CI judges the round as a whole. If anything is still red, a new record is "
+            "written and `!approve` starts the next round.")
+    if scope == "pr":
         head = _head_sha(root)
-        if head == before:
-            return _fix_did_not_land(workspace, marker, "The fix build changed nothing.",
-                                     f"`{branch}` is still at `{before[:7]}`.")
         _await_checks(marker, marker.get("pr_url", ""), head)
-        marker.update({"announced": False, "notice": (
-            f"🔁 **Fix pushed to {_pr_label(marker)} as `{head[:7]}` — waiting for CI.**\n\n"
-            f"It merges only once every check on `{head[:7]}` passes.\n\n"
-            f"- **Where it is:** `!ship status`")})
+        marker.update({"announced": False, "notice": "\n".join([
+            f"🔁 **{len(fixed)} of {len(issues)} issue(s) fixed and pushed to "
+            f"{_pr_label(marker)} as `{head[:7]}` — waiting for CI.**", "",
+            plan, "",
+            *([f"Failed attempts are kept: {', '.join(kept)}.", ""] if kept else []),
+            f"It merges only once every check on `{head[:7]}` passes. {tail}", "",
+            "- **Where it is:** `!ship status`"])})
         _save_marker(workspace, marker)
         return STATE_AWAITING_CHECKS
 
-    # A red base: the fix ships as its own pull request.
-    if not branch.startswith(BUILD_BRANCH_PREFIX) or not files:
-        return _fix_did_not_land(
-            workspace, marker, "The fix build left nothing to ship.",
-            f"It ended on `{branch}` with {len(files)} changed file(s).")
-    try:
-        _commit_and_push(root, branch, title, body, files)
-    except RuntimeError as e:
-        return _fix_did_not_land(workspace, marker, "The fix could not be pushed.",
-                                 f"> {_one_line(str(e), 400)}")
-    url, pr_error = _open_pull_request(root, f"Fix {base} CI: {title}"[:MAX_TITLE_CHARS],
-                                       body, branch, base)
-    if not url:
-        marker["branch"] = branch
-        return _fix_did_not_land(workspace, marker,
-                                 "The fix was pushed, but its pull request could not be opened.",
-                                 f"> {_one_line(pr_error, 400)}")
+    title = f"Fix {base} CI: {len(fixed)} issue(s) after {_pr_label(marker)}"[:MAX_TITLE_CHARS]
+    body = "\n".join(["Built by br.ai.n, one build per CI issue.", "",
+                      f"**Failure record:** `{CONTEXT_DIR}/{CI_FAILURE_NAME}`", "", plan])
+    url, pr_error = _open_pull_request(root, title, body, branch, base)
     marker["branch"] = branch
+    if not url:
+        return _fix_did_not_land(workspace, marker,
+                                 "The fixes were pushed, but their pull request could not be opened.",
+                                 f"> {_one_line(pr_error, 400)}")
     _await_checks(marker, url, _head_sha(root))
-    marker.update({"announced": False, "notice": (
-        f"🔁 **Fix for `{base}` opened as {_pr_label(marker)} — waiting for CI.**\n\n"
-        f"- {url}\n\nIt merges only once every check on it passes.\n\n"
-        f"- **Where it is:** `!ship status`")})
+    marker.update({"announced": False, "notice": "\n".join([
+        f"🔁 **{len(fixed)} of {len(issues)} issue(s) fixed for `{base}`, opened as "
+        f"{_pr_label(marker)} — waiting for CI.**", "",
+        f"- {url}", "", plan, "",
+        *([f"Failed attempts are kept: {', '.join(kept)}.", ""] if kept else []),
+        f"It merges only once every check on it passes. {tail}", "",
+        "- **Where it is:** `!ship status`"])})
     _save_marker(workspace, marker)
     return STATE_AWAITING_CHECKS
+
+
+def fix_launch_failed(workspace: str, reply: str) -> None:
+    """The next issue's build could not be started: end the round with what is done."""
+    marker = read_marker(workspace)
+    if not marker or marker.get("state") != STATE_FIXING:
+        return
+    fix = marker.get("fix") or {}
+    issues = fix.get("issues", [])
+    for later in issues[fix.get("current", 0):]:
+        later.update({"status": ISSUE_SKIPPED, "note": _one_line(reply, 160)})
+    fix["current"] = len(issues)
+    _save_marker(workspace, marker)
+    _finish_fix_queue(workspace, marker)
 
 
 # -----------------------------------------------------------------------------
@@ -1907,8 +2261,11 @@ def status(workspace: str) -> str:
         lines.append(f"- Merged as `{marker.get('merge_sha', '')[:7]}`; waiting for "
                      f"`{marker.get('base')}`'s run of it.")
     elif state == STATE_FIXING:
-        lines.append(f"- Fix attempt {marker.get('fix_attempts', 1)} is building in "
+        fix = marker.get("fix") or {}
+        lines.append(f"- Round {marker.get('fix_attempts', 1)}: building in "
                      f"`{marker.get('container', '?')}`. `!logs` follows it.")
+        if fix.get("issues"):
+            lines += ["", _plan_markdown(fix["issues"])]
     elif state == STATE_READY:
         lines.append("- `!ship` shows what would be shipped.")
     return "\n".join(lines)

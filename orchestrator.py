@@ -2323,9 +2323,12 @@ async def _orchestrate(request: Request):
             if "Build pipeline triggered" not in fix_msg:
                 ship.abort_fix(project_dir)
             else:
-                fix_msg += ("\n\nWhen it passes its own gates it is pushed to the pull "
-                            "request, and merged only once CI passes. `!ship status` "
-                            "follows it.")
+                fix_msg += ("\n\nOne build per issue: "
+                            + ship.fix_queue_progress(project_dir)
+                            + ". Each fixed issue is committed before the next starts; "
+                            "a failed one is set aside as a diff. When every issue has had "
+                            "its build, the fixes are pushed and merged only once CI "
+                            "passes. `!ship status` shows the queue.")
             return _command_response(fix_msg, is_streaming, is_native)
         elif "!approve" in prompt_lower:
             design_pass = _read_design_pass(messages)
@@ -3722,24 +3725,63 @@ async def is_pipeline_active() -> bool:
         return False
 
 
-def _record_finished_build(container_name: str, workspace: str, base_branch: str) -> bool:
+def _record_finished_build(container_name: str, workspace: str, base_branch: str) -> str:
     """
     Write the marker `!ship` reads, without letting git trouble kill the monitor.
 
-    A CI fix build finishing is a different event: its result is pushed back to
-    the pull request instead of offered. Returns True when the CI gate should
-    start watching again.
+    A CI fix build finishing is a different event: its issue is committed or set
+    aside, and either the next issue is due ("next") or the round is pushed and
+    the CI gate should watch again ("watch"). Returns "" otherwise.
     """
     if not workspace:
-        return False
+        return ""
     try:
         marker = ship.read_marker(workspace)
         if marker and marker.get("state") == ship.STATE_FIXING:
-            return ship.fix_build_finished(workspace) in ship.WATCHED_STATES
+            state = ship.fix_build_finished(workspace)
+            if state == ship.STATE_FIXING:
+                return "next"
+            return "watch" if state in ship.WATCHED_STATES else ""
         ship.record_build_complete(workspace, container=container_name, base=base_branch)
     except Exception as e:
         logger.warning(f"[Safety Monitor] Could not record the finished build: {e}")
-    return False
+    return ""
+
+
+async def _launch_next_ci_fix(workspace: str) -> None:
+    """
+    Start the build for the CI fix queue's next issue.
+
+    There is no chat turn to take messages from: the round runs unattended
+    after `!approve`. The conversation the previous issue's build was given is
+    on disk, and only its last message - that issue's instruction - changes.
+    """
+    try:
+        request = await asyncio.to_thread(ship.next_fix_request, workspace)
+        if not request:
+            return
+        instruction, fix_env = request
+        conv_path = os.path.join(workspace, ".cline_context", "conversation.json")
+        with open(conv_path, "r", encoding="utf-8") as f:
+            messages = json.load(f)
+        if messages and str(messages[-1].get("content", "")).startswith("!build Fix CI issue"):
+            messages = messages[:-1]
+        label = ship.fix_queue_progress(workspace)
+        logger.info(f"[CI Gate] {label}")
+        reply = await _trigger_build_pipeline_safe(
+            messages + [{"role": "user", "content": instruction}],
+            extra_env={**fix_env, "CI_FIX": "1"},
+            mode_label=f"CI fix — {label}"[:120],
+            skip_cooldown=True,
+        )
+        if "Build pipeline triggered" not in reply:
+            logger.error(f"[CI Gate] Next issue's build did not start: {reply[:300]}")
+            await asyncio.to_thread(ship.fix_launch_failed, workspace, reply)
+            _start_ci_watch_if_due(workspace)
+    except Exception as e:
+        logger.error(f"[CI Gate] Could not start the next issue's build: {e}")
+        await asyncio.to_thread(ship.fix_launch_failed, workspace, str(e))
+        _start_ci_watch_if_due(workspace)
 
 
 # One CI watcher per workspace, so `!ship status`, a restart and a fix build
@@ -3843,21 +3885,31 @@ async def _docker_safety_monitor(container_name: str, workspace: str = "",
             if proc.returncode != 0:
                 # Container likely deleted or vanished
                 logger.info(f"[Safety Monitor] Container {container_name} vanished. Releasing VRAM.")
-                if await asyncio.to_thread(
-                        _record_finished_build, container_name, workspace, base_branch):
+                action = await asyncio.to_thread(
+                    _record_finished_build, container_name, workspace, base_branch)
+                if action == "watch":
                     _start_ci_watch(workspace)
                 _live_builds.discard(container_name)
                 await shutdown_expert()
+                if action == "next":
+                    # After the cleanup above: the next build takes the GPU lock
+                    # and loads its own model, as any build does.
+                    asyncio.create_task(_launch_next_ci_fix(workspace))
                 break
             
             status = stdout.decode().strip().lower()
             if status == "false":
                 logger.info(f"[Safety Monitor] Container {container_name} stopped. Releasing VRAM.")
-                if await asyncio.to_thread(
-                        _record_finished_build, container_name, workspace, base_branch):
+                action = await asyncio.to_thread(
+                    _record_finished_build, container_name, workspace, base_branch)
+                if action == "watch":
                     _start_ci_watch(workspace)
                 _live_builds.discard(container_name)
                 await shutdown_expert()
+                if action == "next":
+                    # After the cleanup above: the next build takes the GPU lock
+                    # and loads its own model, as any build does.
+                    asyncio.create_task(_launch_next_ci_fix(workspace))
                 break
                 
             # Wait before next poll
