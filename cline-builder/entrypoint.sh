@@ -595,6 +595,22 @@ TEST_GATE_TIMEOUT=$(jq -r '.limits.test_gate_timeout_secs // 900' "$CONFIG_PATH"
 REPLAN_GROWTH_BYTES=$(jq -r '.limits.replan_issue_growth_bytes // 2000' "$CONFIG_PATH")
 MAX_REPLANS=$(jq -r '.limits.max_replans // 2' "$CONFIG_PATH")
 
+# .cline_logs is emptied when every build starts, so a gate log was gone by the
+# time anyone asked why the gate decided what it did - the next issue's build
+# had already started. A copy goes to .cline_context/test_gate/, named for the
+# build container and iteration, newest TEST_GATE_LOGS_KEPT kept. Prints the
+# workspace-relative path for the progress event.
+TEST_GATE_LOGS_KEPT=20
+keep_gate_log() {
+    local SRC=$1 ITER=$2 EXIT=$3
+    local DIR=/workspace/.cline_context/test_gate
+    local NAME="$(date -u +%Y%m%dT%H%M%SZ)_${BUILD_CONTAINER:-build}_iter${ITER}_exit${EXIT}.txt"
+    mkdir -p "$DIR" 2>/dev/null || return 0
+    cp "$SRC" "$DIR/$NAME" 2>/dev/null || return 0
+    ls -1t "$DIR"/*.txt 2>/dev/null | tail -n +$((TEST_GATE_LOGS_KEPT + 1)) | xargs -r rm -f
+    echo ".cline_context/test_gate/$NAME"
+}
+
 run_test_gate() {
     local ITERATION=$1
     local CMD
@@ -615,11 +631,23 @@ run_test_gate() {
     timeout "$TEST_GATE_TIMEOUT" bash -c "cd /workspace && ${CMD}" > "$GATE_LOG" 2>&1
     local GATE_EXIT=$?
     set -e
+    local KEPT_LOG
+    KEPT_LOG=$(keep_gate_log "$GATE_LOG" "$ITERATION" "$GATE_EXIT")
 
     if [ $GATE_EXIT -eq 0 ]; then
         echo "  ✅ Test gate PASSED"
-        report_event "🧪 Test gate passed: \`${CMD}\` (iteration ${ITERATION})."
+        report_event "🧪 Test gate passed: \`${CMD}\` (iteration ${ITERATION}). Log: \`${KEPT_LOG}\`"
         return 0
+    fi
+
+    # A timeout is a timeout, whatever the log holds. Checked before the
+    # environment rules below: a suite killed mid-run has its fail-open
+    # ECONNREFUSED noise in the log too, and used to be skipped for it.
+    if [ $GATE_EXIT -eq 124 ]; then
+        echo "  ❌ Test gate TIMED OUT after ${TEST_GATE_TIMEOUT}s"
+        report_event "🧪 Test gate timed out after ${TEST_GATE_TIMEOUT}s (iteration ${ITERATION}). Log: \`${KEPT_LOG}\`"
+        record_gate_failure "$ITERATION" "$CMD" "$GATE_EXIT" "timed out after ${TEST_GATE_TIMEOUT}s" "$GATE_LOG"
+        return 1
     fi
 
     # Tests that ran and failed are a code verdict, whatever else the log says.
@@ -630,25 +658,22 @@ run_test_gate() {
     # build with failing tests reported "TESTS PASSING". Same rule as distill.py.
     if python3 /app/distill.py --tests-failed "$GATE_LOG"; then
         echo "  ❌ Test gate FAILED (exit ${GATE_EXIT}): tests ran and failed"
-        report_event "🧪 Test gate failed: tests ran and failed under \`${CMD}\` (iteration ${ITERATION}). The next iteration gets the failures."
+        report_event "🧪 Test gate failed: tests ran and failed under \`${CMD}\` (iteration ${ITERATION}). The next iteration gets the failures. Log: \`${KEPT_LOG}\`"
         sed -E 's/\x1b\[[0-9;]*m//g' "$GATE_LOG" \
             | grep -E "Tests?|Test Files|Test Suites|^ *(FAIL|FAILED) |^ *[×✗✕] |AssertionError" \
             | grep -vE "^ *(✓|√) " | tail -n 8 | sed 's/^/      /'
-        local REFUSED=""
-        if grep -qiE "econnrefused|connection refused|could not connect to server" "$GATE_LOG"; then
-            REFUSED="Some output also shows refused connections. If a failure is CAUSED by one (the test's own error is ECONNREFUSED), it is the environment: say so in .build_issues.md rather than changing code for it. Background jobs that log ECONNREFUSED and carry on are noise."
-        fi
-        {
-            echo ""
-            echo "## Test gate failure — iteration ${ITERATION} ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
-            echo "Command: \`${CMD}\` exited ${GATE_EXIT}, and tests ran and failed."
-            echo "This is the harness running your tests, not your own assessment."
-            [ -n "$REFUSED" ] && echo "$REFUSED"
-            echo '```'
-            sed -E 's/\x1b\[[0-9;]*m//g' "$GATE_LOG" | tail -c 2000
-            echo '```'
-        } >> /workspace/.cline_context/.build_issues.md
-        echo "  ↳ Failure recorded in .build_issues.md for the next iteration."
+        record_gate_failure "$ITERATION" "$CMD" "$GATE_EXIT" "tests ran and failed" "$GATE_LOG"
+        return 1
+    fi
+
+    # Tests ran, none failed, and the command still exited non-zero: an
+    # unhandled error, a coverage floor, a strict reporter, a crash after the
+    # run. Still the code's verdict - the suite was running, so whatever the
+    # log says about refused connections, the environment did not stop it.
+    if python3 /app/distill.py --tests-ran "$GATE_LOG"; then
+        echo "  ❌ Test gate FAILED (exit ${GATE_EXIT}): tests ran, but the command did not succeed"
+        report_event "🧪 Test gate failed: \`${CMD}\` exited ${GATE_EXIT} after its tests ran - no test failed, so look for an unhandled error, a coverage floor or a crash (iteration ${ITERATION}). Log: \`${KEPT_LOG}\`"
+        record_gate_failure "$ITERATION" "$CMD" "$GATE_EXIT" "tests ran, but the command exited ${GATE_EXIT} without a failing test: look for an unhandled error, a coverage threshold, a strict reporter or a crash after the run" "$GATE_LOG"
         return 1
     fi
 
@@ -667,14 +692,14 @@ run_test_gate() {
     # strings the same way for the bugfix reproduction gate.
     if [ $GATE_EXIT -eq 127 ] || grep -qiE "no module named pytest|command not found|could not determine executable|npm error|cannot find module" "$GATE_LOG"; then
         echo "  ⚠ TEST GATE SKIPPED: '${CMD}' could not run (runner not installed)."
-        report_event "⚠️ Test gate skipped: \`${CMD}\` could not run (runner not installed). Completion is self-reported."
+        report_event "⚠️ Test gate skipped: \`${CMD}\` could not run (runner not installed). Completion is self-reported. Log: \`${KEPT_LOG}\`"
         echo "    Completion is self-reported for this build."
         sed -n '1,5p' "$GATE_LOG" | sed 's/^/      /'
         return 0
     fi
     if grep -qiE "econnrefused|connection refused|could not connect to server|getaddrinfo" "$GATE_LOG"; then
         echo "  ⚠ TEST GATE SKIPPED: '${CMD}' could not reach a service it needs."
-        report_event "⚠️ Test gate skipped: \`${CMD}\` could not reach a service before any test ran. Completion is self-reported."
+        report_event "⚠️ Test gate skipped: \`${CMD}\` could not reach a service before any test ran. Completion is self-reported. Log: \`${KEPT_LOG}\`"
         echo "    This is the environment, not the code — nothing the build can edit"
         echo "    will fix it. Completion is self-reported for this build."
         echo "    No test failed: the suite stopped before any test could run."
@@ -683,25 +708,30 @@ run_test_gate() {
         return 0
     fi
 
-    if [ $GATE_EXIT -eq 124 ]; then
-        echo "  ❌ Test gate TIMED OUT after ${TEST_GATE_TIMEOUT}s"
-        report_event "🧪 Test gate timed out after ${TEST_GATE_TIMEOUT}s (iteration ${ITERATION})."
-    else
-        echo "  ❌ Test gate FAILED (exit ${GATE_EXIT})"
-        report_event "🧪 Test gate failed: \`${CMD}\` exited ${GATE_EXIT} (iteration ${ITERATION})."
-    fi
+    echo "  ❌ Test gate FAILED (exit ${GATE_EXIT})"
+    report_event "🧪 Test gate failed: \`${CMD}\` exited ${GATE_EXIT} (iteration ${ITERATION}). Log: \`${KEPT_LOG}\`"
+    record_gate_failure "$ITERATION" "$CMD" "$GATE_EXIT" "exited ${GATE_EXIT}" "$GATE_LOG"
+    return 1
+}
 
+# The failure the next iteration reads in .build_issues.md.
+record_gate_failure() {
+    local ITER=$1 CMD=$2 EXIT=$3 WHY=$4 LOG=$5
+    local REFUSED=""
+    if grep -qiE "econnrefused|connection refused|could not connect to server" "$LOG"; then
+        REFUSED="Some output also shows refused connections. If a failure is CAUSED by one (the test's own error is ECONNREFUSED), it is the environment: say so in .build_issues.md rather than changing code for it. Background jobs that log ECONNREFUSED and carry on are noise."
+    fi
     {
         echo ""
-        echo "## Test gate failure — iteration ${ITERATION} ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
-        echo "Command: \`${CMD}\` exited ${GATE_EXIT}."
+        echo "## Test gate failure — iteration ${ITER} ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+        echo "Command: \`${CMD}\` exited ${EXIT}: ${WHY}."
         echo "This is the harness running your tests, not your own assessment."
+        [ -n "$REFUSED" ] && echo "$REFUSED"
         echo '```'
-        tail -c 2000 "$GATE_LOG"
+        sed -E 's/\x1b\[[0-9;]*m//g' "$LOG" | tail -c 2000
         echo '```'
     } >> /workspace/.cline_context/.build_issues.md
     echo "  ↳ Failure recorded in .build_issues.md for the next iteration."
-    return 1
 }
 
 # Cline's system prompt states that every user message arrives wrapped in a
