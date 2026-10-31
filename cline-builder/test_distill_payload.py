@@ -3384,6 +3384,53 @@ def test_the_shipped_veriform_example_fits_the_cap():
     )
 
 
+# --- Test-gate verdicts -----------------------------------------------------
+
+_E = "\x1b"
+# vitest's own colouring of a failing run, as the gate's log holds it.
+_COLOURED_FAILURE = "\n".join([
+    "[lease-renewal] tick failed: Error: ECONNREFUSED",
+    f"{_E}[41m{_E}[1m FAIL {_E}[22m{_E}[49m test/policy-notices.test.ts{_E}[2m > {_E}[22mTC1",
+    f"{_E}[31mAssertionError{_E}[39m: expected 2 to be +0",
+    f"{_E}[2m Test Files {_E}[22m {_E}[1m{_E}[31m1 failed{_E}[39m{_E}[22m{_E}[2m | {_E}[22m{_E}[1m{_E}[32m176 passed{_E}[39m",
+])
+
+
+def test_gate_sees_a_coloured_failure_once_the_colour_is_stripped():
+    """Unstripped, nothing matched - not even AssertionError, as `[31m` leaves no word boundary."""
+    assert not distill.tests_failed(_COLOURED_FAILURE)
+    assert distill.tests_failed(distill._ANSI_ESCAPE.sub("", _COLOURED_FAILURE))
+
+
+def test_gate_cli_strips_colour_itself():
+    import subprocess
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+        f.write(_COLOURED_FAILURE)
+
+    def run(flag):
+        return subprocess.run([sys.executable, os.path.join(_HERE, "distill.py"), flag, f.name],
+                              capture_output=True, check=False).returncode
+
+    try:
+        assert run("--tests-failed") == 0
+        assert run("--tests-ran") == 0
+    finally:
+        os.remove(f.name)
+
+
+def test_an_unhandled_error_fails_a_green_run():
+    assert distill.tests_failed(" Test Files  178 passed (178)\n Vitest caught 1 unhandled error during the test run.")
+    assert distill.tests_failed("⎯⎯⎯ Unhandled Rejection ⎯⎯⎯\nError: boom")
+
+
+def test_tests_ran_tells_a_running_suite_from_one_that_never_started():
+    assert distill.tests_ran(" Test Files  178 passed (178)\n      Tests  2312 passed (2312)")
+    assert distill.tests_ran(" ✓ src/lib/verification.test.ts (36 tests) 25ms")
+    assert distill.tests_ran("==== 3 passed in 0.2s ====")
+    assert not distill.tests_ran("[pretest-migrate] Error: connect ECONNREFUSED 127.0.0.1:5432")
+    assert not distill.tests_ran('npm error Missing script: "test"')
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failures, skipped = [], []

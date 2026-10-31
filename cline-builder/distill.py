@@ -1981,7 +1981,29 @@ _TESTS_FAILED_RE = re.compile(
     r"|^\s*(?:FAIL|FAILED)\s+\S"
     r"|^\s*[×✗✕]\s"
     r"|\bAssertionError\b"
-    r"|^#\s*fail\s+[1-9]",
+    r"|^#\s*fail\s+[1-9]"
+    # An unhandled error fails a vitest run with every test green, and is a code
+    # fault all the same: a rejected promise or a throw outside any test.
+    r"|Unhandled (?:Rejection|Error)s?\b|caught [1-9]\d* unhandled error",
+    re.MULTILINE,
+)
+
+# Runners colour their output when they think they have a terminal, and an
+# anchored pattern such as `^ FAIL` never matches behind an escape code.
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+# Output a runner prints once tests have RUN, pass or fail: totals and per-file
+# result lines. With it in the log, a non-zero exit is not "the environment
+# could not run this" - the suite was running. A timeout, an unhandled error, a
+# coverage floor or a strict reporter can all fail such a run with no failing
+# test, and the test gate used to file every one of those as an unreachable
+# service, because a suite with fail-open background jobs always has an
+# ECONNREFUSED somewhere in its log.
+_TESTS_RAN_RE = re.compile(
+    r"^\s*(?:Test Files|Tests|Test Suites):?\s+\d+"
+    r"|^\s*[✓√]\s"
+    r"|\b\d+\s+passed\b"
+    r"|^#\s*pass\s+\d+",
     re.MULTILINE,
 )
 
@@ -1997,6 +2019,11 @@ def tests_failed(output: str) -> bool:
     return bool(_TESTS_FAILED_RE.search(output or ""))
 
 
+def tests_ran(output: str) -> bool:
+    """True when the output shows any test ran at all, whatever the outcome."""
+    return bool(_TESTS_RAN_RE.search(output or "")) or tests_failed(output)
+
+
 def _unrunnable(exit_code: int, output: str) -> bool:
     """
     The reproduction could not run, as opposed to ran and failed.
@@ -2010,6 +2037,7 @@ def _unrunnable(exit_code: int, output: str) -> bool:
         return True
     if exit_code == 0:
         return False
+    output = _ANSI_ESCAPE.sub("", output)
     if _SERVICE_UNREACHABLE_RE.search(output):
         return True
     return bool(_REPRO_UNRUNNABLE_RE.search(output)) and not tests_failed(output)
@@ -6328,11 +6356,13 @@ if __name__ == "__main__":
     # build loop calls this once per iteration rather than reading a value cached
     # at distillation time, because on a fresh build the suite does not exist yet
     # when Phase 1 runs - it is written during Phase 2, by the agent being gated.
-    if len(sys.argv) > 2 and sys.argv[1] == "--tests-failed":
-        # For the build loop's test gate: exit 0 when the log shows failing tests.
+    if len(sys.argv) > 2 and sys.argv[1] in ("--tests-failed", "--tests-ran"):
+        # For the build loop's test gate: exit 0 when the log shows failing
+        # tests (--tests-failed), or that any test ran at all (--tests-ran).
+        check = tests_failed if sys.argv[1] == "--tests-failed" else tests_ran
         try:
             with open(sys.argv[2], "r", encoding="utf-8", errors="replace") as f:
-                sys.exit(0 if tests_failed(f.read()) else 1)
+                sys.exit(0 if check(_ANSI_ESCAPE.sub("", f.read())) else 1)
         except OSError:
             sys.exit(1)
     if len(sys.argv) > 2 and sys.argv[1] == "--test-command":
