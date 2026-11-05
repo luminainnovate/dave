@@ -463,8 +463,16 @@ echo "========================================="
 PYTHONUNBUFFERED=1 python3 /app/distill.py
 DISTILL_EXIT=$?
 
+# Tell the orchestrator this container built nothing, so the files already on
+# the branch are not offered for !ship as its output.
+if [ $DISTILL_EXIT -ne 0 ]; then
+    echo "${BUILD_CONTAINER:-}" > /workspace/.cline_context/.build_stopped 2>/dev/null || true
+fi
+
 if [ $DISTILL_EXIT -eq 3 ]; then
-    report_event "🛑 Design pass stopped on blockers it could not resolve from the workspace. Nothing was built; \`!logs\` lists them."
+    report_event "🛑 Design pass stopped on blockers it could not resolve from the workspace. Nothing was built.
+$(head -c 3000 /workspace/.cline_context/distill_blockers.md 2>/dev/null)
+Answer or correct them in chat (or edit the plan), then re-run \`!approve\`."
     echo "✗ STOPPED: the design passes reported blockers that could not be resolved"
     echo "  from the workspace. Nothing was built and .clinerules was not written."
     echo "  Answer the blockers listed above in chat, then re-run !build."

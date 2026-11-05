@@ -273,6 +273,29 @@ def base_branch(workspace: str) -> str:
     return _default_branch(root)
 
 
+STOPPED_NAME = ".build_stopped"
+
+
+def build_stopped(workspace: str, container: str) -> bool:
+    """
+    True when this container's entrypoint stopped before building anything.
+
+    The design pass stops on blockers (exit 3) and the bug-fix pass on an
+    unreproduced bug (exit 4); the entrypoint then writes the container's name
+    to this file. Without it a stopped build looked like a finished one, and
+    whatever untracked files the branch already held (a spec the user had
+    written, say) were offered for `!ship` as the build's output.
+    """
+    if not workspace or not container:
+        return False
+    path = os.path.join(os.path.abspath(workspace), CONTEXT_DIR, STOPPED_NAME)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip() == container
+    except OSError:
+        return False
+
+
 def record_build_complete(workspace: str, container: str = "", base: str = "") -> Optional[str]:
     """
     Note that a build finished with work on a branch. Returns the branch, or None.
@@ -283,6 +306,10 @@ def record_build_complete(workspace: str, container: str = "", base: str = "") -
     """
     root = os.path.abspath(workspace or "")
     if not root or not _is_git_repo(root):
+        return None
+
+    if build_stopped(workspace, container):
+        logger.info(f"Build {container} stopped before building. Nothing to offer.")
         return None
 
     branch = _current_branch(root)

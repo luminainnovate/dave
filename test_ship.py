@@ -201,6 +201,19 @@ def test_a_build_that_never_left_the_users_branch_records_nothing():
     check("and none on disk", ship.read_marker(w.root) is None)
 
 
+def test_a_build_that_stopped_before_building_records_nothing():
+    """A design pass blocked on a blocker leaves the branch's old files behind."""
+    w = Workspace()
+    w.build()
+    os.makedirs(os.path.join(w.root, ".cline_context"), exist_ok=True)
+    with open(os.path.join(w.root, ".cline_context", ".build_stopped"), "w") as f:
+        f.write("c1\n")
+    check("no marker for the container that stopped",
+          ship.record_build_complete(w.root, container="c1", base="main") is None)
+    check("a later container is not affected",
+          ship.record_build_complete(w.root, container="c2", base="main") is not None)
+
+
 def test_a_build_that_changed_nothing_records_nothing():
     w = Workspace()
     w.build(files={})
