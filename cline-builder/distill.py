@@ -1035,6 +1035,33 @@ EVIDENCE_MAX_ROUNDS_DEFAULT = 2
 EVIDENCE_FRAMING_RESERVE_CHARS = 4000
 
 
+BLOCKERS_PATH = os.path.join(os.path.dirname(STATUS_PATH), "distill_blockers.md")
+
+
+def write_blockers_file(still_blocked: dict) -> None:
+    """
+    Leave the blockers where entrypoint.sh can post them to the chat.
+
+    They used to reach only this container's stdout, which is gone once the
+    build ends - so a design pass that stopped on a contradiction looked, in
+    chat, like a build that had finished. Removed when there are none, so a
+    stale list is never posted for a later run.
+    """
+    try:
+        if not still_blocked:
+            if os.path.exists(BLOCKERS_PATH):
+                os.remove(BLOCKERS_PATH)
+            return
+        lines = []
+        for key, blockers in still_blocked.items():
+            lines.append(f"[{key}]")
+            lines.extend(f"- {b}" for b in blockers)
+        with open(BLOCKERS_PATH, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except OSError as e:
+        print(f"  ⚠ Could not write the blockers file: {e}", flush=True)
+
+
 def detect_blockers(result: str) -> list:
     """
     Return the blocker statements a pass emitted, or [] if it produced a design.
@@ -5762,6 +5789,7 @@ def run_distillation():
 
     still_blocked = {k: detect_blockers(v) for k, v in results.items()}
     still_blocked = {k: v for k, v in still_blocked.items() if v}
+    write_blockers_file(still_blocked)
 
     # A partial run (the review gate) must not overwrite .clinerules with an
     # incomplete ruleset - the approve run assembles the real one.
