@@ -3954,6 +3954,12 @@ def _start_ci_watch_if_due(project_dir: str) -> None:
         _start_ci_watch(project_dir)
 
 
+# How long the safety monitor waits for a just-launched build container to
+# exist, and how often it checks meanwhile. See _docker_safety_monitor.
+SAFETY_MONITOR_STARTUP_SECS = 20
+SAFETY_MONITOR_STARTUP_POLL_SECS = 1
+
+
 async def _docker_safety_monitor(container_name: str, workspace: str = "",
                                  base_branch: str = "", compose_files: Optional[list] = None):
     """
@@ -3967,9 +3973,25 @@ async def _docker_safety_monitor(container_name: str, workspace: str = "",
     """
     logger.info(f"[Safety Monitor] Starting monitor for {container_name}")
     try:
-        # Initial wait to let it start
-        await asyncio.sleep(10)
-        
+        # Wait for the container to exist before judging it. `compose run -d` is
+        # launched fire-and-forget, and with the ephemeral overrides compose does
+        # not create the build container until its Postgres and Redis pass their
+        # health checks - so for the first few seconds "no such container" means
+        # "not created yet", not "exited and removed". Poll until it appears, and
+        # fall through to the main loop (which reads a still-missing container as
+        # vanished) only once the startup window has passed.
+        startup_deadline = time.time() + SAFETY_MONITOR_STARTUP_SECS
+        while time.time() < startup_deadline:
+            proc = await asyncio.create_subprocess_exec(
+                "docker", "inspect", "-f", "{{.State.Running}}", container_name,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+            if proc.returncode == 0:
+                break
+            await asyncio.sleep(SAFETY_MONITOR_STARTUP_POLL_SECS)
+
         while True:
             # Check container status
             proc = await asyncio.create_subprocess_exec(
@@ -4530,6 +4552,7 @@ async def _run_design_review(messages: list, pass_key: str, streaming: bool = Fa
     deadline = started + budget
     last_status = ""
     last_liveness = 0.0
+    seen_running = False
     last_emit = started
 
     def _elapsed() -> str:
@@ -4575,9 +4598,22 @@ async def _run_design_review(messages: list, pass_key: str, streaming: bool = Fa
                 last_emit = time.time()
                 yield False, ""
 
-        if time.time() - last_liveness >= DESIGN_REVIEW_LIVENESS_SECS:
+        # Until the container has been seen running, check on every poll rather
+        # than every DESIGN_REVIEW_LIVENESS_SECS, and read "not running" as "not
+        # created yet" for the first SAFETY_MONITOR_STARTUP_SECS. `compose run -d`
+        # is fire-and-forget, and with the ephemeral overrides compose does not
+        # create the build container until its Postgres and Redis are healthy -
+        # which is how a pass that went on to finish was reported as having
+        # exited after 0:05.
+        starting = not seen_running
+        if starting or time.time() - last_liveness >= DESIGN_REVIEW_LIVENESS_SECS:
             last_liveness = time.time()
-            if not await _container_is_running(container_name):
+            alive = await _container_is_running(container_name)
+            if alive:
+                seen_running = True
+            elif starting and time.time() - started < SAFETY_MONITOR_STARTUP_SECS:
+                continue
+            if not alive:
                 # The document is re-checked because a container can exit
                 # immediately after writing it; without this the race turns a
                 # successful pass into a reported failure.
