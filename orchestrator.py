@@ -2210,6 +2210,17 @@ async def _orchestrate(request: Request):
             for m in messages[-2:]
         )
         
+        # A turn the user typed as a `!` command is never a background ping. The
+        # ping detectors above are bare substring matches, so a command's own
+        # argument can trip them: an `!architect` brief with a `| tags |` row in
+        # a table was read as Open WebUI's tag-generation task, and Rule E then
+        # silenced it as a follow-up to the previous `!architect` - an empty
+        # reply and no pass. Open WebUI's own task prompts start with
+        # "### Task:", never "!", so this cannot let a real ping through.
+        is_user_command = role == "user" and last_content.lstrip().startswith("!")
+        if is_user_command:
+            is_suggestion_ping = is_description_ping = is_expansion_ping = False
+
         # 3. Interception Rules
         # Rule A: Silence image tool outputs
         if is_image_tool:

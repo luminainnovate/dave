@@ -74,6 +74,9 @@ def install(project, *, alive, budget_streaming=6, budget_blocking=6):
     orch.DESIGN_REVIEW_LIVENESS_SECS = 0.1
     orch.DESIGN_REVIEW_HEARTBEAT_SECS = 0.1
     orch.DESIGN_REVIEW_DEATH_GRACE_SECS = 0.5
+    # How long a container may not exist yet before it is read as gone. 20s in
+    # production; scaled down like the rest.
+    orch.SAFETY_MONITOR_STARTUP_SECS = 1.0
 
 
 async def collect(pass_key="bugfix", streaming=True, messages=None):
@@ -125,6 +128,29 @@ def test_a_dead_container_stops_the_wait_immediately():
     check("reports the failure honestly", "stopped without producing" in f[0],
           repr(f[0][:80]))
     check("does not claim it is still running", "still running" not in f[0])
+
+
+def test_a_container_not_created_yet_is_not_read_as_dead():
+    """
+    With the ephemeral veriform overrides, compose does not create the build
+    container until its Postgres and Redis are healthy, seconds after the name
+    was returned. The first liveness check used to find no container and report
+    "stopped ... after 0:05" for a pass that went on to finish.
+    """
+    p = Project()
+    t0 = time.time()
+    install(p, alive=lambda: time.time() - t0 > 0.5)
+
+    async def run():
+        task = asyncio.create_task(collect())
+        await asyncio.sleep(0.8)
+        p.write_doc()
+        return await task
+
+    f = finals(asyncio.run(run()))
+    check("exactly one final item", len(f) == 1, f"got {len(f)}")
+    check("the late container's document is returned", "Root Cause" in f[0],
+          repr(f[0][:80]))
 
 
 def test_a_container_that_dies_just_after_writing_still_wins():
