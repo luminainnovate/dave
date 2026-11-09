@@ -14,6 +14,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from typing import Optional
 
 import mover
+import owui
 import repo_tools
 import ship
 import tracer
@@ -543,7 +544,9 @@ def _adapt_body(body: dict, config: dict) -> dict:
 
     adapted = {
         "model": body.get("model", config.get("model", "")),
-        "messages": body.get("messages", []),
+        # Open WebUI sends tool calls in Ollama's shape on /api/chat, and an
+        # OpenAI-compatible server rejects an object `arguments` with a 400.
+        "messages": owui.openai_tool_calls(body.get("messages", [])),
         "stream": body.get("stream", True),
     }
 
@@ -2010,6 +2013,22 @@ async def shutdown_expert():
             )
     return JSONResponse(content={"status": "ok", "processes_killed": killed_count})
 
+async def _read_turn(request: Request) -> dict:
+    """
+    The request body, with the message the user typed back in last place.
+
+    Every turn handler reads its body through here, never request.json()
+    directly: Open WebUI 0.13 appends its own memory recall after the user's
+    message, and every `messages[-1]` below - each `!` command, the ping
+    detectors, the build offer - would read that instead (see owui.py).
+    Idempotent, and Starlette caches the parsed body, so both readers of one
+    request see the same list.
+    """
+    body = await request.json()
+    body["messages"] = owui.put_typed_turn_last(body.get("messages", []))
+    return body
+
+
 @app.post("/api/chat")
 @app.post("/v1/chat/completions")
 async def proxy_ollama(request: Request):
@@ -2037,7 +2056,7 @@ async def _attach_build_offer(request: Request, response):
         if response.headers.get(SILENT_HEADER):
             return response
 
-        body = await request.json()
+        body = await _read_turn(request)
         messages = body.get("messages", [])
         if not _is_plain_user_turn(messages):
             return response
@@ -2134,7 +2153,7 @@ async def _orchestrate(request: Request):
     """
     global vram_locked, expert_warm_until, expert_last_used, expert_mode, last_comfy_history_count
 
-    body = await request.json()
+    body = await _read_turn(request)
     is_streaming = body.get("stream", True)
     messages = body.get("messages", [])
     path = str(request.url.path)

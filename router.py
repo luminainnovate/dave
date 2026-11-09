@@ -9,6 +9,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
+import owui
+
 # Load environment from .env file if python-dotenv is available
 try:
     from dotenv import load_dotenv
@@ -585,7 +587,11 @@ async def route_request(request: Request):
     3. Route to either local Ollama or desktop orchestrator
     """
     body = await request.json()
-    messages = body.get("messages", [])
+    # Open WebUI 0.13 appends its memory recall after the typed message; put the
+    # typed message back last before classifying it (see owui.py). The body is
+    # forwarded with the same list, so the orchestrator agrees.
+    body["messages"] = owui.put_typed_turn_last(body.get("messages", []))
+    messages = body["messages"]
     is_streaming = body.get("stream", True)
     path = str(request.url.path)
     is_native = "/api/chat" in path
