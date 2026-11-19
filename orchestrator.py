@@ -13,6 +13,9 @@ from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from typing import Optional
 
+import jira_auth
+import jira_client
+import jira_runner
 import mover
 import owui
 import repo_tools
@@ -2268,7 +2271,7 @@ async def _orchestrate(request: Request):
                                 "!bugfix", "!approve", "!review", "!restore",
                                 "!lock", "!unlock",
                                 "!write", "!readonly", "!undo", "!diff", "!pr",
-                                "!ship"]
+                                "!ship", "!jira"]
         is_maintenance_followup = False
         if is_background_task and len(messages) >= 3:
             prev_user_msg = messages[-3].get("content", "").lower() if messages[-3].get("role") == "user" else ""
@@ -2322,6 +2325,11 @@ async def _orchestrate(request: Request):
         elif "!general" in prompt_lower:
             expert_mode = "general"
             logger.info("Command: Switched to General Mode.")
+        elif prompt_lower.lstrip().startswith("!jira"):
+            rest = messages[-1].get("content", "").strip()[len("!jira"):].strip()
+            logger.info(f"Command: Jira ({rest or 'status'}).")
+            jira_msg = await _handle_jira_command(messages, rest)
+            return _command_response(jira_msg, is_streaming, is_native)
         elif "!move" in prompt_lower:
             logger.info("Command: Move initiated.")
             # VS Code only opens when explicitly requested via `!move --open`.
@@ -2358,27 +2366,7 @@ async def _orchestrate(request: Request):
             widen = bool(re.search(r"!approve\s+all\b", prompt_lower))
             logger.info(f"Command: CI failure approved{' (all)' if widen else ''}; "
                         f"launching the fix build.")
-            instruction, fix_env, refusal = await asyncio.to_thread(
-                ship.ci_fix_request, project_dir, widen)
-            if refusal:
-                return _command_response(refusal, is_streaming, is_native)
-            # The fix is a `!build` of the failure document, appended for the
-            # container only: OpenWebUI's history never sees this message.
-            fix_msg = await _trigger_build_pipeline_safe(
-                messages + [{"role": "user", "content": instruction}],
-                extra_env={**fix_env, "CI_FIX": "1"},
-                mode_label="CI fix (approved)",
-                skip_cooldown=True,
-            )
-            if "Build pipeline triggered" not in fix_msg:
-                ship.abort_fix(project_dir)
-            else:
-                fix_msg += ("\n\nOne build per issue: "
-                            + ship.fix_queue_progress(project_dir)
-                            + ". Each fixed issue is committed before the next starts; "
-                            "a failed one is set aside as a diff. When every issue has had "
-                            "its build, the fixes are pushed and merged only once CI "
-                            "passes. `!ship status` shows the queue.")
+            fix_msg = await _launch_ci_fix(project_dir, messages, widen)
             return _command_response(fix_msg, is_streaming, is_native)
         elif "!approve" in prompt_lower:
             design_pass = _read_design_pass(messages)
@@ -3982,6 +3970,205 @@ def _start_ci_watch_if_due(project_dir: str) -> None:
     marker = ship.read_marker(project_dir)
     if marker and marker.get("state") in ship.WATCHED_STATES:
         _start_ci_watch(project_dir)
+
+
+async def _launch_ci_fix(project_dir: str, messages: list, widen: bool = False) -> str:
+    """
+    The `!approve` for a CI failure: plan the fix queue and start its first build.
+
+    Shared by the chat command and the Jira runner. "Build pipeline triggered"
+    in the reply means the build started; anything else is a refusal.
+    """
+    instruction, fix_env, refusal = await asyncio.to_thread(
+        ship.ci_fix_request, project_dir, widen)
+    if refusal:
+        return refusal
+    # The fix is a `!build` of the failure document, appended for the
+    # container only: OpenWebUI's history never sees this message.
+    fix_msg = await _trigger_build_pipeline_safe(
+        messages + [{"role": "user", "content": instruction}],
+        extra_env={**fix_env, "CI_FIX": "1"},
+        mode_label="CI fix (approved)",
+        skip_cooldown=True,
+    )
+    if "Build pipeline triggered" not in fix_msg:
+        ship.abort_fix(project_dir)
+    else:
+        fix_msg += ("\n\nOne build per issue: "
+                    + ship.fix_queue_progress(project_dir)
+                    + ". Each fixed issue is committed before the next starts; "
+                    "a failed one is set aside as a diff. When every issue has had "
+                    "its build, the fixes are pushed and merged only once CI "
+                    "passes. `!ship status` shows the queue.")
+    return fix_msg
+
+
+# =============================================================================
+# JIRA STORY RUNNER (`!jira`)
+# =============================================================================
+#
+# jira_runner.StoryRun decides what happens; this adapter is how it happens. It
+# drives the same functions the chat commands do, so a subtask goes through the
+# design gate, the build, `!ship confirm` and the CI gate exactly as one pasted
+# by hand would. One run at a time: there is one GPU, and the runner's whole
+# point is that subtasks are delivered strictly in order.
+
+_jira_task: asyncio.Task | None = None
+_jira_run = None
+
+
+def _read_text(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+class _OrchestratorEngine(jira_runner.Engine):
+    def __init__(self, workspace: str):
+        self.workspace = os.path.abspath(workspace)
+
+    async def design(self, messages: list, pass_key: str):
+        final = ""
+        # streaming=True for the long budget: nobody is waiting on a socket here.
+        async for is_final, text in _run_design_review(messages, pass_key, streaming=True):
+            if is_final:
+                final = text
+        path = _design_review_path(messages, pass_key)
+        try:
+            document = (await asyncio.to_thread(_read_text, path)).strip()
+        except (OSError, TypeError):
+            return None, final
+        if not document or UNVERIFIED_MARKER in document:
+            return None, final
+        return document, final
+
+    async def build(self, messages: list, pass_key: str):
+        reply = await _trigger_build_pipeline_safe(
+            messages,
+            extra_env={"DISTILL_RESUME": "1", "DISTILL_DESIGN_PASS": pass_key},
+            mode_label=f"Jira (auto-approved {_DESIGN_PASS_UI[pass_key]['noun']})",
+            skip_cooldown=True,
+        )
+        match = re.search(r"cline-builder-\d+", reply)
+        if "Build pipeline triggered" not in reply or not match:
+            return None, reply
+        return match.group(0), reply
+
+    async def container_running(self, name: str) -> bool:
+        return await _container_is_running(name)
+
+    def read_marker(self):
+        return ship.read_marker(self.workspace)
+
+    def build_passed_gates(self) -> bool:
+        return ship.build_passed_gates(self.workspace)
+
+    def ship(self, title: str):
+        proposal = ship.propose(self.workspace, title)
+        if not ship.read_marker(self.workspace) or "Ready to ship" not in proposal:
+            return False, proposal
+        reply = ship.confirm(self.workspace)
+        _start_ci_watch_if_due(self.workspace)
+        return ship.in_flight(ship.read_marker(self.workspace)), reply
+
+    def watch_ci(self) -> None:
+        _start_ci_watch_if_due(self.workspace)
+
+    async def fix_ci(self, messages: list):
+        reply = await _launch_ci_fix(self.workspace, messages)
+        return "Build pipeline triggered" in reply, reply
+
+    def note(self, text: str) -> None:
+        ship.record_event(self.workspace, text)
+
+
+def _jira_running() -> bool:
+    return _jira_task is not None and not _jira_task.done()
+
+
+def _jira_status(project_dir: str | None) -> str:
+    state = (_jira_run.state if _jira_run else None) or (
+        jira_runner.read_run_state(project_dir) if project_dir else None)
+    if not state:
+        return ("🎫 **No Jira run yet.**\n\n"
+                "- **Preview a Story:** `!jira plan KAN-123`\n"
+                "- **Deliver it:** `!jira KAN-123`")
+    live = "running" if _jira_running() else state.get("status", "?")
+    lines = [f"🎫 **{state.get('story')}: {live}**", ""]
+    if state.get("current"):
+        lines.append(f"- **Current:** `{state['current']}` ({state.get('phase') or '?'})")
+    lines.append(f"- **Delivered:** {', '.join(state.get('done') or []) or 'nothing yet'}")
+    if state.get("reason"):
+        lines.append(f"- **Why it stopped:** {state['reason'][:600]}")
+    lines += ["", "- **Stop after the current step:** `!jira stop`",
+              "- **CI gate detail:** `!ship status`"]
+    return "\n".join(lines)
+
+
+async def _handle_jira_command(messages: list, rest: str) -> str:
+    global _jira_task, _jira_run
+    project_dir = _get_bound_project_dir(messages)
+    words = rest.split()
+    verb = words[0].lower() if words else "status"
+
+    if verb == "status":
+        return _jira_status(project_dir)
+
+    if verb == "stop":
+        if not _jira_running():
+            return "🎫 **No Jira run is in progress.**"
+        _jira_task.cancel()
+        return ("⏹️ **Jira run stopped.** No further subtask will start. A build or CI "
+                "gate already running carries on: `!status`, `!ship status`, or `!stop` "
+                "to kill the build container.")
+
+    plan_only = verb == "plan"
+    key = (words[1] if plan_only and len(words) > 1 else words[0]).upper()
+    if not re.fullmatch(r"[A-Z][A-Z0-9_]+-\d+", key):
+        return (f"⚠️ **`{key}` is not an issue key.**\n\n"
+                f"- `!jira KAN-123` delivers that Story's subtasks\n"
+                f"- `!jira plan KAN-123` shows what it would do\n"
+                f"- `!jira status`, `!jira stop`")
+
+    try:
+        client = await asyncio.to_thread(jira_client.JiraClient)
+        story = await asyncio.to_thread(client.issue, key)
+        subtasks = [] if story["is_subtask"] else await asyncio.to_thread(client.children, key)
+    except (jira_client.JiraError, jira_auth.JiraAuthError) as e:
+        return f"❌ **Could not read `{key}` from Jira.**\n\n{e}"
+
+    plan = jira_runner.unit_plan(story, subtasks)
+    preview = jira_runner.plan_text(story, plan, client.browse_url)
+    if plan_only:
+        return f"🎫 **Plan for {key}** — nothing has been started.\n\n{preview}\n\n" \
+               f"- **Deliver it:** `!jira {key}`"
+
+    if not project_dir:
+        return ("⚠️ **No project bound to this conversation.** Dave builds in the "
+                "repository this chat is bound to: `!clone <repo-url>` first.")
+    if _jira_running():
+        return (f"🎫 **Already running {_jira_run.story_key}.** One Story at a time. "
+                f"`!jira status`, or `!jira stop` first.")
+    if await is_pipeline_active():
+        return "⏳ **A build is running.** Start the Jira run once it finishes (`!status`)."
+
+    anchor = next((m.get("content", "") for m in messages if m.get("role") == "user"), "")
+    _jira_run = jira_runner.StoryRun(client, _OrchestratorEngine(project_dir), key, anchor)
+    refusal = _jira_run._refuse(story)
+    if refusal:
+        return refusal
+
+    async def _run_and_report(run):
+        result = await run.run()
+        ship.record_event(os.path.abspath(project_dir), result)
+        logger.info(f"[Jira] {run.story_key}: {result[:200]}")
+
+    _jira_task = asyncio.create_task(_run_and_report(_jira_run))
+    return (f"🎫 **Delivering {key}, one subtask at a time.**\n\n{preview}\n\n"
+            f"Each design is approved automatically when it passes the existing gates; "
+            f"each PR merges only once CI is green. The first failure stops the Story "
+            f"and is commented on its subtask in Jira.\n\n"
+            f"- **Where it is:** `!jira status`\n"
+            f"- **Stop:** `!jira stop`")
 
 
 # How long the safety monitor waits for a just-launched build container to

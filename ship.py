@@ -2193,6 +2193,12 @@ def note_fix_container(workspace: str, container: str) -> None:
         _save_marker(workspace, marker)
 
 
+def build_passed_gates(workspace: str) -> bool:
+    """True when the last build wrote `.build_complete` with VERIFIED and SAFE:
+    its own tests passed and the safety review signed off."""
+    return _build_passed_its_gates(os.path.abspath(workspace))
+
+
 def _build_passed_its_gates(root: str) -> bool:
     try:
         with open(os.path.join(root, ".build_complete"), "r", encoding="utf-8") as f:
