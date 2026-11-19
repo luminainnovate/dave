@@ -30,6 +30,9 @@ gatekeeper-env/
 
 # Environment secrets
 .env
+# Jira OAuth refresh token (jira_auth.py login)
+.jira_oauth.json
+.jira_oauth.*
 
 # External Tools
 ComfyUI/

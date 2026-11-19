@@ -493,6 +493,44 @@ than try to install one. Copy it to the workspace root as `.builder_env.md`.
 | `!approve all` *(after a CI failure)* | The same, but also takes on failures that were already failing on the base branch before this change. | Widens the change beyond its design. CI-environment failures (runner images, outages) are never handed to a build. |
 | `!stop` | Force-stops all pipelines and clears VRAM. | |
 
+### Jira: deliver a Story's subtasks unattended
+
+| Command | Effect | Notes |
+|---|---|---|
+| `!jira plan <STORY>` | Reads the Story and its subtasks and says what Dave would do with each. | Changes nothing, here or in Jira. |
+| `!jira <STORY>` | Delivers the Story's subtasks **one at a time, in board order**. Each goes through `!architect` (or `!bugfix` for a subtask labelled `bug`) → approve → build → `!ship confirm` → CI gate, and the next starts only once it is merged and green. A Story with no subtasks is itself the unit. | **Must open the message.** Requires a bound project. One run at a time. Every approval that used to be yours is taken automatically, but only when the existing gate passes. |
+| `!jira status` | Which subtask is in progress, what is delivered, why a run stopped. | Progress is also shown above your next reply, and commented in Jira. |
+| `!jira stop` | No further subtask starts. | A build or CI gate already running carries on; `!stop` kills the container. |
+
+**The gates that stand in for you.** A design is approved only if the document exists and
+is not marked UNVERIFIED. A build is shipped only if it left changes and wrote
+`.build_complete` with VERIFIED and SAFE (its own tests passed). A PR merges only on green CI,
+exactly as with `!ship confirm`. A CI failure the change introduced gets an automatic fix
+round, up to `JIRA_MAX_FIX_ROUNDS` (2). The first gate that fails **stops the whole Story**:
+the reason is commented on the subtask, which is labelled `dave-blocked`, and no later
+subtask starts, since it may depend on this one.
+
+**Scope.** Only the one Story given, and only its own subtasks. Done and Cancelled subtasks
+are skipped; MVP+ ones are deferred. A subtask someone else has moved to In Progress or In
+Review stops the run before it: Dave does not jump the queue past a person's work.
+
+**In Jira.** The Story moves to In Progress, then Done once every subtask is finished. Each
+subtask moves To Do → In Progress → In Review (PR open) → Done (merged and green), gains the
+`agent-dave` label, and gets comments with the approved design, the PR link and the merge.
+PR titles start with the subtask key, so Jira's development panel links them.
+
+**Resuming.** Run `!jira <STORY>` again after a stop or a restart. Finished subtasks are
+skipped, and the one Dave was on (labelled `agent-dave`) resumes at the CI gate if its PR is
+still open, otherwise from its design pass.
+
+**Signing in.** Dave uses OAuth 2.0, not an API token. Once: create an OAuth 2.0
+integration at developer.atlassian.com/console/myapps with callback
+`http://localhost:8765/callback` and the Jira scopes `read:jira-work`, `write:jira-work`,
+`read:jira-user`. Put its `JIRA_CLIENT_ID` / `JIRA_CLIENT_SECRET` and `JIRA_BASE_URL` in
+`.env`, then run `python3 jira_auth.py login` (add `--paste` when the browser is on another
+machine) and `python3 jira_auth.py check`. Approve **as the Atlassian account that uses
+Jira**: an address without Jira access on the site gets "Access denied".
+
 ### Repository editing & pull requests
 
 | Command | Effect | Notes |
@@ -515,11 +553,11 @@ containment-checked, blocking `../` and symlinks pointing out of the project. `.
 raising a PR is outward-facing, so it happens only when you run `!pr`.
 
 **Matching rules.** Substring match, first wins, in a fixed `if/elif` order:
-`!lock` → `!unlock` → `!code` → `!general` → `!move` → `!architect` → `!bugfix` → `!approve` →
+`!lock` → `!unlock` → `!code` → `!general` → `!jira` → `!move` → `!architect` → `!bugfix` → `!approve` →
 `!review` → `!build` → `!clone` → `!write`/`!readonly` → `!undo` → `!diff` → `!pr` → `!ship` → `!stop` →
 `!status` →
 `!logs`. So *"Should I run !build or !status?"* triggers `!build`, and *"!code let's !build
-this"* runs `!code` only. `!clone`, `!pr` and `!ship` are prefix-matched. Background
+this"* runs `!code` only. `!clone`, `!jira`, `!pr` and `!ship` are prefix-matched. Background
 title/tag/summary pings from Open WebUI never trigger commands.
 
 ---
@@ -922,6 +960,9 @@ ComfyUI's `/history`. A background task sweeps idle ComfyUI RAM/VRAM every 5 min
 ├── mover.py                   # 📂 Chat → file tree extraction, path-sanitised
 ├── repo_tools.py              # ✏️ Read/edit/write/delete, byte snapshots, !diff / !undo / !pr
 ├── tracer.py                  # 🔍 Human-readable decision trace → trace.log
+├── jira_auth.py               # 🎫 OAuth 2.0 sign-in to Jira Cloud (login / check)
+├── jira_client.py             # 🎫 Story + subtasks, transitions, comments, ADF → Markdown
+├── jira_runner.py             # 🎫 `!jira`: one Story's subtasks, delivered in order
 ├── cline-builder/
 │   ├── distill.py             #   4 design passes, budget solver, --replan, --test-command
 │   ├── entrypoint.sh          #   Iterative build → review → verify → safety → test gate
@@ -953,6 +994,7 @@ ComfyUI's `/history`. A background task sweeps idle ComfyUI RAM/VRAM every 5 min
 | `.cline_context/test_gate/` | A copy of every test-gate run's output, named `<time>_<container>_iter<n>_exit<code>.txt`, newest 20 kept. `.cline_logs/` is emptied when each build starts; these are not, so a gate verdict can still be read after the next issue's build has begun. Each gate event names its log |
 | `.cline_context/build_events.jsonl` | Progress from builds and the CI fix queue: each issue starting and finishing, each iteration, each test-gate verdict. OpenWebUI cannot be written to unprompted, so unseen events are shown above the next reply in that conversation; `!ship status` lists the latest. `build_events.seen` records how far the chat has read |
 | `.cline_context/ci_failure.md` | The CI gate's failure record: each failed check, the step and command that failed, and the error lines from its log, triaged against the base branch into *introduced by this change*, *already failing before it* and *CI environment*. Reviewed before `!approve`, and edited to steer the fix. Flipped to RESOLVED once CI passes; rewritten by `!ship recheck` |
+| `.cline_context/jira_run.json` | The last `!jira` run: its Story, the subtask and phase it was on, what it delivered, and why it stopped. Read by `!jira status` |
 | `.cline_context/ship_design.md` | The approved design a shipped PR implements, frozen at `!ship confirm` so a fix build (which deletes `distill_*.md`) is still scoped by it |
 | `.cline_context/.session_state.md` | Regenerated each phase; the agent's first read every step |
 | `.cline_context/.build_issues.md` | Accumulated failures; drives re-planning and the next iteration |
