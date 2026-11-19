@@ -25,6 +25,11 @@ subtasks are ordered, and the next one may depend on this one.
 Scope is the one Story given. Only its own subtasks are read, in board order.
 A Story with no subtasks is itself the unit of work.
 
+A subtask labelled `human` is work only a person can do (spending money,
+production access, a sign-off). The run pauses before it, comments on it to
+hand it over, and starts nothing after it. Once the person moves it to Done,
+`!jira <STORY>` carries on past it.
+
 Re-running `!jira <STORY>` resumes. Done and Cancelled subtasks are skipped,
 and a subtask Dave had started (it carries the `agent-dave` label) is picked up
 where it was: waiting on CI if its pull request is still open, else from its
@@ -59,6 +64,12 @@ DEFERRED_STATUSES = {s.strip().lower() for s in _env("JIRA_DEFERRED_STATUSES", "
 LABEL_ACTIVE = "agent-dave"      # Dave started this subtask
 LABEL_BLOCKED = "dave-blocked"   # Dave stopped on it; a person is needed
 BUGFIX_LABELS = {"bug", "bugfix"}
+# A person does this subtask: the run pauses before it until it is Done.
+LABEL_HUMAN = _env("JIRA_HUMAN_LABEL", "human").lower()
+
+
+def needs_person(issue: dict) -> bool:
+    return LABEL_HUMAN in {lbl.lower() for lbl in issue["labels"]}
 
 MAX_FIX_ROUNDS = int(_env("JIRA_MAX_FIX_ROUNDS", "2"))
 
@@ -110,7 +121,8 @@ class Engine:
 def unit_plan(story: dict, subtasks: list) -> list:
     """
     [(issue, action, why)] in order. action is "work", "resume", "skip" or "stop".
-    "stop" means a person is on this subtask: nothing at or after it is touched.
+    "stop" means a person is on this subtask, or it is labelled `human` and a
+    person must do it: nothing at or after it is touched.
     """
     if not subtasks:
         return [(story, "work", "the Story has no subtasks, so it is the unit of work")]
@@ -123,6 +135,10 @@ def unit_plan(story: dict, subtasks: list) -> list:
             plan.append((sub, "skip", sub["status"]))
         elif status in DEFERRED_STATUSES:
             plan.append((sub, "skip", f"{sub['status']} (deferred)"))
+        elif needs_person(sub):
+            plan.append((sub, "stop", f"{sub['status']}, labelled {LABEL_HUMAN}: "
+                                      f"a person does this one"))
+            stopped = True
         elif LABEL_ACTIVE in sub["labels"] and status not in ("to do",):
             plan.append((sub, "resume", f"{sub['status']}, started by Dave"))
         elif sub["status_category"] == "new":
@@ -143,7 +159,12 @@ def plan_text(story: dict, plan: list, browse) -> str:
     todo = [p for p in plan if p[1] in ("work", "resume")]
     stop = next((p[0] for p in plan if p[1] == "stop"), None)
     lines.append("")
-    if stop:
+    if stop and needs_person(stop):
+        lines.append((f"Dave would deliver {len(todo)} unit(s), then pause at `{stop['key']}`: "
+                      if todo else f"⏸️ `{stop['key']}` comes first and ")
+                     + f"it needs a person. Move it to Done once it is done, "
+                       f"and Dave carries on past it.")
+    elif stop:
         lines.append(f"Dave would deliver {len(todo)} unit(s), then stop at `{stop['key']}`. "
                      f"Move it to Done, or back to To Do, for Dave to carry on past it."
                      if todo else
@@ -290,6 +311,21 @@ class StoryRun:
         return ""
 
     async def _finish(self, story: dict, plan: list, stop_at) -> str:
+        if stop_at and needs_person(stop_at):
+            key = stop_at["key"]
+            msg = (f"Delivered {len(self.state['done'])} unit(s). Paused before {key}: "
+                   f"it is labelled {LABEL_HUMAN}, so a person does it.")
+            await self._jira("comment", key,
+                             f"⏸️ Agent DAVE paused {self.story_key} here. This subtask "
+                             f"needs a person, so Dave will not start it or anything after "
+                             f"it.\n\nWhen it is done, move it to Done and run "
+                             f"!jira {self.story_key} again.")
+            await self._jira("comment", self.story_key, f"⏸️ Agent DAVE: {msg}")
+            self._save(status="paused", reason=msg, waiting_on=key)
+            self.engine.note(f"⏸️ Jira run for {self.story_key} is waiting on a person: "
+                             f"{key} {stop_at['summary']}")
+            return (f"⏸️ **Waiting on a person.** {msg} When it is done, move it to Done "
+                    f"and run `!jira {self.story_key}` again.")
         if stop_at:
             msg = (f"Delivered {len(self.state['done'])} unit(s). Stopped before "
                    f"{stop_at['key']}: it is {stop_at['status']} and Dave did not start it.")

@@ -188,6 +188,54 @@ def test_plan_order_skips_and_stops():
     check("plan text names where it stops", "stop at `KAN-7`" in text, text)
 
 
+def test_human_subtask_pauses_the_run():
+    subs = [issue("KAN-2"), issue("KAN-3", labels=["Human"], summary="run the eval"),
+            issue("KAN-4")]
+    plan = {i["key"]: a for i, a, _ in jira_runner.unit_plan(story(), subs)}
+    check("work before the human subtask", plan["KAN-2"] == "work", plan)
+    check("human subtask in To Do stops the run", plan["KAN-3"] == "stop", plan)
+    check("nothing after it is touched", plan["KAN-4"] == "skip", plan)
+    text = jira_runner.plan_text(story(), jira_runner.unit_plan(story(), subs), lambda k: k)
+    check("plan text says it needs a person", "pause at `KAN-3`" in text and "needs a person" in text, text)
+
+    jira = FakeJira(story(), subs)
+    engine = FakeEngine()
+    _, result = run(jira, engine)
+    check("only the first subtask built", [c[0] for c in engine.calls] == ["design", "build", "ship"],
+          engine.calls)
+    check("result says it is waiting on a person", "Waiting on a person" in result and "KAN-3" in result,
+          result)
+    check("human subtask left alone", jira.statuses("KAN-3") == []
+          and "agent-dave" not in jira.issues["KAN-3"]["labels"], jira.log)
+    check("hand-over commented on the human subtask",
+          any("needs a person" in c and "!jira KAN-1" in c for c in jira.comments("KAN-3")),
+          jira.comments("KAN-3"))
+    check("story not closed", jira.issues["KAN-1"]["status"] == "In Progress", jira.log)
+    state = jira_runner.read_run_state(engine.workspace)
+    check("run saved as paused, waiting on KAN-3",
+          state["status"] == "paused" and state.get("waiting_on") == "KAN-3", state)
+    check("chat note names the subtask", any("waiting on a person" in n and "KAN-3" in n
+                                              for n in engine.notes), engine.notes)
+
+    # The person finishes it; the rerun carries on past it.
+    jira.issues["KAN-3"]["status"] = "Done"
+    jira.issues["KAN-3"]["status_category"] = "done"
+    engine2 = FakeEngine()
+    _, result2 = run(jira, engine2)
+    check("rerun builds only the subtask after it", len([c for c in engine2.calls if c[0] == "design"]) == 1
+          and "KAN-4" in engine2.calls[0][2][1]["content"], engine2.calls)
+    check("story completes", "complete" in result2 and jira.issues["KAN-1"]["status"] == "Done", result2)
+
+
+def test_human_subtask_first_does_nothing():
+    jira = FakeJira(story(), [issue("KAN-2", labels=["human"]), issue("KAN-3")])
+    engine = FakeEngine()
+    _, result = run(jira, engine)
+    check("nothing built", engine.calls == [], engine.calls)
+    check("story not moved", jira.statuses("KAN-1") == [], jira.log)
+    check("still reports waiting", "Waiting on a person" in result, result)
+
+
 def test_happy_path_delivers_in_order_and_closes_story():
     jira = FakeJira(story(), [issue("KAN-2"), issue("KAN-3", "Done"), issue("KAN-4")])
     engine = FakeEngine()

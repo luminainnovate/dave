@@ -4097,7 +4097,10 @@ def _jira_status(project_dir: str | None) -> str:
     if state.get("current"):
         lines.append(f"- **Current:** `{state['current']}` ({state.get('phase') or '?'})")
     lines.append(f"- **Delivered:** {', '.join(state.get('done') or []) or 'nothing yet'}")
-    if state.get("reason"):
+    if state.get("waiting_on"):
+        lines.append(f"- **Waiting on a person:** `{state['waiting_on']}`. Move it to Done "
+                     f"when it is done, then `!jira {state.get('story')}` carries on.")
+    elif state.get("reason"):
         lines.append(f"- **Why it stopped:** {state['reason'][:600]}")
     lines += ["", "- **Stop after the current step:** `!jira stop`",
               "- **CI gate detail:** `!ship status`"]
