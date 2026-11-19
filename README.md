@@ -514,6 +514,14 @@ subtask starts, since it may depend on this one.
 are skipped; MVP+ ones are deferred. A subtask someone else has moved to In Progress or In
 Review stops the run before it: Dave does not jump the queue past a person's work.
 
+**Steps only a person can do.** Label a subtask `human` (spending money, production access, a
+sign-off, waiting for a release to go live). Dave delivers everything before it, then **pauses**:
+he comments on that subtask to hand it over, leaves it untouched, and starts nothing after it.
+`!jira plan` and `!jira status` show what it is waiting on. When the person has done it, they
+move it to Done and run `!jira <STORY>` again; Dave carries on past it. Unlike MVP+, which
+skips a subtask and keeps going, `human` holds back everything after it. The label name can be
+changed with `JIRA_HUMAN_LABEL`.
+
 **In Jira.** The Story moves to In Progress, then Done once every subtask is finished. Each
 subtask moves To Do → In Progress → In Review (PR open) → Done (merged and green), gains the
 `agent-dave` label, and gets comments with the approved design, the PR link and the merge.
