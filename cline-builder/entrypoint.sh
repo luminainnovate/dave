@@ -653,6 +653,28 @@ run_test_gate() {
         fi
     fi
 
+    # CI's other checks, run first, as CI runs them: a build whose tests pass
+    # but whose lint fails was shipped and failed CI on formatting alone, three
+    # PRs running. TEST_GATE_PRECHECK (e.g. `npm run lint`) failing is a code
+    # verdict like a failing test: the next iteration gets its output.
+    if [ -n "${TEST_GATE_PRECHECK:-}" ]; then
+        echo "  🧪 Test gate pre-check: ${TEST_GATE_PRECHECK}"
+        local PRE_LOG="/workspace/.cline_logs/test_gate_precheck_iter_${ITERATION}.txt"
+        set +e
+        timeout "$TEST_GATE_TIMEOUT" bash -c "cd /workspace && ${TEST_GATE_PRECHECK}" > "$PRE_LOG" 2>&1
+        local PRE_EXIT=$?
+        set -e
+        if [ $PRE_EXIT -ne 0 ]; then
+            local PRE_KEPT
+            PRE_KEPT=$(keep_gate_log "$PRE_LOG" "$ITERATION" "$PRE_EXIT")
+            echo "  ❌ Test gate FAILED at the pre-check (exit ${PRE_EXIT}): ${TEST_GATE_PRECHECK}"
+            sed -E 's/\x1b\[[0-9;]*m//g' "$PRE_LOG" | grep -E "error|✖" | tail -n 8 | sed 's/^/      /'  || true
+            report_event "🧪 Test gate failed: \`${TEST_GATE_PRECHECK}\` (iteration ${ITERATION}), as CI would. The next iteration gets the errors. Log: \`${PRE_KEPT}\`"
+            record_gate_failure "$ITERATION" "$TEST_GATE_PRECHECK" "$PRE_EXIT" "the pre-check CI also runs failed" "$PRE_LOG"
+            return 1
+        fi
+    fi
+
     echo "  🧪 Test gate: ${CMD} (timeout ${TEST_GATE_TIMEOUT}s)"
     local GATE_LOG="/workspace/.cline_logs/test_gate_iter_${ITERATION}.txt"
     set +e
