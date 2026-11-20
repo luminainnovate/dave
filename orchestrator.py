@@ -3573,6 +3573,26 @@ def _reset_ephemeral_services(files: list[str]) -> None:
         logger.warning(f"Pipeline: could not remove the ephemeral build services: {e}")
 
 
+async def _release_ephemeral_services(container_name: str, files: list[str]) -> None:
+    """
+    Remove a finished build's ephemeral services, unless another build is live.
+
+    There is one `build-postgres` for every build, and a build joins its network
+    namespace. When a build starts while the previous container is still
+    exiting (a design pass hands straight over to its build, as `!jira` does),
+    the finished build's cleanup would remove the Postgres the new build has
+    just joined, taking its network with it: every model call then fails with
+    "Network is unreachable" and the build dies within a minute. The next build
+    resets the services before it starts anyway, and the live build's own
+    monitor removes them when it ends.
+    """
+    if _live_builds:
+        logger.info(f"Pipeline: leaving the ephemeral build services up after {container_name}: "
+                    f"{', '.join(sorted(_live_builds))} is using them.")
+        return
+    await asyncio.to_thread(_reset_ephemeral_services, files)
+
+
 def _compose_files(workspace: str = "") -> list[str]:
     """
     The -f flags for the build container launch.
@@ -4015,6 +4035,20 @@ async def _launch_ci_fix(project_dir: str, messages: list, widen: bool = False) 
 
 _jira_task: asyncio.Task | None = None
 _jira_run = None
+# How long the runner waits for the design container to exit before building.
+JIRA_DESIGN_EXIT_WAIT_SECS = 300
+
+
+async def _wait_for_builds_to_finish(limit: float) -> bool:
+    """True once no build is live (each monitor has finished its cleanup)."""
+    deadline = time.time() + limit
+    while _live_builds:
+        if time.time() > deadline:
+            logger.warning(f"[Jira] Still live after {limit:.0f}s: "
+                           f"{', '.join(sorted(_live_builds))}. Building anyway.")
+            return False
+        await asyncio.sleep(2)
+    return True
 
 
 def _read_text(path: str) -> str:
@@ -4032,6 +4066,11 @@ class _OrchestratorEngine(jira_runner.Engine):
         async for is_final, text in _run_design_review(messages, pass_key, streaming=True):
             if is_final:
                 final = text
+        # A person reads the design before `!approve`, and by then the design
+        # container has exited and its monitor has cleaned up. Wait for the
+        # same, so the build never starts beside a container that is still
+        # shutting down.
+        await _wait_for_builds_to_finish(JIRA_DESIGN_EXIT_WAIT_SECS)
         path = _design_review_path(messages, pass_key)
         try:
             document = (await asyncio.to_thread(_read_text, path)).strip()
@@ -4231,7 +4270,7 @@ async def _docker_safety_monitor(container_name: str, workspace: str = "",
                 if action == "watch":
                     _start_ci_watch(workspace)
                 _live_builds.discard(container_name)
-                await asyncio.to_thread(_reset_ephemeral_services, compose_files or [])
+                await _release_ephemeral_services(container_name, compose_files or [])
                 await shutdown_expert()
                 if action == "next":
                     # After the cleanup above: the next build takes the GPU lock
@@ -4249,7 +4288,7 @@ async def _docker_safety_monitor(container_name: str, workspace: str = "",
                 if action == "watch":
                     _start_ci_watch(workspace)
                 _live_builds.discard(container_name)
-                await asyncio.to_thread(_reset_ephemeral_services, compose_files or [])
+                await _release_ephemeral_services(container_name, compose_files or [])
                 await shutdown_expert()
                 if action == "next":
                     # After the cleanup above: the next build takes the GPU lock
