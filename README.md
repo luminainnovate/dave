@@ -503,7 +503,9 @@ than try to install one. Copy it to the workspace root as `.builder_env.md`.
 | `!jira stop` | No further subtask starts. | A build or CI gate already running carries on; `!stop` kills the container. |
 
 **The gates that stand in for you.** A design is approved only if the document exists and
-is not marked UNVERIFIED. A build is shipped only if it left changes and wrote
+is neither marked UNVERIFIED nor an ABORTED report (a pass whose model call failed or timed
+out). An aborted or missing design is run again, `JIRA_DESIGN_ATTEMPTS` (2) times in all,
+before the Story stops. The build starts only once the design container has exited. A build is shipped only if it left changes and wrote
 `.build_complete` with VERIFIED and SAFE (its own tests passed). A PR merges only on green CI,
 exactly as with `!ship confirm`. A CI failure the change introduced gets an automatic fix
 round, up to `JIRA_MAX_FIX_ROUNDS` (2). The first gate that fails **stops the whole Story**:

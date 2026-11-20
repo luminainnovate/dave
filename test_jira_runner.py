@@ -296,12 +296,39 @@ def test_unapprovable_design_blocks_the_story():
     engine = FakeEngine(document=None)
     r, result = run(jira, engine)
     check("reported as stopped", "Stopped on `KAN-2`" in result, result)
-    check("no build after a failed design", [c[0] for c in engine.calls] == ["design"])
+    check("no build after a failed design", [c[0] for c in engine.calls] == ["design", "design"])
     check("blocked label", "dave-blocked" in jira.issues["KAN-2"]["labels"])
     check("reason commented", any("did not produce a design" in c for c in jira.comments("KAN-2")))
     check("next subtask untouched", not [e for e in jira.log if e[1] == "KAN-3"])
     check("subtask left In Progress, not Done", jira.issues["KAN-2"]["status"] == "In Progress")
     check("state blocked", r.state["status"] == "blocked")
+
+
+def test_aborted_design_is_rerun_not_approved():
+    """KAN-142, 2026-11-20: the architect pass timed out and its abort report
+    was approved as the design."""
+    jira = FakeJira(story(), [issue("KAN-2")])
+    engine = FakeEngine()
+    answers = [None, "# Design\n\nDo it."]
+
+    async def flaky_design(messages, pass_key):
+        engine.calls.append(("design", pass_key, messages))
+        return answers.pop(0), "## ❌ ABORTED — the pass could not run"
+    engine.design = flaky_design
+    run(jira, engine)
+    check("design ran twice", len([c for c in engine.calls if c[0] == "design"]) == 2)
+    approved = [c for c in jira.comments("KAN-2") if "Design approved" in c]
+    check("only the real design approved", approved and "ABORTED" not in approved[0], approved)
+    check("subtask done", jira.issues["KAN-2"]["status"] == "Done")
+
+
+def test_design_that_keeps_aborting_blocks():
+    jira = FakeJira(story(), [issue("KAN-2")])
+    engine = FakeEngine(document=None)
+    _, result = run(jira, engine)
+    check("design tried twice", len([c for c in engine.calls if c[0] == "design"]) == 2)
+    check("no build", "build" not in [c[0] for c in engine.calls])
+    check("blocked", "did not produce a design" in result, result)
 
 
 def test_build_that_fails_its_gates_is_not_shipped():
