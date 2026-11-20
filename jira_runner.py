@@ -72,6 +72,8 @@ def needs_person(issue: dict) -> bool:
     return LABEL_HUMAN in {lbl.lower() for lbl in issue["labels"]}
 
 MAX_FIX_ROUNDS = int(_env("JIRA_MAX_FIX_ROUNDS", "2"))
+# Design passes per subtask before the Story stops (an aborted pass is re-run).
+DESIGN_ATTEMPTS = max(1, int(_env("JIRA_DESIGN_ATTEMPTS", "2")))
 
 # How often the runner looks at a running build and at the CI gate.
 POLL_SECS = 15
@@ -381,10 +383,19 @@ class StoryRun:
 
         prompt = unit_prompt(story, issue)
         self._save(phase="design")
-        document, text = await self.engine.design(self._messages(prompt, f"!{pass_key}"), pass_key)
+        # An aborted or empty design is run again, as a person would re-run
+        # `!architect`; it is never approved.
+        for attempt in range(1, DESIGN_ATTEMPTS + 1):
+            document, text = await self.engine.design(self._messages(prompt, f"!{pass_key}"),
+                                                      pass_key)
+            if document:
+                break
+            if attempt < DESIGN_ATTEMPTS:
+                self.engine.note(f"🔁 {key}: the {pass_key} pass produced no design that can "
+                                 f"be approved; running it again ({attempt + 1}/{DESIGN_ATTEMPTS}).")
         if not document:
             raise Blocked(f"The {pass_key} pass did not produce a design that can be "
-                          f"approved:\n\n{_plain(text)[:1500]}")
+                          f"approved ({DESIGN_ATTEMPTS} attempt(s)):\n\n{_plain(text)[:1500]}")
         excerpt = document[:DESIGN_EXCERPT_CHARS]
         more = "\n\n(truncated)" if len(document) > DESIGN_EXCERPT_CHARS else ""
         await self._jira("comment", key, f"📐 Design approved automatically ({pass_key} pass):"

@@ -4037,6 +4037,8 @@ _jira_task: asyncio.Task | None = None
 _jira_run = None
 # How long the runner waits for the design container to exit before building.
 JIRA_DESIGN_EXIT_WAIT_SECS = 300
+# The heading distill.py (ABORT_MARKER) puts on a design pass that could not run.
+DESIGN_ABORT_MARKER = "## ❌ ABORTED — the pass could not run"
 
 
 async def _wait_for_builds_to_finish(limit: float) -> bool:
@@ -4076,6 +4078,11 @@ class _OrchestratorEngine(jira_runner.Engine):
             document = (await asyncio.to_thread(_read_text, path)).strip()
         except (OSError, TypeError):
             return None, final
+        # An aborted pass still writes its document: a report that the model
+        # could not be reached or timed out. A person reading that would run
+        # `!architect` again, never `!approve` it.
+        if DESIGN_ABORT_MARKER in document:
+            return None, document
         if not document or UNVERIFIED_MARKER in document:
             return None, final
         return document, final
