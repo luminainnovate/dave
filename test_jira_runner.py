@@ -26,7 +26,11 @@ def _load(name):
 jira_client = _load("jira_client")
 jira_runner = _load("jira_runner")
 jira_runner.POLL_SECS = 0
-jira_runner.BUILD_MARKER_GRACE_SECS = 0
+
+# A fake clock: each engine.wait() is one 15-second poll. The real grace
+# periods stay in force, so the tests exercise the timing the runner uses.
+CLOCK = [0.0]
+jira_runner._now = lambda: CLOCK[0]
 
 FAILURES = []
 
@@ -111,6 +115,8 @@ class FakeEngine(jira_runner.Engine):
         self.build_ok, self.fix_ok = build_ok, fix_ok
         self.marker, self.script = marker, []
         self.calls, self.notes = [], []
+        # Liveness answers for the build container, one per check; False once spent.
+        self.running = []
 
     async def design(self, messages, pass_key):
         self.calls.append(("design", pass_key, messages))
@@ -125,12 +131,13 @@ class FakeEngine(jira_runner.Engine):
         return f"cline-builder-{n}", "🔨 Build pipeline triggered."
 
     async def container_running(self, name):
-        return False
+        return self.running.pop(0) if self.running else False
 
     def read_marker(self):
         return self.marker
 
     async def wait(self):
+        CLOCK[0] += 15
         # Time passing is what moves the CI gate along.
         if self.script:
             self.marker = self.script.pop(0)
@@ -313,10 +320,45 @@ def test_build_that_leaves_nothing_blocks():
     async def build_without_marker(messages, pass_key):
         name, text = await real_build(messages, pass_key)
         engine.marker = None  # stopped on a blocker: no ship marker written
+        engine.running = [True, True]
         return name, text
     engine.build = build_without_marker
     _, result = run(jira, engine)
     check("stopped for nothing to ship", "without leaving anything to ship" in result, result)
+
+
+def test_slow_starting_build_is_waited_for():
+    """KAN-142: the container was not visible yet on the first checks, and the
+    runner gave up a minute in while the build went on for two hours."""
+    jira = FakeJira(story(), [issue("KAN-2")])
+    engine = FakeEngine()
+    real_build = engine.build
+
+    async def slow_build(messages, pass_key):
+        name, text = await real_build(messages, pass_key)
+        ready, engine.marker = engine.marker, None
+        # Not created for 2 minutes, then runs for an hour, then exits.
+        engine.running = [False] * 8 + [True] * 240
+        engine.script = [None] * 248 + [ready]
+        return name, text
+    engine.build = slow_build
+    _, result = run(jira, engine)
+    check("shipped after the long build", "ship" in [c[0] for c in engine.calls], result)
+    check("subtask done", jira.issues["KAN-2"]["status"] == "Done", jira.issues["KAN-2"])
+
+
+def test_build_that_never_appears_blocks():
+    jira = FakeJira(story(), [issue("KAN-2")])
+    engine = FakeEngine()
+    real_build = engine.build
+
+    async def phantom_build(messages, pass_key):
+        name, text = await real_build(messages, pass_key)
+        engine.marker = None
+        return name, text
+    engine.build = phantom_build
+    _, result = run(jira, engine)
+    check("stopped: never started", "never started" in result, result)
 
 
 def test_refused_ship_blocks():

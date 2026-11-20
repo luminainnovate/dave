@@ -78,6 +78,16 @@ POLL_SECS = 15
 # After a build container exits, how long to wait for its ship marker before
 # deciding the build left nothing (stopped on a blocker, or changed nothing).
 BUILD_MARKER_GRACE_SECS = 60
+# How long a just-launched build may take to show up in `docker inspect`.
+# `docker compose run -d` returns before the container exists, and a build
+# with ephemeral services waits for their health checks first. Until the
+# container has been seen running, not seeing it means "not started yet".
+BUILD_START_GRACE_SECS = int(_env("JIRA_BUILD_START_GRACE_SECS", "900"))
+
+
+def _now() -> float:
+    """The runner's clock; tests replace it."""
+    return time.monotonic()
 
 # Longest design document excerpt copied into a Jira comment.
 DESIGN_EXCERPT_CHARS = 3000
@@ -400,17 +410,27 @@ class StoryRun:
         await self._through_ci(story, issue)
 
     async def _await_build(self, container: str) -> None:
-        ended_at = None
+        launched = _now()
+        seen = False      # has the container been seen running yet?
+        gone_since = None
         while True:
             marker = self.engine.read_marker() or {}
             if marker.get("state") == S_READY and marker.get("container") == container:
                 return
-            if ended_at is None and not await self.engine.container_running(container):
-                ended_at = time.time()
-            if ended_at and time.time() - ended_at > BUILD_MARKER_GRACE_SECS:
-                raise Blocked(f"The build (`{container}`) ended without leaving anything to "
-                              f"ship: it stopped on a blocker, or changed nothing. `!logs` "
-                              f"shows why.")
+            if await self.engine.container_running(container):
+                seen, gone_since = True, None
+            elif seen or _now() - launched > BUILD_START_GRACE_SECS:
+                # Gone after running, or never appeared at all: give the
+                # safety monitor its grace to write the ship marker, then stop.
+                gone_since = gone_since or _now()
+                if _now() - gone_since > BUILD_MARKER_GRACE_SECS:
+                    if not seen:
+                        raise Blocked(f"The build (`{container}`) never started: no such "
+                                      f"container after {BUILD_START_GRACE_SECS // 60} "
+                                      f"minutes. `!logs` shows why.")
+                    raise Blocked(f"The build (`{container}`) ended without leaving anything "
+                                  f"to ship: it stopped on a blocker, or changed nothing. "
+                                  f"`!logs` shows why.")
             await self.engine.wait()
 
     async def _through_ci(self, story: dict, issue: dict) -> None:
