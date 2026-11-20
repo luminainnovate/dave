@@ -1425,6 +1425,9 @@ def _check_causes(root: str, failed: list) -> list:
                     cause["steps"] = _name_steps(root, run_id, job_id, cause["steps"])
             if not cause["steps"]:
                 cause["steps"] = _failed_steps_from_full_log(root, run_id, job_id)
+            if not cause["steps"]:
+                cause["steps"] = _annotation_step(check.get("name", ""),
+                                                  _job_annotations(root, job_id))
             if not cause["steps"] and code != 0:
                 cause["log_error"] = (err or out).strip()
         causes.append(cause)
@@ -1448,7 +1451,10 @@ def _run_causes(root: str, runs: list) -> list:
             view, _ = _gh_json(root, "run", "view", run_id, "--json", "jobs")
             for job in (view or {}).get("jobs", []):
                 if (job.get("conclusion") or "").lower() not in ("success", "skipped", "neutral"):
-                    cause["steps"] += _failed_steps_from_full_log(root, run_id, str(job.get("databaseId")))
+                    job_id = str(job.get("databaseId"))
+                    steps = _failed_steps_from_full_log(root, run_id, job_id)
+                    cause["steps"] += steps or _annotation_step(job.get("name", ""),
+                                                                _job_annotations(root, job_id))
         if not cause["steps"] and code != 0:
             cause["log_error"] = (err or out).strip()
         causes.append(cause)
@@ -1512,9 +1518,36 @@ _ENVIRONMENT_RE = re.compile(
     r"|API rate limit|secondary rate limit|ECONNRESET|Could not resolve host"
     r"|Service Unavailable|Bad Gateway|lost communication with the server"
     r"|runner has received a shutdown signal|The operation was canceled"
-    r"|Unable to locate executable|exceeded the maximum execution time",
+    r"|Unable to locate executable|exceeded the maximum execution time"
+    # GitHub refusing to start the job at all: no step ran, so nothing in the
+    # project can be at fault. Seen on veriform-ui PR #293 (2026-11-20).
+    r"|job was not started|spending limit|payments have failed"
+    r"|No hosted runners?|exceeded .*minutes quota",
     re.IGNORECASE,
 )
+
+
+def _job_annotations(root: str, job_id: str) -> list:
+    """
+    GitHub's own messages on a job (its check run's annotations).
+
+    The only record of why a job that never started failed: it has no steps and
+    no log, so every other reader here comes back empty and the failure was
+    judged as the code's. A billing block then sent fix builds after five
+    "failures" no edit could touch.
+    """
+    code, out, _ = _gh(root, "api", f"repos/{{owner}}/{{repo}}/check-runs/{job_id}/annotations",
+                       "--jq", ".[].message")
+    if code != 0:
+        return []
+    return [line.strip() for line in out.splitlines() if line.strip()][:10]
+
+
+def _annotation_step(job: str, messages: list) -> list:
+    """A failed job's annotations as the one step it has, so triage reads them."""
+    if not messages:
+        return []
+    return [{"job": job, "step": "", "command": "", "errors": messages, "tail": []}]
 
 _ORIGIN_LABELS = {
     ORIGIN_INTRODUCED: "introduced by this change",
