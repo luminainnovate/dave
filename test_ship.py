@@ -1290,6 +1290,33 @@ def test_a_step_the_api_left_in_progress_is_read_from_the_full_log():
     check("one issue per failing test file", len(issues) == 2, [i["title"] for i in issues])
 
 
+def test_a_job_github_never_started_is_the_ci_environment():
+    """veriform-ui PR #293, 2026-11-20: Actions billing blocked every job. No
+    step ran and there was no log, so the five failures were judged the code's
+    and fix builds were sent after them."""
+    billing = ("The job was not started because recent account payments have failed or "
+               "your spending limit needs to be increased.")
+    real_gh = ship._gh
+
+    def fake_gh(root, *args):
+        if args[:2] == ("run", "view"):
+            return 1, "", "log not found"
+        if args and args[0] == "api" and args[1].endswith("/annotations"):
+            return 0, billing + "\n", ""
+        return 1, "", "not stubbed"
+    ship._gh = fake_gh
+    try:
+        check_ = {"name": "ci / backend", "workflow": "ci",
+                  "url": "https://github.com/o/r/actions/runs/44739637782/job/136299724788"}
+        causes = ship._check_causes("/nonexistent", [check_])
+    finally:
+        ship._gh = real_gh
+    steps = causes[0]["steps"]
+    check("annotation becomes the job's step", steps and steps[0]["errors"] == [billing], steps)
+    origin = ship._step_origin("ci", "ci / backend", steps[0], set(), {"ci"}) if steps else ""
+    check("classified as the CI environment", origin == ship.ORIGIN_ENVIRONMENT, origin)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
