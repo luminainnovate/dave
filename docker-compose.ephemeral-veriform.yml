@@ -91,6 +91,8 @@ services:
       # `.builder_env.md` describes the developer's stack, and its hostnames do
       # not exist here; BUILDER_ENV_FILE makes distill.py read this instead.
       - ./builder-env.ephemeral-veriform.md:/app/builder_env.md:ro
+      # Run before every test gate: a fresh database, as CI has (see the file).
+      - ./cline-builder/ephemeral/veriform-reset-db.mjs:/app/reset-test-db.mjs:ro
       # CI runs with no Backend/.env, and so does this build. The developer's
       # .env sits in the bind-mounted tree, and its loader fills every key not
       # already set: VAULT_ADDR sent `db:migrate` to a Vault the container cannot
@@ -103,6 +105,7 @@ services:
       - /dev/null:/workspace/Backend/.env:ro
     environment:
       - BUILDER_ENV_FILE=/app/builder_env.md
+      - TEST_GATE_PREPARE=node /app/reset-test-db.mjs
       # As ci.yml states them: every connection, the same database.
       - TEST_DATABASE_URL=postgres://vif:vif@localhost:5432/veriform_test
       - MIGRATION_DATABASE_URL=postgres://vif:vif@localhost:5432/veriform_test
