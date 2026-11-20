@@ -1099,6 +1099,22 @@ def _looks_like_path(candidate: str) -> bool:
     return "/" in candidate or re.search(r"\.[A-Za-z0-9]{1,5}$", candidate) is not None
 
 
+def _rel_path(path: str) -> str:
+    """
+    A model-written path made workspace-relative: leading "./" and "/" removed.
+
+    Not `path.lstrip("./")`: lstrip takes a set of characters, so it also ate
+    the dot that starts `.cline_context/`, `.github/` and every other dotfile
+    path. `.cline_context/ci_failure.md` became `cline_context/ci_failure.md`,
+    was reported <ABSENT>, and a CI-fix design pass blocked on a record that
+    was on disk (veriform-ui PR #293, 2026-11-20).
+    """
+    path = path.strip()
+    while path.startswith(("./", "/")):
+        path = path[2:] if path.startswith("./") else path[1:]
+    return path
+
+
 def resolve_blocker_paths(client, model_config, blockers: list,
                           skeleton: str, project_dir: str) -> BlockerPaths:
     """
@@ -1142,7 +1158,7 @@ def resolve_blocker_paths(client, model_config, blockers: list,
         candidate = line.strip().strip("-*` \t")
         if not candidate or candidate.upper() == "NONE" or " " in candidate:
             continue
-        candidate = candidate.lstrip("./")
+        candidate = _rel_path(candidate)
         full = os.path.join(project_dir, candidate)
         if os.path.isfile(full):
             if candidate not in paths:
@@ -1207,10 +1223,10 @@ def blocker_symbol_hints(blockers: list) -> dict:
         # Precise form first, so an explicit pairing leads the list.
         paired = _BLOCKER_SYMBOL_RE.findall(text)
         for path, symbol in paired:
-            hints.setdefault(path.lstrip("./"), []).append(symbol)
+            hints.setdefault(_rel_path(path), []).append(symbol)
 
         ticked = _BLOCKER_TICKED_RE.findall(text)
-        paths = [t.lstrip("./") for t in ticked if _LOOKS_LIKE_PATH_RE.search(t)]
+        paths = [_rel_path(t) for t in ticked if _LOOKS_LIKE_PATH_RE.search(t)]
         symbols = [t for t in ticked
                    if not _LOOKS_LIKE_PATH_RE.search(t) and _IDENTIFIER_RE.match(t)]
         for path in paths:
@@ -1287,7 +1303,7 @@ def blocker_line_hints(blockers: list) -> dict:
         for ticked in _BLOCKER_TICKED_RE.findall(text):
             if not _LOOKS_LIKE_PATH_RE.search(ticked):
                 continue
-            hints[ticked.lstrip("./").split("::", 1)[0]] = (start, end)
+            hints[_rel_path(ticked).split("::", 1)[0]] = (start, end)
     return hints
 
 
@@ -1745,7 +1761,7 @@ def parse_survey_claims(raw: str) -> list:
         candidate = line.strip().strip("-*`, \t")
         if not candidate or candidate.upper() == "NONE" or " " in candidate:
             continue
-        match = _SURVEY_CLAIM_RE.match(candidate.lstrip("./"))
+        match = _SURVEY_CLAIM_RE.match(_rel_path(candidate))
         if not match:
             continue
         key = (match.group(1), match.group(2))
