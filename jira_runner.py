@@ -87,6 +87,11 @@ BUILD_MARKER_GRACE_SECS = 60
 BUILD_START_GRACE_SECS = int(_env("JIRA_BUILD_START_GRACE_SECS", "900"))
 
 
+# Longest the runner waits for a pull request it did not open to finish the
+# CI gate before starting a subtask.
+OTHER_PR_WAIT_SECS = int(_env("JIRA_OTHER_PR_WAIT_SECS", str(6 * 3600)))
+
+
 def _now() -> float:
     """The runner's clock; tests replace it."""
     return time.monotonic()
@@ -369,9 +374,7 @@ class StoryRun:
             await self._through_ci(story, issue)
             return
         if marker.get("state") in (S_CHECKS, S_BASE, S_FAILED, S_FIXING, S_STALLED):
-            raise Blocked(f"Another pull request is still going through the CI gate "
-                          f"({marker.get('pr_url') or marker.get('branch')}, {marker.get('state')}). "
-                          f"Finish or close it first (`!ship status`).")
+            await self._wait_for_other_pr(key, marker)
 
         pass_key = pass_for(issue)
         await self._jira("transition", key, STATUS_IN_PROGRESS)
@@ -419,6 +422,31 @@ class StoryRun:
         await self._jira("transition", key, STATUS_IN_REVIEW)
         await self._jira("comment", key, f"🚦 Pull request open, waiting for CI before merging: {pr}")
         await self._through_ci(story, issue)
+
+    async def _wait_for_other_pr(self, key: str, marker: dict) -> None:
+        """
+        A pull request this run did not open is in the CI gate (one shipped by
+        hand, say). While the gate is moving it along on its own, wait for it
+        to merge, as a person would before starting the next piece of work. A
+        failed or stalled gate needs whoever owns that PR, so the run stops.
+        """
+        pr = marker.get("pr_url") or marker.get("branch") or "another pull request"
+        self._save(phase="waiting for " + pr)
+        self.engine.note(f"⏳ {key}: waiting for {pr} to finish the CI gate before starting.")
+        since = _now()
+        while True:
+            state = marker.get("state", "")
+            if state in (S_FAILED, S_STALLED):
+                raise Blocked(f"Another pull request is stuck in the CI gate ({pr}, {state}). "
+                              f"Finish or close it (`!ship status`), then run `!jira` again.")
+            if state not in (S_CHECKS, S_BASE, S_FIXING):
+                self.engine.note(f"▶️ {key}: {pr} is through the CI gate; starting.")
+                return
+            if _now() - since > OTHER_PR_WAIT_SECS:
+                raise Blocked(f"Waited {OTHER_PR_WAIT_SECS // 3600} h for {pr} to finish the CI "
+                              f"gate ({state}). Check it with `!ship status`.")
+            await self.engine.wait()
+            marker = self.engine.read_marker() or {}
 
     async def _await_build(self, container: str) -> None:
         launched = _now()

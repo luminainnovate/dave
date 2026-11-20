@@ -449,11 +449,26 @@ def test_resume_waits_on_open_pr_without_redesigning():
     check("then the next one", jira.issues["KAN-3"]["status"] == "Done", jira.log)
 
 
-def test_unrelated_pr_in_flight_blocks_new_work():
+def test_unrelated_pr_in_flight_is_waited_for():
+    """KAN-143, 2026-11-20: a hand-shipped PR was in CI, so the run stopped,
+    and nothing restarted it when that PR merged minutes later."""
     jira = FakeJira(story(), [issue("KAN-2")])
-    engine = FakeEngine(marker={"state": "awaiting_checks", "pr_url": "https://gh/pr/other"})
+    other = "https://gh/pr/other"
+    engine = FakeEngine(marker={"state": "awaiting_checks", "pr_url": other})
+    engine.script = [{"state": "awaiting_checks", "pr_url": other},
+                     {"state": "awaiting_base_ci", "pr_url": other},
+                     {"state": "integrated", "pr_url": other}]
     _, result = run(jira, engine)
-    check("refuses to start beside an open PR", "Another pull request" in result, result)
+    check("designed after the other PR merged", engine.calls and engine.calls[0][0] == "design",
+          engine.calls[:1])
+    check("subtask delivered", jira.issues["KAN-2"]["status"] == "Done", result)
+
+
+def test_unrelated_pr_stuck_in_ci_blocks_new_work():
+    jira = FakeJira(story(), [issue("KAN-2")])
+    engine = FakeEngine(marker={"state": "ci_failed", "pr_url": "https://gh/pr/other"})
+    _, result = run(jira, engine)
+    check("refuses to start beside a failed PR", "stuck in the CI gate" in result, result)
     check("nothing designed", not engine.calls)
 
 
