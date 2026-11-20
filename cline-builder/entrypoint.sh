@@ -446,7 +446,14 @@ changed_sources() {
         | grep -vE '/(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|\.gitignore|\.build_complete|\.clinerules)$' \
         | sed 's|^/workspace/||' \
         | sort \
-        | head -n "$REVIEW_MAX_FILES"
+        | head -n "$REVIEW_MAX_FILES" \
+        || true
+    # `|| true` because this script runs under `set -euo pipefail`: when the
+    # build phase wrote nothing but filtered files (a verify-only iteration that
+    # touches just .build_complete), `grep -v` selects no lines and exits 1, the
+    # pipeline fails, and `REVIEW_FILES=$(changed_sources)` killed the whole
+    # build with no message, before verify, safety or the test gate ran.
+    # An empty list is a valid answer here; the callers test for it.
 }
 
 # =============================================================================
