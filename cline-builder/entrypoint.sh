@@ -640,6 +640,19 @@ run_test_gate() {
         return 0
     fi
 
+    # The gate is CI's verdict, so it starts from CI's state. A build that
+    # provides TEST_GATE_PREPARE (the ephemeral-services overrides do) resets
+    # whatever the agent's own test runs left behind - leftover rows failed
+    # whole-database checks on code that passes in CI. A reset that fails is
+    # reported and the gate still runs: a dirty database can only add failures.
+    if [ -n "${TEST_GATE_PREPARE:-}" ]; then
+        echo "  🧹 Preparing the test gate: ${TEST_GATE_PREPARE}"
+        if ! (cd /workspace && bash -c "$TEST_GATE_PREPARE") 2>&1 | sed 's/^/      /'; then
+            echo "  ⚠ Test gate preparation failed; running the gate on the database as it is."
+            report_event "⚠️ Could not reset the build database before the test gate (iteration ${ITERATION}); the gate ran on the database as the build left it."
+        fi
+    fi
+
     echo "  🧪 Test gate: ${CMD} (timeout ${TEST_GATE_TIMEOUT}s)"
     local GATE_LOG="/workspace/.cline_logs/test_gate_iter_${ITERATION}.txt"
     set +e
