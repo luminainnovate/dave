@@ -466,9 +466,14 @@ echo "   Design pass: ${DISTILL_DESIGN_PASS}"
 echo "   Workspace: $(pwd)"
 echo "========================================="
 
-# Run distillation with unbuffered output
-PYTHONUNBUFFERED=1 python3 /app/distill.py
-DISTILL_EXIT=$?
+# Run distillation with unbuffered output. `|| DISTILL_EXIT=$?`, not a bare
+# `DISTILL_EXIT=$?` on the next line: this script runs under `set -e`, so a
+# non-zero exit ended it right here - the blocker report, the .build_stopped
+# marker and the "answer them in chat" instructions below never ran, and a
+# design pass that stopped on a question looked like a build that changed
+# nothing (KAN-152, 2026-11-21).
+DISTILL_EXIT=0
+PYTHONUNBUFFERED=1 python3 /app/distill.py || DISTILL_EXIT=$?
 
 # Tell the orchestrator this container built nothing, so the files already on
 # the branch are not offered for !ship as its output.

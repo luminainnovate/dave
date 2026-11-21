@@ -128,11 +128,17 @@ class Engine:
     fix_ci(messages) -> (ok, chat_text)    the `!approve` for a CI failure
     note(text) -> None                     an event shown above the next chat reply
     wait() -> None                         the pause between two polls
+    stop_reason(container) -> str          why this build stopped before building,
+                                           e.g. the design passes' blockers; "" if
+                                           it did not stop on one
     """
     workspace = ""
 
     async def wait(self) -> None:
         await asyncio.sleep(POLL_SECS)
+
+    def stop_reason(self, container: str) -> str:
+        return ""
 
 
 def unit_plan(story: dict, subtasks: list) -> list:
@@ -467,6 +473,16 @@ class StoryRun:
                         raise Blocked(f"The build (`{container}`) never started: no such "
                                       f"container after {BUILD_START_GRACE_SECS // 60} "
                                       f"minutes. `!logs` shows why.")
+                    reason = self.engine.stop_reason(container)
+                    if reason:
+                        # The design passes found a question the ticket does not
+                        # answer. A person reading it in chat would answer it and
+                        # `!approve` again; here the answer goes in the subtask,
+                        # which is what the next run's design pass reads.
+                        raise Blocked(f"The design passes stopped on a question this subtask "
+                                      f"does not answer, so nothing was built:\n\n"
+                                      f"{reason[:1500]}\n\nAdd the answer to this subtask's "
+                                      f"description, then run `!jira` again.")
                     raise Blocked(f"The build (`{container}`) ended without leaving anything "
                                   f"to ship: it stopped on a blocker, or changed nothing. "
                                   f"`!logs` shows why.")

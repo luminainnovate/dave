@@ -4126,6 +4126,16 @@ class _OrchestratorEngine(jira_runner.Engine):
     def note(self, text: str) -> None:
         ship.record_event(self.workspace, text)
 
+    def stop_reason(self, container: str) -> str:
+        """The design passes' blockers, when this container stopped on them."""
+        if not ship.build_stopped(self.workspace, container):
+            return ""
+        path = os.path.join(self.workspace, ".cline_context", "distill_blockers.md")
+        try:
+            return _read_text(path).strip()
+        except OSError:
+            return ""
+
 
 def _jira_running() -> bool:
     return _jira_task is not None and not _jira_task.done()
