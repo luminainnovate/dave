@@ -354,6 +354,27 @@ def test_build_that_leaves_nothing_blocks():
     check("stopped for nothing to ship", "without leaving anything to ship" in result, result)
 
 
+def test_design_blocker_is_reported_with_its_question():
+    """KAN-152, 2026-11-21: the safety pass stopped on an unmapped enum value and
+    Jira was told only that the build "ended without leaving anything to ship"."""
+    jira = FakeJira(story(), [issue("KAN-2")])
+    engine = FakeEngine()
+    real_build = engine.build
+
+    async def blocked_build(messages, pass_key):
+        name, text = await real_build(messages, pass_key)
+        engine.marker = None
+        engine.running = [True]
+        return name, text
+    engine.build = blocked_build
+    engine.stop_reason = lambda container: "[safety]\n- which kind does 'analyse' persist as?"
+    _, result = run(jira, engine)
+    check("the question is in the stop message", "which kind does 'analyse'" in result, result)
+    check("says where to answer", "description" in result, result)
+    check("question commented on the subtask",
+          any("which kind does 'analyse'" in c for c in jira.comments("KAN-2")))
+
+
 def test_slow_starting_build_is_waited_for():
     """KAN-142: the container was not visible yet on the first checks, and the
     runner gave up a minute in while the build went on for two hours."""
