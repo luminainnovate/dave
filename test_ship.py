@@ -743,6 +743,45 @@ def test_no_checks_and_no_workflows_never_merges():
     check("not merged", not gh.merges())
 
 
+def snyk_status(state="SUCCESS"):
+    return {"__typename": "StatusContext", "context": "security/snyk (org)",
+            "state": state, "targetUrl": "https://app.snyk.test/pr"}
+
+
+def with_workflows(w):
+    folder = os.path.join(w.root, ".github", "workflows")
+    os.makedirs(folder, exist_ok=True)
+    with open(os.path.join(folder, "ci.yml"), "w") as f:
+        f.write("on: pull_request\n")
+
+
+def test_a_third_party_status_alone_does_not_merge():
+    """KAN-166, 2026-11-22: veriform-ui PR #317 merged 34s after it opened on
+    Snyk's SUCCESS alone, before GitHub Actions had registered any run."""
+    with FakeGh() as gh:
+        w = shipped(gh)
+        with_workflows(w)
+        gh.script("pr view", pr_view(w.head(), [snyk_status()]))
+        state = ship.advance(w.root)
+        check("waits for Actions", state == ship.STATE_AWAITING_CHECKS, state)
+        check("not merged", not gh.merges(), gh.calls())
+        gh.script("pr view", pr_view(w.head(), [snyk_status(), check_run()]))
+        state = ship.advance(w.root)
+    check("merges once an Actions job passes", gh.merges(), gh.calls())
+
+
+def test_actions_that_never_run_stall_rather_than_merge():
+    with FakeGh() as gh:
+        w = shipped(gh)
+        with_workflows(w)
+        gh.script("pr view", pr_view(w.head(), [snyk_status()]))
+        age(w, 100000)
+        state = ship.advance(w.root)
+    check("stalls", state == ship.STATE_STALLED, state)
+    check("not merged", not gh.merges())
+    check("says Actions never ran", "Actions never ran" in (ship.pending_offer(w.root) or ""))
+
+
 def test_a_refused_merge_stalls_with_the_pr_still_open():
     with FakeGh(merge_fails=True) as gh:
         w = shipped(gh)
