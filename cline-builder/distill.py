@@ -3310,6 +3310,52 @@ def _fit_facts_to_budget(client, model_config, parts: list,
     return kept
 
 
+# Files read to answer a blocker are the one part of a payload the pass asked
+# for by name, so they must reach the call that writes the document verbatim.
+# On the map-reduce path they did not: the evidence was appended to the payload
+# and chunked with it, the extractor turned the handler body into capped bullet
+# records, and the merge - the only call that writes the design - never saw a
+# line of code. KAN-163's CI fix asked for the same `three-sixty.ts` handler in
+# all four rounds, was handed it each time, and stopped blocked on it.
+VERBATIM_TAGS = ("REQUESTED_EVIDENCE",)
+# Share of the window the forwarded evidence may take. The facts budget is the
+# compressible term and absorbs it; this leaves the extracted records room.
+VERBATIM_EVIDENCE_FRACTION = 0.25
+_VERBATIM_BLOCK_RE = re.compile(
+    r"\n*[ \t]*<(" + "|".join(VERBATIM_TAGS) + r")>.*?</\1>[ \t]*\n?",
+    re.DOTALL,
+)
+
+
+def split_verbatim_evidence(user_content: str, limit_tokens: int) -> tuple:
+    """
+    Lift the most recent evidence blocks out of a payload, within `limit_tokens`.
+
+    Returns (rest, verbatim). Taken newest first, because the latest round's
+    files are what the pass is blocked on now; older rounds that do not fit stay
+    in `rest` and go through extraction as before. Nothing is lost either way.
+    """
+    blocks = list(_VERBATIM_BLOCK_RE.finditer(user_content or ""))
+    keep, used = [], 0
+    for m in reversed(blocks):
+        cost = est_tokens(m.group(0))
+        if used + cost > limit_tokens:
+            break
+        keep.append(m)
+        used += cost
+    if not keep:
+        return user_content, ""
+    keep.sort(key=lambda m: m.start())
+    rest, verbatim, last = [], [], 0
+    for m in keep:
+        rest.append(user_content[last:m.start()])
+        verbatim.append(m.group(0).strip("\n"))
+        last = m.end()
+    rest.append(user_content[last:])
+    return "".join(rest), "\n\n".join(verbatim)
+
+
+
 def call_llm(client: httpx.Client, model_config, system_prompt: str, user_content: str, prior_context: str = "") -> str:
     """
     Send a synchronous chat completion request to the configured provider.
@@ -3352,7 +3398,10 @@ def call_llm(client: httpx.Client, model_config, system_prompt: str, user_conten
     )
     chunk_tokens, record_cap, extraction_tokens = solve_extraction_budget(window, chunk_fixed)
 
-    chunks = chunk_text(user_content, slice_tokens(chunk_tokens))
+    # Only the map-reduce path needs this; the single pass below sends it whole.
+    to_chunk, verbatim = split_verbatim_evidence(
+        user_content, int(window * VERBATIM_EVIDENCE_FRACTION))
+    chunks = chunk_text(to_chunk, slice_tokens(chunk_tokens))
 
     print(f"  ↳ Input: {len(user_content) + len(prior_context)} chars "
           f"(~{est_tokens(user_content) + est_tokens(prior_context)} tok). "
@@ -3378,6 +3427,9 @@ def call_llm(client: httpx.Client, model_config, system_prompt: str, user_conten
             raise ExtractionFailed("Single-pass", [failure], 1)
         return result
 
+    if verbatim:
+        print(f"    ↳ Requested evidence (~{est_tokens(verbatim)} tok) goes to the "
+              f"merge verbatim, not through extraction.", flush=True)
     print(f"    ↳ Processing into {len(chunks)} parts "
           f"(chunk {chunk_tokens} tok, cap {record_cap} records, "
           f"out {extraction_tokens} tok, fixed {chunk_fixed} tok)...", flush=True)
@@ -3440,8 +3492,18 @@ def call_llm(client: httpx.Client, model_config, system_prompt: str, user_conten
             "facts below describe the codebase it lands in.",
         )
 
+    if verbatim:
+        merge_head += (
+            "### REQUESTED EVIDENCE\n"
+            "Files read from the workspace because an earlier attempt at this pass "
+            "asked for them, given here in full rather than as extracted facts. "
+            "They are what you asked for; use them.\n\n"
+            f"{verbatim}\n\n---\n\n"
+        )
+
     pivots = [name for name, value in (("MODE", mode), ("NEW_REQUEST", new_request),
-                                       ("PREVIOUS ANALYSES", prior_context)) if value]
+                                       ("PREVIOUS ANALYSES", prior_context),
+                                       ("REQUESTED EVIDENCE", verbatim)) if value]
     sources = "these details"
     if pivots:
         sources += f" and the {' and '.join(pivots)} above"
