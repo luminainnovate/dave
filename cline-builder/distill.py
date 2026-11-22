@@ -1091,7 +1091,12 @@ BlockerPaths = collections.namedtuple("BlockerPaths", ("present", "absent"))
 # What read_evidence actually put in the payload, as opposed to what was asked
 # for. The two diverge whenever the budget runs out mid-set, and the caller has
 # to mark only `included` as seen - see resolve_pass_blockers.
-Evidence = collections.namedtuple("Evidence", ("text", "included"))
+# `partial` names the included files that were cut to fit (a slice, not the
+# whole file). A slice answers the region it was aimed at and no other, so the
+# blocker loop must let the pass ask for the same file again at a different
+# place - see resolve_pass_blockers.
+Evidence = collections.namedtuple("Evidence", ("text", "included", "partial"),
+                                  defaults=((),))
 
 
 def _looks_like_path(candidate: str) -> bool:
@@ -1470,7 +1475,7 @@ def read_evidence(project_dir: str, paths: list, budget_chars: int,
               f"found on disk and left unread.", flush=True)
         return Evidence("", [])
 
-    blocks, remaining, included, skipped = [], budget_chars, [], []
+    blocks, remaining, included, skipped, partial = [], budget_chars, [], [], []
     for rel in paths:
         if remaining <= 0:
             skipped.append(rel)
@@ -1498,6 +1503,7 @@ def read_evidence(project_dir: str, paths: list, budget_chars: int,
                 content, keep, (symbol_hints or {}).get(rel),
                 (line_hints or {}).get(rel),
             )
+            partial.append(rel)
         remaining -= len(content)
         included.append(rel)
         blocks.append(f'<file path="{rel}">\n{content}\n</file>')
@@ -1526,6 +1532,7 @@ def read_evidence(project_dir: str, paths: list, budget_chars: int,
         + "\n".join(blocks) + note +
         f"  </{tag}>\n",
         included,
+        tuple(partial),
     )
 
 
@@ -1583,6 +1590,12 @@ def resolve_pass_blockers(client, pass_key: str, model_config, prompt: str,
     else:
         restated_budget = ceiling = max_rounds
     seen = set()
+    # path -> the aims (symbols, line range) a truncated read of it was centred
+    # on. A 34k file against a 24k cap is handed over as a slice; recording it
+    # in `seen` made a later request for a different region of it - "the
+    # handler around line 745" - read as "already supplied", and the pass
+    # stopped blocked on a region it had never been shown.
+    sliced = {}
     evidence = ""
     restated = 0
     asked = None
@@ -1623,19 +1636,40 @@ def resolve_pass_blockers(client, pass_key: str, model_config, prompt: str,
         # A pass that re-asks for a file it has already been shown is stuck, not
         # progressing. Reading it a second time would spend the budget to hand
         # back a byte-identical payload, so only genuinely new paths count.
-        fresh = [p for p in found.present if p not in seen]
+        symbol_hints = blocker_symbol_hints(blockers)
+        line_hints = blocker_line_hints(blockers)
+
+        def _aim(path):
+            symbols = frozenset((symbol_hints or {}).get(path) or ())
+            return (symbols, line_hints.get(path))
+
+        def _new_ground(path):
+            if path in seen:
+                return False
+            if path in sliced:
+                # Only a request aimed somewhere the earlier slices were not.
+                aim = _aim(path)
+                return aim != (frozenset(), None) and aim not in sliced[path]
+            return True
+
+        fresh = [p for p in found.present if _new_ground(p)]
         fresh_absent = [p for p in found.absent if p not in seen]
 
         # What the resolver made of the blockers, before any of it is acted on.
         # Without this the log jumps from the pass's request to a file count,
         # and a path that was classified absent, or held back as already-seen,
         # is indistinguishable from one the budget simply could not reach.
-        repeated = [p for p in (list(found.present) + list(found.absent)) if p in seen]
+        repeated = [p for p in (list(found.present) + list(found.absent))
+                    if p not in fresh and p not in fresh_absent]
+        resliced = [p for p in fresh if p in sliced]
         if fresh:
             print(f"     ↳ on disk, will read: {', '.join(fresh)}", flush=True)
         if fresh_absent:
             print(f"     ↳ not in the workspace (answers the blocker): "
                   f"{', '.join(fresh_absent)}", flush=True)
+        if resliced:
+            print(f"     ↳ only a slice was supplied before; reading the region now "
+                  f"asked for: {', '.join(resliced)}", flush=True)
         if repeated:
             print(f"     ↳ already supplied in an earlier round: "
                   f"{', '.join(repeated)}", flush=True)
@@ -1668,8 +1702,8 @@ def resolve_pass_blockers(client, pass_key: str, model_config, prompt: str,
                   f"already exceeds the merge budget, so this call extracts either way.",
                   flush=True)
         found_evidence = read_evidence("/workspace", fresh, budget, fresh_absent,
-                                       symbol_hints=blocker_symbol_hints(blockers),
-                                       line_hints=blocker_line_hints(blockers))
+                                       symbol_hints=symbol_hints,
+                                       line_hints=line_hints)
         addendum = found_evidence.text
         if not addendum:
             print("  ⚠ No readable evidence identified for these blockers.", flush=True)
@@ -1694,7 +1728,12 @@ def resolve_pass_blockers(client, pass_key: str, model_config, prompt: str,
         # unread ones stay unseen so the next round can spend a fresh budget on
         # them. `fresh_absent` is different - a confirmed absence is a complete
         # answer, costs no budget, and is always reported in full.
-        seen.update(found_evidence.included)
+        for p in found_evidence.included:
+            if p in found_evidence.partial:
+                sliced.setdefault(p, set()).add(_aim(p))
+            else:
+                seen.add(p)
+                sliced.pop(p, None)
         seen.update(fresh_absent)
         evidence += addendum
 

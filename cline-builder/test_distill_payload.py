@@ -2575,6 +2575,107 @@ def test_a_failed_blocker_resolution_returns_the_right_shape():
     assert out.present == [] and out.absent == []
 
 
+def test_a_sliced_file_can_be_asked_for_again_at_another_region():
+    """
+    KAN-163's CI fix: `three-sixty.ts` is 34108 chars against a 24000 cap, so
+    round 1 handed the architect a slice. Rounds 3 and 4 asked for "the
+    `GET /feedback/360/templates` handler body (around line 745)", which sat
+    outside that slice; the loop called the file "already supplied" and the
+    design pass stopped on a region it had never been shown. A slice answers
+    the region it was aimed at, not the file.
+    """
+    rel = "Backend/src/routes/three-sixty.ts"
+    head = "export function serializeTemplate(t) { return t; }\n"
+    body = head + "// filler line\n" * 2600
+    line_of_handler = body.count("\n") + 2
+    body += "\n// THE TEMPLATES HANDLER\nrouter.get('/feedback/360/templates', h);\n"
+    body += "// tail\n" * 50
+    assert len(body) > distill.EVIDENCE_MAX_FILE_CHARS
+
+    rounds = [
+        [f"`{rel}` — need the `serializeTemplate` function"],
+        [f"`{rel}` — need the handler body (around line {line_of_handler})"],
+    ]
+    calls = []
+
+    with tempfile.TemporaryDirectory() as tmp:
+        os.makedirs(os.path.join(tmp, os.path.dirname(rel)))
+        with open(os.path.join(tmp, rel), "w") as f:
+            f.write(body)
+
+        real_read = distill.read_evidence
+        saved = (distill.detect_blockers, distill.resolve_blocker_paths,
+                 distill.call_llm, distill.read_evidence)
+        state = {"round": 0}
+
+        def detect(result):
+            return rounds[state["round"]] if state["round"] < len(rounds) else []
+
+        def call(client, cfg, prompt, payload, prior):
+            calls.append(payload)
+            state["round"] += 1
+            return "result %d" % state["round"]
+
+        distill.detect_blockers = detect
+        distill.resolve_blocker_paths = lambda *a, **k: distill.BlockerPaths([rel], [])
+        distill.call_llm = call
+        distill.read_evidence = lambda _d, *a, **k: real_read(tmp, *a, **k)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                result = distill.resolve_pass_blockers(
+                    None, "architect", {}, "prompt", "target", "", "skel", "blocked")
+        finally:
+            (distill.detect_blockers, distill.resolve_blocker_paths,
+             distill.call_llm, distill.read_evidence) = saved
+
+    log = out.getvalue()
+    assert "already supplied" not in log, log
+    assert len(calls) == 2, log
+    assert "THE TEMPLATES HANDLER" not in calls[0]
+    assert "THE TEMPLATES HANDLER" in calls[1], "round 2 never read the region asked for"
+    assert result == "result 2"
+
+
+def test_a_sliced_file_asked_for_at_the_same_place_still_stops():
+    """The repeat guard still holds: the same aim twice is the pass going in circles."""
+    rel = "src/big.ts"
+    body = "export function serializeTemplate() {}\n" + "// filler\n" * 4000
+    ask = [f"`{rel}` — need the `serializeTemplate` function"]
+    calls = []
+    with tempfile.TemporaryDirectory() as tmp:
+        os.makedirs(os.path.join(tmp, "src"))
+        with open(os.path.join(tmp, rel), "w") as f:
+            f.write(body)
+        real_read = distill.read_evidence
+        saved = (distill.detect_blockers, distill.resolve_blocker_paths,
+                 distill.call_llm, distill.read_evidence)
+        distill.detect_blockers = lambda r: ask
+        distill.resolve_blocker_paths = lambda *a, **k: distill.BlockerPaths([rel], [])
+        distill.call_llm = lambda *a, **k: calls.append(a[3]) or "still blocked"
+        distill.read_evidence = lambda _d, *a, **k: real_read(tmp, *a, **k)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                distill.resolve_pass_blockers(
+                    None, "architect", {}, "prompt", "target", "", "skel", "blocked")
+        finally:
+            (distill.detect_blockers, distill.resolve_blocker_paths,
+             distill.call_llm, distill.read_evidence) = saved
+    assert len(calls) == 1, out.getvalue()
+    assert "already supplied" in out.getvalue()
+
+
+def test_read_evidence_reports_which_files_it_sliced():
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "big.ts"), "w") as f:
+            f.write("x\n" * 20000)
+        with open(os.path.join(tmp, "small.ts"), "w") as f:
+            f.write("y\n")
+        ev = distill.read_evidence(tmp, ["small.ts", "big.ts"], 30000)
+    assert ev.included == ["small.ts", "big.ts"]
+    assert ev.partial == ("big.ts",)
+    assert distill.Evidence("", []).partial == ()
+
+
 # --- Sibling test suites ------------------------------------------------------
 
 def _mkpkg(root, rel, scripts=None, dev=None):
