@@ -1039,6 +1039,12 @@ def _stall(workspace: str, marker: dict, headline: str, detail: str, error: str 
     _notify(workspace, marker, STATE_STALLED, "\n".join(lines), stall_reason=headline)
 
 
+def _actions_ran(rollup) -> bool:
+    """Whether any GitHub Actions job reported: a check run from a workflow."""
+    return any(item.get("__typename") != "StatusContext" and item.get("workflowName")
+               for item in rollup or [])
+
+
 def _classify_checks(rollup) -> tuple:
     """(pending, failed, passed), each a list of {name, url, conclusion}."""
     pending, failed, passed = [], [], []
@@ -1117,6 +1123,21 @@ def _advance_checks(workspace: str, marker: dict) -> None:
 
     if failed:
         _fail(workspace, marker, "pr", head, _check_causes(root, failed))
+        return
+
+    # A third-party status is not CI. KAN-166 (veriform-ui PR #317): Snyk posted
+    # SUCCESS 14s after the PR opened, before GitHub Actions had registered a
+    # single run, and that one green status was enough to merge. When the
+    # branch has workflows, at least one Actions check has to report first.
+    if passed and _has_workflows(root) and not _actions_ran(data.get("statusCheckRollup")):
+        if not _timed_out(marker):
+            return
+        others = ", ".join(f"`{c['name']}`" for c in passed[:5])
+        _stall(workspace, marker, f"GitHub Actions never ran on {_pr_label(marker)}.",
+               f"Only {others} reported on `{head[:7]}`, although the branch has "
+               f"workflows under `.github/workflows/`. A third-party status is not "
+               f"CI, so nothing was merged. Check the repository's Actions settings "
+               f"and billing, then `!ship watch` to wait again.")
         return
 
     if not passed:
