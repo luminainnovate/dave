@@ -2676,6 +2676,47 @@ def test_read_evidence_reports_which_files_it_sliced():
     assert distill.Evidence("", []).partial == ()
 
 
+def _payload_with_evidence(rounds=1):
+    filler = "\n".join(f"- src/file_{i}.ts: exports thing_{i}" for i in range(9000))
+    body = f"<NEW_REQUEST>fix the 500 on GET /feedback/360/templates</NEW_REQUEST>\n{filler}"
+    for n in range(1, rounds + 1):
+        body += (f"\n\n  <REQUESTED_EVIDENCE>\n  Files you asked for.\n"
+                 f'<file path="Backend/src/routes/three-sixty.ts">\n'
+                 f"app.get('/feedback/360/templates', HANDLER_BODY_ROUND_{n});\n"
+                 f"</file>\n  </REQUESTED_EVIDENCE>\n")
+    return body
+
+
+def test_requested_evidence_reaches_the_merge_verbatim():
+    """
+    KAN-163, 2026-11-22: the architect asked for the templates handler in all
+    four rounds and was handed it each time, but the payload was over the window,
+    so the evidence was chunked with it and reached the merge only as extracted
+    bullet records. The merge writes the design and never saw the code.
+    """
+    fake = run_call_llm(_payload_with_evidence(), window=CHUNKING_WINDOW)
+    assert fake.chunks, "the fixture must take the map-reduce path"
+    assert "HANDLER_BODY_ROUND_1" in fake.merge["user"]
+    assert "### REQUESTED EVIDENCE" in fake.merge["user"]
+    assert not any("HANDLER_BODY_ROUND_1" in c["user"] for c in fake.chunks), \
+        "the evidence was also sent through extraction"
+
+
+def test_only_the_newest_evidence_that_fits_is_lifted():
+    payload = _payload_with_evidence(rounds=3)
+    big = payload.replace("HANDLER_BODY_ROUND_1", "HANDLER_BODY_ROUND_1" + " x" * 20000)
+    rest, verbatim = distill.split_verbatim_evidence(big, 2000)
+    assert "HANDLER_BODY_ROUND_3" in verbatim and "HANDLER_BODY_ROUND_2" in verbatim
+    assert "HANDLER_BODY_ROUND_1" not in verbatim
+    assert "HANDLER_BODY_ROUND_1" in rest, "evidence that does not fit is not dropped"
+    assert "HANDLER_BODY_ROUND_3" not in rest
+
+
+def test_payload_without_evidence_is_unchanged_by_the_split():
+    text = "<NEW_REQUEST>x</NEW_REQUEST>\nplain payload"
+    assert distill.split_verbatim_evidence(text, 10000) == (text, "")
+
+
 # --- Sibling test suites ------------------------------------------------------
 
 def _mkpkg(root, rel, scripts=None, dev=None):
