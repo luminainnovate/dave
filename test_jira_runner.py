@@ -441,6 +441,42 @@ def test_ci_still_failing_after_max_rounds_blocks():
     check("subtask stays In Review", jira.issues["KAN-2"]["status"] == "In Review")
 
 
+def test_rerun_of_a_story_stopped_on_fix_rounds_gets_fresh_rounds():
+    """KAN-163, 2026-11-22: the run stopped after 2 fix rounds; `!jira KAN-141`
+    resumed at the CI gate and stopped again within a second, with no build."""
+    spent = jira_runner.MAX_FIX_ROUNDS
+    jira = FakeJira(story("In Progress"),
+                    [issue("KAN-2", "In Review", labels=["agent-dave"])])
+    engine = FakeEngine(marker={"state": "ci_failed", "fix_attempts": spent,
+                                "pr_url": "https://gh/pr/9"})
+    engine.script = [{"state": "fixing", "fix_attempts": spent + 1},
+                     {"state": "awaiting_checks", "fix_attempts": spent + 1},
+                     *INTEGRATED[1:]]
+    _, result = run(jira, engine)
+    check("a fresh fix round ran", [c[0] for c in engine.calls].count("fix_ci") == 1,
+          engine.calls)
+    check("delivered", jira.issues["KAN-2"]["status"] == "Done", result)
+    check("numbered from the re-run", any("fix round 1 of" in c for c in jira.comments("KAN-2")),
+          jira.comments("KAN-2"))
+
+
+def test_rerun_still_stops_after_its_own_rounds():
+    spent = jira_runner.MAX_FIX_ROUNDS
+    jira = FakeJira(story("In Progress"),
+                    [issue("KAN-2", "In Review", labels=["agent-dave"])])
+    engine = FakeEngine(marker={"state": "ci_failed", "fix_attempts": spent,
+                                "pr_url": "https://gh/pr/9"})
+    engine.script = []
+    for n in range(1, spent + 1):
+        engine.script += [{"state": "fixing", "fix_attempts": spent + n},
+                          {"state": "ci_failed", "fix_attempts": spent + n,
+                           "notice": "🔴 **CI failed**"}]
+    _, result = run(jira, engine)
+    check("exactly this run's allowance",
+          [c[0] for c in engine.calls].count("fix_ci") == spent, engine.calls)
+    check("stopped with this run's count", f"after {spent} fix round" in result, result)
+
+
 def test_unfixable_ci_failure_blocks():
     script = [{"state": "awaiting_checks"}, {"state": "ci_failed", "fix_attempts": 0}]
     jira = FakeJira(story(), [issue("KAN-2")])

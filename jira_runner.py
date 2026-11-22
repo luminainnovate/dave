@@ -377,7 +377,12 @@ class StoryRun:
         marker = self.engine.read_marker() or {}
         if resume and marker.get("state") in (S_CHECKS, S_BASE, S_FAILED, S_FIXING, S_STALLED):
             self.engine.note(f"⏯️ {key}: resuming at the CI gate.")
-            await self._through_ci(story, issue)
+            # A re-run is a person deciding to try again, so it gets the full
+            # allowance of fix rounds. Counting the ones the stopped run spent
+            # made `!jira` on a story stopped for "still failing after N fix
+            # rounds" stop again within a second, without a single build.
+            await self._through_ci(story, issue,
+                                   fix_base=int(marker.get("fix_attempts", 0) or 0))
             return
         if marker.get("state") in (S_CHECKS, S_BASE, S_FAILED, S_FIXING, S_STALLED):
             await self._wait_for_other_pr(key, marker)
@@ -488,7 +493,7 @@ class StoryRun:
                                   f"`!logs` shows why.")
             await self.engine.wait()
 
-    async def _through_ci(self, story: dict, issue: dict) -> None:
+    async def _through_ci(self, story: dict, issue: dict, fix_base: int = 0) -> None:
         key = issue["key"]
         self._save(phase="ci")
         self.engine.watch_ci()
@@ -513,7 +518,7 @@ class StoryRun:
                 raise Blocked(f"The CI gate needs a person: {marker.get('stall_reason', 'stalled')}.\n\n"
                               f"{_plain(marker.get('notice') or '')[:1200]}")
             if state == S_FAILED:
-                rounds = int(marker.get("fix_attempts", 0))
+                rounds = max(0, int(marker.get("fix_attempts", 0) or 0) - fix_base)
                 if rounds >= MAX_FIX_ROUNDS:
                     raise Blocked(f"CI is still failing after {rounds} fix round(s).\n\n"
                                   f"{_plain(marker.get('notice') or '')[:1200]}")
