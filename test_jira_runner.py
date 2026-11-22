@@ -506,6 +506,29 @@ def test_resume_waits_on_open_pr_without_redesigning():
     check("then the next one", jira.issues["KAN-3"]["status"] == "Done", jira.log)
 
 
+def test_rerun_after_a_merge_while_stopped_delivers_without_rebuilding():
+    """KAN-163, 2026-11-22: `!jira stop` landed after the fix was pushed; the CI
+    gate merged it with no run watching. A re-run must mark it Done, not
+    design and build it again."""
+    jira = FakeJira(story("In Progress"),
+                    [issue("KAN-2", "In Review", labels=["agent-dave"]), issue("KAN-3")])
+    engine = FakeEngine(marker={"state": "integrated", "title": "KAN-2: Subtask",
+                                "pr_url": "https://gh/pr/9", "merge_sha": "c8be2ad0"})
+    _, _result = run(jira, engine)
+    check("not redesigned", not any(c[0] == "design" and "KAN-2" in str(c) for c in engine.calls),
+          engine.calls)
+    check("marked Done", jira.issues["KAN-2"]["status"] == "Done", jira.log)
+    check("then the next one", jira.issues["KAN-3"]["status"] == "Done", jira.log)
+
+
+def test_an_integrated_record_for_another_subtask_is_not_taken_as_this_one():
+    jira = FakeJira(story("In Progress"), [issue("KAN-2", "In Review", labels=["agent-dave"])])
+    engine = FakeEngine(marker={"state": "integrated", "title": "KAN-1: Earlier",
+                                "pr_url": "https://gh/pr/8"})
+    _, _result = run(jira, engine)
+    check("designed afresh", any(c[0] == "design" for c in engine.calls), engine.calls)
+
+
 def test_unrelated_pr_in_flight_is_waited_for():
     """KAN-143, 2026-11-20: a hand-shipped PR was in CI, so the run stopped,
     and nothing restarted it when that PR merged minutes later."""
