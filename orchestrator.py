@@ -4126,6 +4126,9 @@ class _OrchestratorEngine(jira_runner.Engine):
     def note(self, text: str) -> None:
         ship.record_event(self.workspace, text)
 
+    def merged_pr(self, key: str) -> dict:
+        return ship.merged_pr_for(self.workspace, key)
+
     def stop_reason(self, container: str) -> str:
         """The design passes' blockers, when this container stopped on them."""
         if not ship.build_stopped(self.workspace, container):
