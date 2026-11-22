@@ -223,6 +223,11 @@ def unit_prompt(story: dict, issue: dict) -> str:
     ])
 
 
+def _marker_is_for(marker: dict, key: str) -> bool:
+    """Whether a ship record is this subtask's: its title starts with the key."""
+    return (marker.get("title") or "").startswith(f"{key}:")
+
+
 def ship_title(issue: dict) -> str:
     return f"{issue['key']}: {issue['summary']}"[:72]
 
@@ -383,6 +388,14 @@ class StoryRun:
             # rounds" stop again within a second, without a single build.
             await self._through_ci(story, issue,
                                    fix_base=int(marker.get("fix_attempts", 0) or 0))
+            return
+        if resume and marker.get("state") == S_INTEGRATED and _marker_is_for(marker, key):
+            # Merged and green while no run was watching - a `!jira stop` after
+            # the fix was pushed, with the CI gate carrying on and merging. The
+            # work is on the base branch; designing it again would rebuild a
+            # subtask that is already delivered.
+            self.engine.note(f"⏯️ {key}: already merged while the run was stopped.")
+            await self._through_ci(story, issue)
             return
         if marker.get("state") in (S_CHECKS, S_BASE, S_FAILED, S_FIXING, S_STALLED):
             await self._wait_for_other_pr(key, marker)
