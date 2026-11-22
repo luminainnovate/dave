@@ -521,6 +521,32 @@ def test_rerun_after_a_merge_while_stopped_delivers_without_rebuilding():
     check("then the next one", jira.issues["KAN-3"]["status"] == "Done", jira.log)
 
 
+def test_rerun_finds_a_merge_whose_ship_record_is_gone():
+    """KAN-166, 2026-11-22: merged and green, the integrated record deleted when
+    the `!jira` turn announced it, and the re-run designed KAN-166 again."""
+    jira = FakeJira(story("In Progress"),
+                    [issue("KAN-2", "In Progress", labels=["agent-dave"]), issue("KAN-3")])
+    engine = FakeEngine()
+    engine.merged_pr = lambda key: ({"url": "https://gh/pr/317", "sha": "a3c2039f"}
+                                    if key == "KAN-2" else {})
+    _, _result = run(jira, engine)
+    check("not redesigned", not any(c[0] == "design" and "KAN-2" in str(c) for c in engine.calls),
+          engine.calls)
+    check("marked Done", jira.issues["KAN-2"]["status"] == "Done", jira.log)
+    check("comment names the merge", any("a3c2039" in c for c in jira.comments("KAN-2")),
+          jira.comments("KAN-2"))
+    check("then the next one", jira.issues["KAN-3"]["status"] == "Done", jira.log)
+
+
+def test_a_fresh_subtask_is_not_looked_up_as_merged():
+    jira = FakeJira(story(), [issue("KAN-2")])
+    engine = FakeEngine()
+    asked = []
+    engine.merged_pr = lambda key: asked.append(key) or {}
+    run(jira, engine)
+    check("only resumed subtasks are looked up", asked == [], asked)
+
+
 def test_an_integrated_record_for_another_subtask_is_not_taken_as_this_one():
     jira = FakeJira(story("In Progress"), [issue("KAN-2", "In Review", labels=["agent-dave"])])
     engine = FakeEngine(marker={"state": "integrated", "title": "KAN-1: Earlier",

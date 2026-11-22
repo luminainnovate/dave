@@ -959,6 +959,24 @@ def _gh_json(root: str, *args: str) -> tuple:
         return None, f"unparseable gh output: {e}"
 
 
+def merged_pr_for(workspace: str, key: str) -> dict:
+    """
+    The merged pull request whose title starts with `<key>:` - {url, sha} - or {}.
+
+    Titles come from the Jira runner's ship_title(), so the key prefix is exact.
+    Any gh failure answers {}, which costs a redundant build at worst, never a
+    wrongly closed ticket.
+    """
+    data, _ = _gh_json(os.path.abspath(workspace), "pr", "list", "--state", "merged",
+                       "--search", f'"{key}:" in:title', "--limit", "20",
+                       "--json", "title,url,mergeCommit")
+    for pr in data or []:
+        if (pr.get("title") or "").startswith(f"{key}:"):
+            return {"url": pr.get("url") or "",
+                    "sha": ((pr.get("mergeCommit") or {}).get("oid") or "")}
+    return {}
+
+
 def _has_workflows(root: str) -> bool:
     folder = os.path.join(root, ".github", "workflows")
     try:

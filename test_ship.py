@@ -782,6 +782,20 @@ def test_actions_that_never_run_stall_rather_than_merge():
     check("says Actions never ran", "Actions never ran" in (ship.pending_offer(w.root) or ""))
 
 
+def test_merged_pr_for_matches_the_key_prefix_exactly():
+    with FakeGh() as gh:
+        w = Workspace()
+        gh.script("pr list", [
+            {"title": "KAN-16: other", "url": "u16", "mergeCommit": {"oid": "1" * 40}},
+            {"title": "KAN-166: Draft lifecycle", "url": "u166", "mergeCommit": {"oid": "a" * 40}},
+        ])
+        found = ship.merged_pr_for(w.root, "KAN-166")
+        gh.script("pr list", [{"title": "KAN-1666: x", "url": "u", "mergeCommit": None}])
+        missing = ship.merged_pr_for(w.root, "KAN-166")
+    check("finds its own PR", found == {"url": "u166", "sha": "a" * 40}, found)
+    check("a longer key is not a match", missing == {}, missing)
+
+
 def test_a_refused_merge_stalls_with_the_pr_still_open():
     with FakeGh(merge_fails=True) as gh:
         w = shipped(gh)

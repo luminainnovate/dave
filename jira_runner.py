@@ -131,6 +131,8 @@ class Engine:
     stop_reason(container) -> str          why this build stopped before building,
                                            e.g. the design passes' blockers; "" if
                                            it did not stop on one
+    merged_pr(key) -> dict                 the merged pull request titled for this
+                                           subtask ({url, sha}); {} if there is none
     """
     workspace = ""
 
@@ -139,6 +141,9 @@ class Engine:
 
     def stop_reason(self, container: str) -> str:
         return ""
+
+    def merged_pr(self, key: str) -> dict:
+        return {}
 
 
 def unit_plan(story: dict, subtasks: list) -> list:
@@ -397,6 +402,22 @@ class StoryRun:
             self.engine.note(f"⏯️ {key}: already merged while the run was stopped.")
             await self._through_ci(story, issue)
             return
+        if resume and marker.get("state") not in (S_CHECKS, S_BASE, S_FAILED,
+                                                  S_FIXING, S_STALLED):
+            # The ship record is not the only witness. An integrated record is
+            # deleted once announced, and the `!jira` that restarts the run is
+            # itself the turn that announces it - KAN-166, 2026-11-22: merged
+            # and green, the record gone, and the re-run designed it again.
+            # The merged pull request outlives all of that.
+            merged = await asyncio.to_thread(self.engine.merged_pr, key)
+            if merged:
+                sha, url = merged.get("sha", ""), merged.get("url", "")
+                self.engine.note(f"⏯️ {key}: already merged ({url}).")
+                await self._jira("transition", key, STATUS_DONE)
+                await self._jira("comment", key, f"✅ Merged while the run was stopped"
+                                                 f"{' as ' + sha[:7] if sha else ''}. {url}".strip())
+                self.engine.note(f"✅ {key} delivered.")
+                return
         if marker.get("state") in (S_CHECKS, S_BASE, S_FAILED, S_FIXING, S_STALLED):
             await self._wait_for_other_pr(key, marker)
 
