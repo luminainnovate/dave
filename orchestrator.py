@@ -4037,8 +4037,25 @@ _jira_task: asyncio.Task | None = None
 _jira_run = None
 # How long the runner waits for the design container to exit before building.
 JIRA_DESIGN_EXIT_WAIT_SECS = 300
+# How long a Jira design pass may run in all. The chat gate gives up at
+# DESIGN_REVIEW_TIMEOUT_STREAMING because a person is waiting on the reply; the
+# runner is not, and treating "still running" as "no design" started a second
+# architect container beside the first, on one GPU and one workspace.
+JIRA_DESIGN_MAX_SECS = int(os.environ.get("JIRA_DESIGN_MAX_SECS", "10800"))
+JIRA_DESIGN_POLL_SECS = 10
 # The heading distill.py (ABORT_MARKER) puts on a design pass that could not run.
 DESIGN_ABORT_MARKER = "## ❌ ABORTED — the pass could not run"
+
+
+async def _wait_for_container_exit(name: str, limit: float) -> bool:
+    """True once `name` is no longer running; False if it still is after `limit`."""
+    deadline = time.time() + max(0.0, limit)
+    while await _container_is_running(name):
+        if time.time() > deadline:
+            logger.warning(f"[Jira] {name} still running after {limit:.0f}s.")
+            return False
+        await asyncio.sleep(JIRA_DESIGN_POLL_SECS)
+    return True
 
 
 async def _wait_for_builds_to_finish(limit: float) -> bool:
@@ -4065,9 +4082,20 @@ class _OrchestratorEngine(jira_runner.Engine):
     async def design(self, messages: list, pass_key: str):
         final = ""
         # streaming=True for the long budget: nobody is waiting on a socket here.
+        started = time.time()
         async for is_final, text in _run_design_review(messages, pass_key, streaming=True):
             if is_final:
                 final = text
+        still = re.search(r"pass is still running\*\* \(`(cline-builder-\d+)`\)", final or "")
+        if still:
+            name = still.group(1)
+            if not await _wait_for_container_exit(name, JIRA_DESIGN_MAX_SECS - (time.time() - started)):
+                # Stop it rather than leave it: the runner's retry would start
+                # another pass beside it otherwise.
+                await asyncio.to_thread(subprocess.run, ["docker", "stop", name],
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return None, (f"⏱️ The {pass_key} pass ran past {JIRA_DESIGN_MAX_SECS}s "
+                              f"(`{name}`) and was stopped.")
         # A person reads the design before `!approve`, and by then the design
         # container has exited and its monitor has cleaned up. Wait for the
         # same, so the build never starts beside a container that is still
