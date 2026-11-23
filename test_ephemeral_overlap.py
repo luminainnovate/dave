@@ -14,6 +14,7 @@ import asyncio
 import importlib.util
 import os
 import sys
+import tempfile
 
 os.environ.setdefault("LLAMACPP_BINARY", "/bin/true")
 
@@ -75,6 +76,56 @@ def test_jira_waits_for_the_design_container():
     orch._live_builds.add("cline-builder-stuck")
     check("gives up after the limit", asyncio.run(orch._wait_for_builds_to_finish(0)) is False)
     orch._live_builds.clear()
+
+
+def test_jira_design_waits_out_a_slow_pass_instead_of_retrying():
+    """A Jira architect pass ran past the chat gate's 1800s wait, the runner
+    read "still running" as "no design" and started a second architect
+    container beside the first."""
+    alive = {"n": 3}
+
+    async def running(name):
+        alive["n"] -= 1
+        return alive["n"] > 0
+
+    async def gate(messages, pass_key, streaming=False):
+        yield True, ("⏳ **Architect pass is still running** (`cline-builder-42`).\n\n"
+                     "It exceeded the 1800s wait.")
+
+    saved = (orch._run_design_review, orch._container_is_running, orch.JIRA_DESIGN_POLL_SECS,
+             orch._design_review_path, orch._wait_for_builds_to_finish)
+    tmp = tempfile.NamedTemporaryFile("w", suffix=".md", delete=False)
+    tmp.write("# Design\n\nDo it.")
+    tmp.close()
+
+    async def no_wait(limit):
+        return True
+
+    orch._run_design_review = gate
+    orch._container_is_running = running
+    orch.JIRA_DESIGN_POLL_SECS = 0
+    orch._design_review_path = lambda messages, pass_key: tmp.name
+    orch._wait_for_builds_to_finish = no_wait
+    try:
+        doc, _ = asyncio.run(orch._OrchestratorEngine("/tmp").design([], "architect"))
+    finally:
+        (orch._run_design_review, orch._container_is_running, orch.JIRA_DESIGN_POLL_SECS,
+         orch._design_review_path, orch._wait_for_builds_to_finish) = saved
+        os.unlink(tmp.name)
+    check("waited for the container, then read its design", doc == "# Design\n\nDo it.", doc)
+    check("polled until it exited", alive["n"] == 0, alive)
+
+
+def test_container_exit_wait_gives_up():
+    async def running(name):
+        return True
+    saved = (orch._container_is_running, orch.JIRA_DESIGN_POLL_SECS)
+    orch._container_is_running, orch.JIRA_DESIGN_POLL_SECS = running, 0
+    try:
+        ok = asyncio.run(orch._wait_for_container_exit("cline-builder-1", 0))
+    finally:
+        orch._container_is_running, orch.JIRA_DESIGN_POLL_SECS = saved
+    check("false while it is still running", ok is False)
 
 
 if __name__ == "__main__":
