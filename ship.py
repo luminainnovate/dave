@@ -2013,12 +2013,38 @@ _LINT_STEP_RE = re.compile(r"\b(?:lint|eslint|prettier|ruff|black|flake8|format|
                            re.IGNORECASE)
 
 
+# A job whose setup failed fails every step after it, for the one reason. veriform-ui
+# PR #328: `npm ci` failed and seven later steps of the same job failed on the
+# missing packages, each planned as its own fix build.
+_SETUP_STEP_RE = re.compile(r"\b(install|npm ci|pnpm i|yarn install|setup|set up|checkout|"
+                            r"restore|bootstrap)\b", re.I)
+
+
+def _is_setup(step: dict) -> bool:
+    return bool(_SETUP_STEP_RE.search(f"{step.get('step', '')} {step.get('command', '')}"))
+
+
 def _plan_issues(causes: list) -> list:
-    """Split triaged causes into issues: one per failed step, or per failing test file."""
+    """
+    Split triaged causes into issues: one per failed step, or per failing test file.
+
+    A failed setup step is the job's only issue - the steps after it failed
+    because it did. The same setup step failing the same way in several jobs is
+    one issue too: one fix, not one build per job.
+    """
     issues = []
+    setup_seen = {}
     for cause in causes:
         steps = cause.get("steps") or [{"step": "", "command": "", "errors": [],
                                         "origin": cause.get("origin")}]
+        if steps and _is_setup(steps[0]):
+            steps = steps[:1]
+            key = (steps[0].get("step", ""), tuple((steps[0].get("errors") or [])[:3]))
+            if key in setup_seen:
+                first = setup_seen[key]
+                first["title"] = f"{first['check']}, {cause.get('name', 'check')} › {first['step'] or 'failed'}"
+                first.setdefault("also_checks", []).append(cause.get("name", ""))
+                continue
         for step in steps:
             common = {"check": cause.get("name", ""), "url": cause.get("url", ""),
                       "origin": step.get("origin") or cause.get("origin", ""),
@@ -2039,6 +2065,8 @@ def _plan_issues(causes: list) -> list:
                                "errors": step.get("errors", []),
                                "error_count": step.get("error_count", len(step.get("errors", []))),
                                "files": step.get("files", [])})
+                if _is_setup(step) and step is steps[0]:
+                    setup_seen[(step.get("step", ""), tuple((step.get("errors") or [])[:3]))] = issues[-1]
     issues.sort(key=lambda i: bool(_LINT_STEP_RE.search(f"{i['step']} {i['command']}")))
     for n, issue in enumerate(issues, 1):
         issue.update({"id": n, "status": ISSUE_PENDING})
