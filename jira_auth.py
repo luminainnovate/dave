@@ -65,6 +65,23 @@ class JiraAuthError(Exception):
     """Dave cannot get a working token. The message says what a human must do."""
 
 
+class JiraUnreachable(JiraAuthError):
+    """Atlassian did not answer (timeout, network, 5xx). Nothing for a person to do
+    but wait; the saved sign-in is not known to be bad."""
+
+
+# A refresh rotates the refresh token. If Atlassian performs it but the reply is
+# lost (2026-11-23: a 503/timeout outage), the new token never reaches the store
+# and the old one is already spent - the sign-in is gone. Every refresh attempt
+# during an outage is another chance of that, so after an unanswered refresh the
+# token endpoint is left alone for this long and calls fail fast instead.
+REFRESH_BACKOFF_SECS = 300
+# A read timeout means the request may have been processed. One prompt retry
+# with the same refresh token recovers if Atlassian still honours it; if not, the
+# answer is a refusal and the outcome is no worse than before.
+REFRESH_TIMEOUT_RETRY_SECS = 2
+
+
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
@@ -136,7 +153,11 @@ def _http(method: str, url: str, headers: dict | None = None, body: dict | None 
         raw = e.read()
         status = e.code
     except urllib.error.URLError as e:
-        raise JiraAuthError(f"Could not reach {urllib.parse.urlparse(url).netloc}: {e.reason}")
+        raise JiraUnreachable(f"Could not reach {urllib.parse.urlparse(url).netloc}: {e.reason}")
+    except (TimeoutError, OSError) as e:
+        # A read timeout surfaces here, not as URLError - the request was sent
+        # and may have been processed.
+        raise JiraUnreachable(f"{urllib.parse.urlparse(url).netloc} did not answer: {e}")
     try:
         return status, (json.loads(raw) if raw else {})
     except ValueError:
@@ -198,6 +219,9 @@ def authorize_url(client_id: str, state: str) -> str:
 
 def _token_request(body: dict) -> dict:
     status, payload = _http("POST", TOKEN_URL, body=body)
+    if status >= 500:
+        raise JiraUnreachable(f"Atlassian's token service is failing (HTTP {status}): "
+                              f"{_error_text(payload)}")
     if status != 200 or not payload.get("access_token"):
         raise JiraAuthError(f"Atlassian refused the token request (HTTP {status}): "
                             f"{_error_text(payload)}")
@@ -342,14 +366,30 @@ class JiraAuth:
 
     def _refresh(self, data: dict) -> str:
         """Spend the refresh token for a new pair. Call with both locks held."""
+        backoff = getattr(self, "_backoff_until", 0.0)
+        if time.time() < backoff:
+            raise JiraUnreachable(f"Atlassian was unreachable on the last sign-in refresh; "
+                                  f"not retrying for {int(backoff - time.time())}s more. "
+                                  f"The saved sign-in is kept.")
         client_id, secret = _client(self._env)
+        body = {
+            "grant_type": "refresh_token",
+            "client_id": client_id,
+            "client_secret": secret,
+            "refresh_token": data["refresh_token"],
+        }
         try:
-            tokens = _token_request({
-                "grant_type": "refresh_token",
-                "client_id": client_id,
-                "client_secret": secret,
-                "refresh_token": data["refresh_token"],
-            })
+            try:
+                tokens = _token_request(body)
+            except JiraUnreachable as first:
+                if "did not answer" not in str(first):
+                    raise
+                time.sleep(REFRESH_TIMEOUT_RETRY_SECS)
+                tokens = _token_request(body)
+        except JiraUnreachable as e:
+            self._backoff_until = time.time() + REFRESH_BACKOFF_SECS
+            raise JiraUnreachable(f"{e} This is Atlassian, not the sign-in: nothing to do "
+                                  f"but wait. Refreshes pause for {REFRESH_BACKOFF_SECS}s.") from e
         except JiraAuthError as e:
             raise JiraAuthError(f"{e} The saved sign-in may have expired or been "
                                 f"revoked: run `python3 jira_auth.py login`.") from e
