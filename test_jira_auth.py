@@ -175,6 +175,58 @@ def test_refused_refresh_says_to_log_in_and_keeps_store():
     check("store untouched on failure", stored(root) == before)
 
 
+def test_an_outage_is_not_reported_as_a_lost_sign_in():
+    """2026-11-23: a 503 outage was reported as "the saved sign-in may have expired
+    ... run jira_auth.py login", which was wrong advice for an outage."""
+    root, env_path = workspace(store=signed_in(-10))
+    before = stored(root)
+    fake = FakeAtlassian((503, {"raw": "upstream connect error"}))
+    try:
+        with_fake(fake, jira_auth.JiraAuth.from_env(env_path).access_token)
+        check("outage raises", False)
+    except jira_auth.JiraUnreachable as e:
+        check("names Atlassian, not the sign-in", "jira_auth.py login" not in str(e), str(e))
+    check("store untouched", stored(root) == before)
+
+
+def test_refreshes_pause_after_an_unanswered_one():
+    """Each refresh during an outage risks Atlassian rotating the token and the
+    reply being lost; after one goes unanswered, the next call fails fast."""
+    _root, env_path = workspace(store=signed_in(-10))
+    auth = jira_auth.JiraAuth.from_env(env_path)
+    fake = FakeAtlassian((503, {}))
+    for _ in range(2):
+        try:
+            with_fake(fake, auth.access_token)
+        except jira_auth.JiraUnreachable:
+            pass
+    check("only one call reached the token endpoint", len(fake.calls) == 1, fake.calls)
+
+
+def test_a_timed_out_refresh_is_retried_once():
+    root, env_path = workspace(store=signed_in(-10))
+    answers = [TimeoutError("The read operation timed out"),
+               (200, {"access_token": "a2", "refresh_token": "r2", "expires_in": 3600})]
+    calls = []
+
+    def fake(method, url, headers=None, body=None):
+        calls.append(body)
+        r = answers.pop(0)
+        if isinstance(r, Exception):
+            raise jira_auth.JiraUnreachable(f"auth.atlassian.com did not answer: {r}")
+        return r
+    saved = jira_auth.REFRESH_TIMEOUT_RETRY_SECS
+    jira_auth.REFRESH_TIMEOUT_RETRY_SECS = 0
+    try:
+        token = with_fake(fake, jira_auth.JiraAuth.from_env(env_path).access_token)
+    finally:
+        jira_auth.REFRESH_TIMEOUT_RETRY_SECS = saved
+    check("recovered on the retry", token == "a2", token)
+    check("same refresh token sent both times",
+          [c["refresh_token"] for c in calls] == ["old-refresh", "old-refresh"], calls)
+    check("rotated token saved", stored(root).get("refresh_token") == "r2")
+
+
 def test_not_signed_in_says_to_log_in():
     _root, env_path = workspace()
     try:
