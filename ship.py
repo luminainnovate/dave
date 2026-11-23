@@ -776,7 +776,12 @@ def _update_stale_branch(workspace: str, marker: dict, pr: str, head: str) -> bo
     done = int(marker.get("branch_updates", 0) or 0)
     if done >= MAX_BRANCH_UPDATES:
         return False
-    code, out, err = _gh(root, "pr", "update-branch", pr)
+    # The REST endpoint, not `gh pr update-branch`: that subcommand only
+    # arrived in gh 2.47 and this host runs 2.46, where it prints the `gh pr`
+    # help and exits 0 - which looked like success. {owner}/{repo} is filled
+    # in by gh from the repository's remote.
+    code, out, err = _gh(root, "api", "-X", "PUT", f"repos/{{owner}}/{{repo}}/pulls/{pr}/update-branch",
+                         "-f", f"expected_head_sha={head}")
     if code != 0:
         logger.error(f"gh pr update-branch failed: {(out + err).strip()}")
         return False

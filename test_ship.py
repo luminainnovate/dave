@@ -811,12 +811,13 @@ def test_a_branch_behind_its_base_is_updated_and_rechecked():
         gh.script("pr view", pr_view(head, [check_run()]), {"headRefOid": new},
                   pr_view(new, [check_run()]))
         gh.script("pr merge", STALE, {"out": "merged\n", "err": "", "code": 0})
-        gh.script("pr update-branch", {"out": "updated\n", "err": "", "code": 0})
+        gh.script("api -X PUT", {"out": "{}", "err": "", "code": 0})
         state = ship.advance(w.root)
         marker = ship.read_marker(w.root)
         check("still waiting on CI", state == ship.STATE_AWAITING_CHECKS, state)
         check("now on the updated head", marker["head_sha"] == new, marker.get("head_sha"))
-        check("the branch was updated", any(a[:2] == ["pr", "update-branch"] for a in gh.argvs()))
+        check("the branch was updated", any(a[:3] == ["api", "-X", "PUT"] and a[3].endswith("/pulls/1/update-branch")
+                                            for a in gh.argvs()), gh.argvs())
         state = ship.advance(w.root)
     check("then merges", state == ship.STATE_AWAITING_BASE, state)
 
@@ -831,7 +832,7 @@ def test_a_base_that_keeps_moving_stalls_after_the_limit():
         gh.script("pr merge", STALE)
         state = ship.advance(w.root)
     check("stalls", state == ship.STATE_STALLED, state)
-    check("no further update", not any(a[:2] == ["pr", "update-branch"] for a in gh.argvs()))
+    check("no further update", not any(a[:3] == ["api", "-X", "PUT"] for a in gh.argvs()))
 
 
 def test_a_refused_merge_stalls_with_the_pr_still_open():
