@@ -753,6 +753,53 @@ def _open_pull_request(root: str, title: str, body: str, branch: str, base: str)
     return "", output
 
 
+# GitHub's refusal when branch protection requires the branch to be up to date
+# with the base and the base has moved since the PR was opened.
+_STALE_BRANCH_RE = re.compile(r"not up to date with the base branch|head branch is out of date"
+                              r"|branch is behind", re.I)
+# Updates per pull request before the gate stops and asks: a base that keeps
+# moving faster than CI finishes is a person's call, not a loop.
+MAX_BRANCH_UPDATES = 3
+
+
+def _update_stale_branch(workspace: str, marker: dict, pr: str, head: str) -> bool:
+    """
+    Bring a behind branch up to date with its base and wait for CI again.
+
+    veriform-ui requires branches to be up to date before merging, so a PR cut
+    before someone else merged to main was refused after every check passed
+    (veriform-ui PR #322, 2026-11-23). `gh pr update-branch` merges the base in
+    on GitHub; the new head gets its own CI run, and the gate waits on that
+    exactly as it waited on the first. True if it is now waiting again.
+    """
+    root = os.path.abspath(workspace)
+    done = int(marker.get("branch_updates", 0) or 0)
+    if done >= MAX_BRANCH_UPDATES:
+        return False
+    code, out, err = _gh(root, "pr", "update-branch", pr)
+    if code != 0:
+        logger.error(f"gh pr update-branch failed: {(out + err).strip()}")
+        return False
+    data, _ = _gh_json(root, "pr", "view", pr, "--json", "headRefOid")
+    new_head = (data or {}).get("headRefOid") or ""
+    if not new_head or new_head == head:
+        return False
+    # Keep the local branch in step, so a CI fix round pushes on top of the
+    # merge commit rather than being rejected as non-fast-forward.
+    branch = marker.get("branch", "")
+    if branch and _current_branch(root) == branch:
+        _git(root, "fetch", "origin", branch)
+        _git(root, "merge", "--ff-only", f"origin/{branch}")
+    marker.update({"head_sha": new_head, "since": time.time(),
+                   "branch_updates": done + 1})
+    _save_marker(workspace, marker)
+    logger.info(f"CI gate: {branch} was behind {marker.get('base')}; updated to "
+                f"{new_head[:7]} and waiting on CI again ({done + 1}/{MAX_BRANCH_UPDATES}).")
+    record_event(workspace, f"🔄 `{branch}` was behind `{marker.get('base')}`; brought it up "
+                            f"to date ({new_head[:7]}) and waiting on CI again.")
+    return True
+
+
 def _squash_merge(root: str, pr: str, head_sha: str) -> tuple:
     """
     (merged, error). Branch protection failing here is a refusal, not a crash.
@@ -1171,6 +1218,9 @@ def _advance_checks(workspace: str, marker: dict) -> None:
         return
 
     merged, merge_error = _squash_merge(root, str(pr), head)
+    if not merged and _STALE_BRANCH_RE.search(merge_error or ""):
+        if _update_stale_branch(workspace, marker, str(pr), head):
+            return
     if not merged:
         _stall(workspace, marker, "CI passed, but GitHub refused the merge.",
                f"Every check on `{head[:7]}` passed. Nothing was merged.", merge_error)
