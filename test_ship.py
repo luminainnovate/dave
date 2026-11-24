@@ -835,6 +835,34 @@ def test_a_base_that_keeps_moving_stalls_after_the_limit():
     check("no further update", not any(a[:3] == ["api", "-X", "PUT"] for a in gh.argvs()))
 
 
+def test_a_failed_install_is_one_issue_not_one_per_later_step():
+    """veriform-ui PR #328: `npm ci` failed, and the seven steps after it in the
+    same job - and the same install in a second job - became ten fix builds."""
+    npm = ["npm error Clean install a project", "npm error Usage:"]
+    causes = [
+        {"name": "ci / backend", "origin": "introduced", "steps": [
+            {"step": "Install dependencies", "command": "npm ci", "errors": npm},
+            {"step": "Apply FGA model", "command": "npx tsx x", "errors": ["Cannot find package 'tsx'"]},
+            {"step": "FGA model tests", "command": "npx tsx y", "errors": ["Cannot find package 'tsx'"]},
+        ]},
+        {"name": "ui / verify", "origin": "introduced", "steps": [
+            {"step": "Install dependencies", "command": "npm ci", "errors": npm},
+        ]},
+        {"name": "ci / lint", "origin": "introduced", "steps": [
+            {"step": "Lint", "command": "npm run lint", "errors": ["x.ts: 1 error"]},
+            {"step": "Typecheck", "command": "tsc", "errors": ["TS2322"]},
+        ]},
+    ]
+    issues = ship._plan_issues(causes)
+    titles = [i["title"] for i in issues]
+    check("one issue for the shared install failure",
+          sum("Install dependencies" in t for t in titles) == 1, titles)
+    check("it names both jobs", any("ci / backend" in t and "ui / verify" in t for t in titles), titles)
+    check("the knock-on steps are not planned", not any("FGA" in t for t in titles), titles)
+    check("independent failures elsewhere still each get one",
+          sum(t.startswith("ci / lint") for t in titles) == 2, titles)
+
+
 def test_a_refused_merge_stalls_with_the_pr_still_open():
     with FakeGh(merge_fails=True) as gh:
         w = shipped(gh)
